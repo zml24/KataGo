@@ -91,6 +91,146 @@ SWMatMulLayerDesc MetalProcess::matMulLayerDescToSwift(const MatMulLayerDesc * d
   return swDesc;
 }
 
+SWTransformerRMSNormDesc MetalProcess::transformerRMSNormDescToSwift(const vector<float>& weights) {
+  return createSWTransformerRMSNormDesc((int32_t)weights.size(), (float*)weights.data());
+}
+
+SWTransformerBlockDesc MetalProcess::transformerBlockDescToSwift(
+  const TransformerBlockDesc* desc,
+  int hiddenSize,
+  int ffnDim
+) {
+  SWTransformerRMSNormDesc norm1 = transformerRMSNormDescToSwift(desc->norm1Weight);
+  SWMatMulLayerDesc q = createSWMatMulLayerDesc(hiddenSize, hiddenSize, (float*)desc->qWeight.data());
+  SWMatMulLayerDesc k = createSWMatMulLayerDesc(hiddenSize, hiddenSize, (float*)desc->kWeight.data());
+  SWMatMulLayerDesc v = createSWMatMulLayerDesc(hiddenSize, hiddenSize, (float*)desc->vWeight.data());
+  SWMatMulLayerDesc out = createSWMatMulLayerDesc(hiddenSize, hiddenSize, (float*)desc->outWeight.data());
+  SWTransformerRMSNormDesc norm2 = transformerRMSNormDescToSwift(desc->norm2Weight);
+  SWMatMulLayerDesc ffnW1 = createSWMatMulLayerDesc(hiddenSize, ffnDim, (float*)desc->ffnW1Weight.data());
+  SWMatMulLayerDesc ffnWGate = createSWMatMulLayerDesc(hiddenSize, ffnDim, (float*)desc->ffnWGateWeight.data());
+  SWMatMulLayerDesc ffnW2 = createSWMatMulLayerDesc(ffnDim, hiddenSize, (float*)desc->ffnW2Weight.data());
+  return createSWTransformerBlockDesc(norm1, q, k, v, out, norm2, ffnW1, ffnWGate, ffnW2);
+}
+
+swift::Array<SWTransformerBlockDesc> MetalProcess::transformerBlocksToSwift(
+  const vector<TransformerBlockDesc>& blocks,
+  int hiddenSize,
+  int ffnDim
+) {
+  auto builder = createTransformerBlockDescBuilder();
+  for(const TransformerBlockDesc& block : blocks) {
+    builder.enque(transformerBlockDescToSwift(&block, hiddenSize, ffnDim));
+  }
+  return builder.getBlockDescriptors();
+}
+
+SWTransformerModelDesc MetalProcess::transformerModelDescToSwift(const TransformerModelDesc* desc) {
+  SWConvLayerDesc stemConv = createSWConvLayerDesc(
+    desc->stemKernelSize,
+    desc->stemKernelSize,
+    desc->numInputChannels,
+    desc->hiddenSize,
+    1,
+    1,
+    (float*)desc->stemConvWeight.data()
+  );
+  SWMatMulLayerDesc stemGlobal = createSWMatMulLayerDesc(
+    desc->numInputGlobalChannels,
+    desc->hiddenSize,
+    (float*)desc->stemGlobalWeight.data()
+  );
+  SWTransformerRMSNormDesc finalNorm = transformerRMSNormDescToSwift(desc->finalNormWeight);
+  SWMatMulLayerDesc policyBoard = createSWMatMulLayerDesc(desc->hiddenSize, 2, (float*)desc->policyBoardWeight.data());
+  SWMatMulLayerDesc policyPass = createSWMatMulLayerDesc(desc->hiddenSize, 2, (float*)desc->policyPassWeight.data());
+  SWMatMulLayerDesc policyBoardFull = createSWMatMulLayerDesc(
+    desc->hiddenSize,
+    desc->policyBoardFullWeight.empty() ? 0 : 6,
+    desc->policyBoardFullWeight.empty() ? nullptr : (float*)desc->policyBoardFullWeight.data()
+  );
+  SWMatMulLayerDesc policyPassFull = createSWMatMulLayerDesc(
+    desc->hiddenSize,
+    desc->policyPassFullWeight.empty() ? 0 : 6,
+    desc->policyPassFullWeight.empty() ? nullptr : (float*)desc->policyPassFullWeight.data()
+  );
+  SWMatMulLayerDesc value = createSWMatMulLayerDesc(desc->hiddenSize, 3, (float*)desc->valueWeight.data());
+  SWMatMulLayerDesc misc = createSWMatMulLayerDesc(
+    desc->hiddenSize,
+    desc->miscWeight.empty() ? 0 : 10,
+    desc->miscWeight.empty() ? nullptr : (float*)desc->miscWeight.data()
+  );
+  SWMatMulLayerDesc moreMisc = createSWMatMulLayerDesc(
+    desc->hiddenSize,
+    desc->moreMiscWeight.empty() ? 0 : 8,
+    desc->moreMiscWeight.empty() ? nullptr : (float*)desc->moreMiscWeight.data()
+  );
+  SWMatMulLayerDesc scoreValue = createSWMatMulLayerDesc(desc->hiddenSize, 6, (float*)desc->scoreValueWeight.data());
+  SWMatMulLayerDesc ownership = createSWMatMulLayerDesc(desc->hiddenSize, 1, (float*)desc->ownershipWeight.data());
+  SWMatMulLayerDesc scoring = createSWMatMulLayerDesc(
+    desc->hiddenSize,
+    desc->scoringWeight.empty() ? 0 : 1,
+    desc->scoringWeight.empty() ? nullptr : (float*)desc->scoringWeight.data()
+  );
+  SWMatMulLayerDesc futurePos = createSWMatMulLayerDesc(
+    desc->hiddenSize,
+    desc->futurePosWeight.empty() ? 0 : 2,
+    desc->futurePosWeight.empty() ? nullptr : (float*)desc->futurePosWeight.data()
+  );
+  SWMatMulLayerDesc seki = createSWMatMulLayerDesc(
+    desc->hiddenSize,
+    desc->sekiWeight.empty() ? 0 : 4,
+    desc->sekiWeight.empty() ? nullptr : (float*)desc->sekiWeight.data()
+  );
+  const int scoreBeliefProjectSize =
+    desc->scoreMode == 0 ? desc->scoreBeliefLen :
+    (desc->scoreBeliefLen > 0 && desc->numScoreBeliefs > 0 ? desc->scoreBeliefLen * desc->numScoreBeliefs + desc->numScoreBeliefs : 0);
+  const vector<float>* scoreBeliefWeights =
+    desc->scoreMode == 0 ? &desc->scoreBeliefSimpleWeight : &desc->scoreBeliefMixWeight;
+  SWMatMulLayerDesc scoreBelief = createSWMatMulLayerDesc(
+    desc->hiddenSize,
+    scoreBeliefWeights->empty() ? 0 : scoreBeliefProjectSize,
+    scoreBeliefWeights->empty() ? nullptr : (float*)scoreBeliefWeights->data()
+  );
+
+  return createSWTransformerModelDesc(
+    desc->modelVersion,
+    swift::String(desc->name),
+    desc->posLen,
+    desc->hiddenSize,
+    desc->numHeads,
+    desc->headDim,
+    desc->ffnDim,
+    desc->numInputChannels,
+    desc->numInputGlobalChannels,
+    desc->stemKernelSize,
+    desc->hasPosEmbed,
+    desc->scoreMode,
+    desc->numScoreBeliefs,
+    desc->scoreBeliefLen,
+    stemConv,
+    stemGlobal,
+    desc->hasPosEmbed ? (float*)desc->posEmbed.data() : nullptr,
+    (float*)desc->ropeCos.data(),
+    (float*)desc->ropeSin.data(),
+    transformerBlocksToSwift(desc->blocks, desc->hiddenSize, desc->ffnDim),
+    finalNorm,
+    policyBoard,
+    policyPass,
+    policyBoardFull,
+    policyPassFull,
+    value,
+    misc,
+    moreMisc,
+    scoreValue,
+    ownership,
+    scoring,
+    futurePos,
+    seki,
+    scoreBelief,
+    desc->scoreBeliefS2OffWeight.empty() ? nullptr : (float*)desc->scoreBeliefS2OffWeight.data(),
+    desc->scoreBeliefS2ParWeight.empty() ? nullptr : (float*)desc->scoreBeliefS2ParWeight.data()
+  );
+}
+
 /// Convert a global pooling residual block description from C++ to Swift
 /// - Parameter desc: A global pooling residual block description
 /// - Returns: The global pooling residual block description converted to SWGlobalPoolingResidualBlockDesc
@@ -318,6 +458,36 @@ SWModelDesc MetalProcess::modelDescToSwift(const ModelDesc* modelDesc) {
                            valueHeadDescToSwift(&modelDesc->valueHead));
 }
 
+LoadedModel::LoadedModel(const string& fileName, const string& expectedSha256) {
+  transformerDesc = std::make_unique<TransformerModelDesc>();
+  if(TransformerModelDesc::tryLoadFromFileMaybeGZipped(fileName, expectedSha256, *transformerDesc)) {
+    isTransformer = true;
+    modelDesc.name = transformerDesc->name;
+    modelDesc.sha256 = transformerDesc->sha256;
+    modelDesc.modelVersion = transformerDesc->modelVersion;
+    modelDesc.numInputChannels = transformerDesc->numInputChannels;
+    modelDesc.numInputGlobalChannels = transformerDesc->numInputGlobalChannels;
+    modelDesc.numInputMetaChannels = 0;
+    modelDesc.metaEncoderVersion = 0;
+    modelDesc.numPolicyChannels = 2;
+    modelDesc.numValueChannels = 3;
+    modelDesc.numScoreValueChannels = 6;
+    modelDesc.numOwnershipChannels = 1;
+    modelDesc.postProcessParams = transformerDesc->postProcessParams;
+    modelDesc.trunk.trunkNumChannels = transformerDesc->hiddenSize;
+    modelDesc.trunk.numBlocks = transformerDesc->numLayers;
+    modelDesc.trunk.initialConv.convXSize = transformerDesc->stemKernelSize;
+    modelDesc.trunk.initialConv.convYSize = transformerDesc->stemKernelSize;
+    modelDesc.trunk.initialConv.inChannels = transformerDesc->numInputChannels;
+    modelDesc.trunk.initialConv.outChannels = transformerDesc->hiddenSize;
+  }
+  else {
+    isTransformer = false;
+    transformerDesc.reset();
+    ModelDesc::loadFromFileMaybeGZipped(fileName, modelDesc, expectedSha256);
+  }
+}
+
 //---------------------------------------------------------------------------------------------------------
 
 /**
@@ -384,18 +554,17 @@ const ModelDesc& NeuralNet::getModelDesc(const LoadedModel* loadedModel) {
 //------------------------------------------------------------------------------
 
 ComputeContext::ComputeContext(int nnX, int nnY, enabled_t useFP16Mode, enabled_t useNHWCMode):
-metalComputeContext(createMetalComputeContext(nnX, nnY)) {
-  this->useFP16Mode = useFP16Mode;
-
-  SWEnable swUseFP16Mode =
+metalComputeContext(createMetalComputeContext(
+  nnX,
+  nnY,
   (useFP16Mode == enabled_t::False) ? SWEnable::False() :
   (useFP16Mode == enabled_t::True) ? SWEnable::True() :
-  SWEnable::Auto();
-
-  SWEnable swUseNHWCMode =
+  SWEnable::Auto(),
   (useNHWCMode == enabled_t::False) ? SWEnable::False() :
   (useNHWCMode == enabled_t::True) ? SWEnable::True() :
-  SWEnable::Auto();
+  SWEnable::Auto()
+)) {
+  this->useFP16Mode = useFP16Mode;
 }
 
 ComputeContext::~ComputeContext() {
@@ -456,10 +625,26 @@ ComputeHandle::ComputeHandle(ComputeContext* context,
                              bool inputsUseNHWC,
                              int gpuIdx,
                              int serverThreadIdx):
-metalhandle(maybeCreateMetalComputeHandle((gpuIdx < 100),
-                                          serverThreadIdx,
-                                          MetalProcess::modelDescToSwift(&loadedModel->modelDesc),
-                                          context->metalComputeContext)) {
+isTransformer(loadedModel->isTransformer),
+transformerSupportsFullRawOutputs(loadedModel->isTransformer && !loadedModel->transformerDesc->policyBoardFullWeight.empty()),
+transformerScoreBeliefLen(loadedModel->isTransformer ? loadedModel->transformerDesc->scoreBeliefLen : 0),
+metalhandle(
+  loadedModel->isTransformer ? swift::Optional<MetalComputeHandle>::none() :
+  maybeCreateMetalComputeHandle((gpuIdx < 100),
+                                serverThreadIdx,
+                                MetalProcess::modelDescToSwift(&loadedModel->modelDesc),
+                                context->metalComputeContext)
+),
+metalTransformerHandle(
+  loadedModel->isTransformer ?
+  maybeCreateMetalTransformerComputeHandle(
+    (gpuIdx < 100),
+    serverThreadIdx,
+    MetalProcess::transformerModelDescToSwift(loadedModel->transformerDesc.get()),
+    context->metalComputeContext
+  ) :
+  swift::Optional<MetalTransformerComputeHandle>::none()
+) {
 
   const ModelDesc* modelDesc = &loadedModel->modelDesc;
   auto metalContext = context->metalComputeContext;
@@ -473,7 +658,9 @@ metalhandle(maybeCreateMetalComputeHandle((gpuIdx < 100),
 
   /* Use FP16 mode if the model supports it and the user has not explicitly
    * disabled it. */
-  useFP16 = (context->useFP16Mode != enabled_t::False);
+  useFP16 =
+    isTransformer ? (context->useFP16Mode == enabled_t::True) :
+    (context->useFP16Mode != enabled_t::False);
 
   (void)serverThreadIdx;
 }
@@ -510,12 +697,20 @@ ComputeHandle* NeuralNet::createComputeHandle(
 
   (void)logger;
   (void)maxBatchSize;
-  // Current implementation always tolerates excess nn len
-  (void)requireExactNNLen;
 
   // Transfer the default GPU index into physical GPU index 0
   int gpuIdx = (gpuIdxForThisThread == -1) ? 0 : gpuIdxForThisThread;
   ComputeHandle* handle = nullptr;
+
+  if(loadedModel->isTransformer) {
+    if(!inputsUseNHWC)
+      throw StringError("Metal backend Transformer 路径仅支持 inputsUseNHWC=true");
+    if(!requireExactNNLen)
+      throw StringError("Metal backend Transformer 路径仅支持 requireExactNNLen=true，且棋盘尺寸必须固定等于模型 pos_len");
+    if(context->metalComputeContext.getNnXLen() != loadedModel->transformerDesc->posLen ||
+       context->metalComputeContext.getNnYLen() != loadedModel->transformerDesc->posLen)
+      throw StringError("Metal backend Transformer 路径仅支持与模型 pos_len 完全一致的棋盘尺寸");
+  }
 
   {
     lock_guard<mutex> lock(computeHandleMutex);
@@ -570,11 +765,14 @@ InputBuffers::InputBuffers(const LoadedModel* loadedModel, int maxBatchSz, int n
   const ModelDesc& m = loadedModel->modelDesc;
 
   maxBatchSize = maxBatchSz;
-  policyResultChannels = m.policyHead.p2Conv.outChannels;
+  isTransformer = loadedModel->isTransformer;
+  policyResultChannels = isTransformer ? 2 : (size_t)m.policyHead.p2Conv.outChannels;
 
-  assert(((m.modelVersion < 16) || (policyResultChannels == 4)) &&
-         ((m.modelVersion >= 16) || (m.modelVersion < 12) || (policyResultChannels == 2)) &&
-         ((m.modelVersion >= 12) || (policyResultChannels == 1)));
+  if(!isTransformer) {
+    assert(((m.modelVersion < 16) || (policyResultChannels == 4)) &&
+           ((m.modelVersion >= 16) || (m.modelVersion < 12) || (policyResultChannels == 2)) &&
+           ((m.modelVersion >= 12) || (policyResultChannels == 1)));
+  }
 
   singleSpatialElts = (size_t)m.numInputChannels * nnXLen * nnYLen;
   singleInputElts = (size_t)m.numInputChannels * nnXLen * nnYLen;
@@ -760,12 +958,14 @@ void MetalProcess::processRowData(size_t row, ComputeHandle* gpuHandle, InputBuf
     gpuHandle->inputsUseNHWC,
     inputBufs[row]->symmetry);
 
-  MetalProcess::convertNCHW(
-    rowSpatialInput,
-    numSpatialFeatures,
-    nnYLen,
-    nnXLen,
-    gpuHandle->inputsUseNHWC);
+  if(!gpuHandle->isTransformer) {
+    MetalProcess::convertNCHW(
+      rowSpatialInput,
+      numSpatialFeatures,
+      nnYLen,
+      nnXLen,
+      gpuHandle->inputsUseNHWC);
+  }
 }
 
 float MetalProcess::policyOptimismCalc(const double policyOptimism, const float p, const float pOpt) {
@@ -793,6 +993,28 @@ void MetalProcess::processOptimism(
   currentOutput->policyProbs[buffers.singlePolicyProbsElts - 1] = MetalProcess::policyOptimismCalc(policyOptimism, p, pOpt);
 }
 
+void MetalProcess::processTransformerOptimism(
+  InputBuffers* inputBuffers,
+  NNOutput* currentOutput,
+  const double policyOptimism,
+  size_t row
+) {
+  auto& buffers = *inputBuffers;
+  const auto singlePolicyResultElts = buffers.singlePolicyResultElts;
+  float* targetBuffer = &buffers.policyProbsBuffer[row * singlePolicyResultElts];
+  float* policyOutputBuf = &buffers.policyResults[row * singlePolicyResultElts * buffers.policyResultChannels];
+
+  for(size_t i = 0; i < singlePolicyResultElts; ++i) {
+    const float p = policyOutputBuf[i * buffers.policyResultChannels];
+    const float pOpt = policyOutputBuf[i * buffers.policyResultChannels + 1];
+    targetBuffer[i] = MetalProcess::policyOptimismCalc(policyOptimism, p, pOpt);
+  }
+
+  const auto p = buffers.policyPassResults[row * buffers.policyResultChannels];
+  const auto pOpt = buffers.policyPassResults[row * buffers.policyResultChannels + 1];
+  currentOutput->policyProbs[buffers.singlePolicyProbsElts - 1] = MetalProcess::policyOptimismCalc(policyOptimism, p, pOpt);
+}
+
 void MetalProcess::processPolicy(
   InputBuffers* inputBuffers,
   NNOutput* currentOutput,
@@ -808,7 +1030,10 @@ void MetalProcess::processPolicy(
     currentOutput->policyProbs[buffers.singlePolicyProbsElts - 1] =
       buffers.policyPassResults[row * buffers.policyResultChannels];
   } else {
-    MetalProcess::processOptimism(inputBuffers, currentOutput, policyOptimism, row);
+    if(buffers.isTransformer)
+      MetalProcess::processTransformerOptimism(inputBuffers, currentOutput, policyOptimism, row);
+    else
+      MetalProcess::processOptimism(inputBuffers, currentOutput, policyOptimism, row);
     targetBuffer = &buffers.policyProbsBuffer[row * buffers.singlePolicyResultElts];
   }
 
@@ -945,7 +1170,34 @@ void MetalProcess::getMetalOutput(
   assert(inputBuffers->singleValueResultElts == 3);
 
   for(size_t row = 0; row < batchSize; row++) {
+    if(gpuHandle->isTransformer) {
+      if(
+        inputBufs[row]->boardXSizeForServer != gpuHandle->nnXLen ||
+        inputBufs[row]->boardYSizeForServer != gpuHandle->nnYLen
+      ) {
+        throw StringError("Metal backend Transformer 路径仅支持与模型 pos_len 完全一致的棋盘尺寸");
+      }
+    }
     MetalProcess::processRowData(row, gpuHandle, inputBuffers, inputBufs);
+  }
+
+  if(gpuHandle->isTransformer) {
+    auto transformerHandle = gpuHandle->metalTransformerHandle;
+    assert(transformerHandle);
+    transformerHandle.get().apply(
+      batchSize,
+      inputBuffers->userInputBuffer,
+      inputBuffers->userInputGlobalBuffer,
+      inputBuffers->policyPassResults,
+      inputBuffers->policyResults,
+      inputBuffers->valueResults,
+      inputBuffers->scoreValuesResults,
+      inputBuffers->ownershipResults
+    );
+    for(size_t row = 0; row < batchSize; row++) {
+      MetalProcess::processRow(row, gpuHandle, inputBuffers, inputBufs, outputs);
+    }
+    return;
   }
 
   auto metalHandle = gpuHandle->metalhandle;
@@ -984,6 +1236,104 @@ void NeuralNet::getOutput(
   vector<NNOutput*>& outputs) {
 
   MetalProcess::getMetalOutput(gpuHandle, inputBuffers, numBatchEltsFilled, inputBufs, outputs);
+}
+
+bool NeuralNet::getTransformerRawOutputs(
+  ComputeHandle* gpuHandle,
+  InputBuffers* inputBuffers,
+  int numBatchEltsFilled,
+  NNResultBuf** inputBufs,
+  TransformerRawOutputs& outputs
+) {
+  if(!gpuHandle->isTransformer)
+    return false;
+
+  assert(numBatchEltsFilled > 0);
+  int batchSize = numBatchEltsFilled;
+  assert(batchSize <= inputBuffers->maxBatchSize);
+
+  for(size_t row = 0; row < (size_t)batchSize; row++) {
+    if(
+      inputBufs[row]->boardXSizeForServer != gpuHandle->nnXLen ||
+      inputBufs[row]->boardYSizeForServer != gpuHandle->nnYLen
+    ) {
+      throw StringError("Metal backend Transformer 路径仅支持与模型 pos_len 完全一致的棋盘尺寸");
+    }
+    MetalProcess::processRowData(row, gpuHandle, inputBuffers, inputBufs);
+  }
+
+  outputs.batchSize = batchSize;
+  outputs.nnXLen = gpuHandle->nnXLen;
+  outputs.nnYLen = gpuHandle->nnYLen;
+  outputs.numPolicyChannels = 2;
+  outputs.numFullPolicyChannels = 0;
+  outputs.numMiscChannels = 0;
+  outputs.numMoreMiscChannels = 0;
+  outputs.numScoringChannels = 0;
+  outputs.numFuturePosChannels = 0;
+  outputs.numSekiChannels = 0;
+  outputs.scoreBeliefLen = 0;
+  outputs.policyPass.resize((size_t)batchSize * 2);
+  outputs.policy.resize((size_t)batchSize * gpuHandle->nnXLen * gpuHandle->nnYLen * 2);
+  outputs.value.resize((size_t)batchSize * 3);
+  outputs.scoreValue.resize((size_t)batchSize * 6);
+  outputs.ownership.resize((size_t)batchSize * gpuHandle->nnXLen * gpuHandle->nnYLen);
+  outputs.fullPolicyPass.clear();
+  outputs.fullPolicy.clear();
+  outputs.misc.clear();
+  outputs.moreMisc.clear();
+  outputs.scoring.clear();
+  outputs.futurePos.clear();
+  outputs.seki.clear();
+  outputs.scoreBelief.clear();
+
+  auto transformerHandle = gpuHandle->metalTransformerHandle;
+  assert(transformerHandle);
+  transformerHandle.get().apply(
+    batchSize,
+    inputBuffers->userInputBuffer,
+    inputBuffers->userInputGlobalBuffer,
+    outputs.policyPass.data(),
+    outputs.policy.data(),
+    outputs.value.data(),
+    outputs.scoreValue.data(),
+    outputs.ownership.data()
+  );
+
+  if(gpuHandle->transformerSupportsFullRawOutputs) {
+    outputs.numFullPolicyChannels = 6;
+    outputs.numMiscChannels = 10;
+    outputs.numMoreMiscChannels = 8;
+    outputs.numScoringChannels = 1;
+    outputs.numFuturePosChannels = 2;
+    outputs.numSekiChannels = 4;
+    outputs.scoreBeliefLen = gpuHandle->transformerScoreBeliefLen;
+    outputs.fullPolicyPass.resize((size_t)batchSize * outputs.numFullPolicyChannels);
+    outputs.fullPolicy.resize((size_t)batchSize * gpuHandle->nnXLen * gpuHandle->nnYLen * outputs.numFullPolicyChannels);
+    outputs.misc.resize((size_t)batchSize * outputs.numMiscChannels);
+    outputs.moreMisc.resize((size_t)batchSize * outputs.numMoreMiscChannels);
+    outputs.scoring.resize((size_t)batchSize * gpuHandle->nnXLen * gpuHandle->nnYLen);
+    outputs.futurePos.resize((size_t)batchSize * gpuHandle->nnXLen * gpuHandle->nnYLen * outputs.numFuturePosChannels);
+    outputs.seki.resize((size_t)batchSize * gpuHandle->nnXLen * gpuHandle->nnYLen * outputs.numSekiChannels);
+    outputs.scoreBelief.resize((size_t)batchSize * outputs.scoreBeliefLen);
+
+    transformerHandle.get().applyFull(
+      batchSize,
+      inputBuffers->userInputBuffer,
+      inputBuffers->userInputGlobalBuffer,
+      outputs.fullPolicyPass.data(),
+      outputs.fullPolicy.data(),
+      outputs.value.data(),
+      outputs.misc.data(),
+      outputs.moreMisc.data(),
+      outputs.ownership.data(),
+      outputs.scoring.data(),
+      outputs.futurePos.data(),
+      outputs.seki.data(),
+      outputs.scoreBelief.data()
+    );
+  }
+  return true;
 }
 
 bool MetalProcess::testEvaluateConv(const ConvLayerDesc* desc,

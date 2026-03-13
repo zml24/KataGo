@@ -54,6 +54,8 @@ runnnlayertests : Test a few subcomponents of the current neural net backend
 
 runnnontinyboardtest : Run neural net on a tiny board and dump result to stdout
 runnnsymmetriestest : Run neural net on a hardcoded rectangle board and dump symmetries result
+runtransformerdump : Dump fixed Transformer sample inputs plus raw/backend outputs to JSON
+                     Usage: MODEL_FILE OUTPUT_JSON [SYMMETRY] [SAMPLE_NAME] [PRECISION=fp32|fp16|bf16|auto]
 runownershiptests : Run neural net search on some hardcoded positions and print avg ownership
 
 runoutputtests : Run a bunch of things and dump details to stdout
@@ -99,6 +101,8 @@ static int handleSubcommand(const string& subcommand, const vector<string>& args
     return MainCmds::runnnontinyboardtest(subArgs);
   else if(subcommand == "runnnsymmetriestest")
     return MainCmds::runnnsymmetriestest(subArgs);
+  else if(subcommand == "runtransformerdump")
+    return MainCmds::runtransformerdump(subArgs);
   else if(subcommand == "runownershiptests")
     return MainCmds::runownershiptests(subArgs);
   else if(subcommand == "runoutputtests")

@@ -51,6 +51,17 @@ extension MPSNDArray {
     }
 }
 
+private func castTensorIfNeeded(
+    graph: MPSGraph,
+    sourceTensor: MPSGraphTensor,
+    to dataType: MPSDataType
+) -> MPSGraphTensor {
+    if sourceTensor.dataType == dataType {
+        return sourceTensor
+    }
+    return graph.cast(sourceTensor, to: dataType, name: nil)
+}
+
 /// Extension to Array to count number of elements and bytes
 extension Array where Element == NSNumber {
     /// Count number of elements
@@ -618,8 +629,11 @@ class ConvLayer {
         sourceTensor: MPSGraphTensor,
         descriptor: SWConvLayerDesc,
         nnXLen: NSNumber,
-        nnYLen: NSNumber
+        nnYLen: NSNumber,
+        computationDataType: MPSDataType? = nil,
+        outputDataType: MPSDataType? = nil
     ) {
+        let opDataType = computationDataType ?? sourceTensor.dataType
         let weightsShape = [
             descriptor.outChannels,
             descriptor.inChannels,
@@ -627,20 +641,21 @@ class ConvLayer {
             descriptor.convXSize,
         ]
 
-        let weightsData = Data(
-            floatsNoCopy: descriptor.weights,
-            shape: weightsShape)
-
-        let weightsTensor = graph.constant(
-            weightsData,
+        let weightsTensor = makeConstantTensor(
+            graph: graph,
+            pointer: descriptor.weights,
             shape: weightsShape,
-            dataType: sourceTensor.dataType)
+            dataType: opDataType)
 
-        resultTensor = graph.convolution2D(
-            sourceTensor,
+        let conv = graph.convolution2D(
+            castTensorIfNeeded(graph: graph, sourceTensor: sourceTensor, to: opDataType),
             weights: weightsTensor,
             descriptor: convDescriptor,
             name: nil)
+        resultTensor = castTensorIfNeeded(
+            graph: graph,
+            sourceTensor: conv,
+            to: outputDataType ?? sourceTensor.dataType)
 
         assert(resultTensor.shape?.count == 4)
     }
@@ -763,21 +778,15 @@ class BatchNormLayer {
             nnYLen: 1,
             nnXLen: 1)
 
-        let mergedScaleData = Data(
-            floatsNoCopy: descriptor.mergedScale,
-            shape: scaleBiasShape)
-
-        let mergedBiasData = Data(
-            floatsNoCopy: descriptor.mergedBias,
-            shape: scaleBiasShape)
-
-        let scaleTensor = graph.constant(
-            mergedScaleData,
+        let scaleTensor = makeConstantTensor(
+            graph: graph,
+            pointer: descriptor.mergedScale,
             shape: scaleBiasShape,
             dataType: sourceTensor.dataType)
 
-        let biasTensor = graph.constant(
-            mergedBiasData,
+        let biasTensor = makeConstantTensor(
+            graph: graph,
+            pointer: descriptor.mergedBias,
             shape: scaleBiasShape,
             dataType: sourceTensor.dataType)
 
@@ -1165,7 +1174,7 @@ public struct SWMatMulLayerDesc {
     /// The number of output channels
     let outChannels: NSNumber
     /// The weights used for the matrix multiplication
-    let weights: UnsafeMutablePointer<Float32>
+    let weights: UnsafeMutablePointer<Float32>?
 
     /// Initialize a SWMatMulLayerDesc object
     /// - Parameters:
@@ -1175,7 +1184,7 @@ public struct SWMatMulLayerDesc {
     init(
         inChannels: NSNumber,
         outChannels: NSNumber,
-        weights: UnsafeMutablePointer<Float32>
+        weights: UnsafeMutablePointer<Float32>?
     ) {
         self.inChannels = inChannels
         self.outChannels = outChannels
@@ -1186,7 +1195,7 @@ public struct SWMatMulLayerDesc {
 public func createSWMatMulLayerDesc(
     inChannels: Int32,
     outChannels: Int32,
-    weights: UnsafeMutablePointer<Float32>
+    weights: UnsafeMutablePointer<Float32>?
 ) -> SWMatMulLayerDesc {
     return SWMatMulLayerDesc(
         inChannels: inChannels as NSNumber,
@@ -1214,6 +1223,7 @@ struct MatMulLayer {
             (sourceTensor.shape?.count == 4) || (sourceTensor.shape?[1] == descriptor.inChannels))
         assert(
             (sourceTensor.shape?.count == 2) || (sourceTensor.shape?[1] == descriptor.inChannels))
+        precondition(descriptor.weights != nil)
 
         let weightsShape = [
             descriptor.inChannels,
@@ -1221,7 +1231,7 @@ struct MatMulLayer {
         ]
 
         let weightsData = Data(
-            floatsNoCopy: descriptor.weights,
+            floatsNoCopy: descriptor.weights!,
             shape: weightsShape)
 
         let weightsTensor = graph.constant(
@@ -3166,6 +3176,968 @@ struct Model {
     }
 }
 
+public struct SWTransformerRMSNormDesc {
+    let numChannels: NSNumber
+    let weights: UnsafeMutablePointer<Float32>
+
+    init(
+        numChannels: NSNumber,
+        weights: UnsafeMutablePointer<Float32>
+    ) {
+        self.numChannels = numChannels
+        self.weights = weights
+    }
+}
+
+public func createSWTransformerRMSNormDesc(
+    numChannels: Int32,
+    weights: UnsafeMutablePointer<Float32>
+) -> SWTransformerRMSNormDesc {
+    return SWTransformerRMSNormDesc(
+        numChannels: numChannels as NSNumber,
+        weights: weights)
+}
+
+public struct SWTransformerBlockDesc {
+    let norm1: SWTransformerRMSNormDesc
+    let qProj: SWMatMulLayerDesc
+    let kProj: SWMatMulLayerDesc
+    let vProj: SWMatMulLayerDesc
+    let outProj: SWMatMulLayerDesc
+    let norm2: SWTransformerRMSNormDesc
+    let ffnW1: SWMatMulLayerDesc
+    let ffnWGate: SWMatMulLayerDesc
+    let ffnW2: SWMatMulLayerDesc
+}
+
+public func createSWTransformerBlockDesc(
+    norm1: SWTransformerRMSNormDesc,
+    qProj: SWMatMulLayerDesc,
+    kProj: SWMatMulLayerDesc,
+    vProj: SWMatMulLayerDesc,
+    outProj: SWMatMulLayerDesc,
+    norm2: SWTransformerRMSNormDesc,
+    ffnW1: SWMatMulLayerDesc,
+    ffnWGate: SWMatMulLayerDesc,
+    ffnW2: SWMatMulLayerDesc
+) -> SWTransformerBlockDesc {
+    return SWTransformerBlockDesc(
+        norm1: norm1,
+        qProj: qProj,
+        kProj: kProj,
+        vProj: vProj,
+        outProj: outProj,
+        norm2: norm2,
+        ffnW1: ffnW1,
+        ffnWGate: ffnWGate,
+        ffnW2: ffnW2)
+}
+
+public class TransformerBlockDescBuilder {
+    public var blockDescriptors: [SWTransformerBlockDesc] = []
+
+    public func enque(with descriptor: SWTransformerBlockDesc) {
+        blockDescriptors.append(descriptor)
+    }
+}
+
+public func createTransformerBlockDescBuilder() -> TransformerBlockDescBuilder {
+    return TransformerBlockDescBuilder()
+}
+
+public struct SWTransformerModelDesc {
+    let version: Int
+    let name: String
+    let posLen: NSNumber
+    let hiddenSize: NSNumber
+    let numHeads: NSNumber
+    let headDim: NSNumber
+    let ffnDim: NSNumber
+    let numInputChannels: NSNumber
+    let numInputGlobalChannels: NSNumber
+    let stemKernelSize: NSNumber
+    let hasPosEmbed: Bool
+    let scoreMode: Int
+    let numScoreBeliefs: NSNumber
+    let scoreBeliefLen: NSNumber
+    let stemConv: SWConvLayerDesc
+    let stemGlobal: SWMatMulLayerDesc
+    let posEmbed: UnsafeMutablePointer<Float32>?
+    let ropeCos: UnsafeMutablePointer<Float32>
+    let ropeSin: UnsafeMutablePointer<Float32>
+    let blocks: [SWTransformerBlockDesc]
+    let finalNorm: SWTransformerRMSNormDesc
+    let policyBoard: SWMatMulLayerDesc
+    let policyPass: SWMatMulLayerDesc
+    let policyBoardFull: SWMatMulLayerDesc
+    let policyPassFull: SWMatMulLayerDesc
+    let value: SWMatMulLayerDesc
+    let misc: SWMatMulLayerDesc
+    let moreMisc: SWMatMulLayerDesc
+    let scoreValue: SWMatMulLayerDesc
+    let ownership: SWMatMulLayerDesc
+    let scoring: SWMatMulLayerDesc
+    let futurePos: SWMatMulLayerDesc
+    let seki: SWMatMulLayerDesc
+    let scoreBelief: SWMatMulLayerDesc
+    let scoreBeliefS2OffWeight: UnsafeMutablePointer<Float32>?
+    let scoreBeliefS2ParWeight: UnsafeMutablePointer<Float32>?
+
+    var scoreBeliefProjectSize: Int {
+        if scoreMode == 0 {
+            return scoreBeliefLen.intValue
+        }
+        return (scoreBeliefLen.intValue * numScoreBeliefs.intValue) + numScoreBeliefs.intValue
+    }
+
+    var supportsFullRawOutputs: Bool {
+        return policyBoardFull.outChannels.intValue > 0 &&
+            policyPassFull.outChannels.intValue > 0 &&
+            misc.outChannels.intValue > 0 &&
+            moreMisc.outChannels.intValue > 0 &&
+            scoring.outChannels.intValue > 0 &&
+            futurePos.outChannels.intValue > 0 &&
+            seki.outChannels.intValue > 0 &&
+            scoreBelief.outChannels.intValue > 0
+    }
+}
+
+public func createSWTransformerModelDesc(
+    version: Int32,
+    name: String,
+    posLen: Int32,
+    hiddenSize: Int32,
+    numHeads: Int32,
+    headDim: Int32,
+    ffnDim: Int32,
+    numInputChannels: Int32,
+    numInputGlobalChannels: Int32,
+    stemKernelSize: Int32,
+    hasPosEmbed: Bool,
+    scoreMode: Int32,
+    numScoreBeliefs: Int32,
+    scoreBeliefLen: Int32,
+    stemConv: SWConvLayerDesc,
+    stemGlobal: SWMatMulLayerDesc,
+    posEmbed: UnsafeMutablePointer<Float32>?,
+    ropeCos: UnsafeMutablePointer<Float32>,
+    ropeSin: UnsafeMutablePointer<Float32>,
+    blocks: [SWTransformerBlockDesc],
+    finalNorm: SWTransformerRMSNormDesc,
+    policyBoard: SWMatMulLayerDesc,
+    policyPass: SWMatMulLayerDesc,
+    policyBoardFull: SWMatMulLayerDesc,
+    policyPassFull: SWMatMulLayerDesc,
+    value: SWMatMulLayerDesc,
+    misc: SWMatMulLayerDesc,
+    moreMisc: SWMatMulLayerDesc,
+    scoreValue: SWMatMulLayerDesc,
+    ownership: SWMatMulLayerDesc,
+    scoring: SWMatMulLayerDesc,
+    futurePos: SWMatMulLayerDesc,
+    seki: SWMatMulLayerDesc,
+    scoreBelief: SWMatMulLayerDesc,
+    scoreBeliefS2OffWeight: UnsafeMutablePointer<Float32>?,
+    scoreBeliefS2ParWeight: UnsafeMutablePointer<Float32>?
+) -> SWTransformerModelDesc {
+    return SWTransformerModelDesc(
+        version: Int(version),
+        name: name,
+        posLen: posLen as NSNumber,
+        hiddenSize: hiddenSize as NSNumber,
+        numHeads: numHeads as NSNumber,
+        headDim: headDim as NSNumber,
+        ffnDim: ffnDim as NSNumber,
+        numInputChannels: numInputChannels as NSNumber,
+        numInputGlobalChannels: numInputGlobalChannels as NSNumber,
+        stemKernelSize: stemKernelSize as NSNumber,
+        hasPosEmbed: hasPosEmbed,
+        scoreMode: Int(scoreMode),
+        numScoreBeliefs: numScoreBeliefs as NSNumber,
+        scoreBeliefLen: scoreBeliefLen as NSNumber,
+        stemConv: stemConv,
+        stemGlobal: stemGlobal,
+        posEmbed: posEmbed,
+        ropeCos: ropeCos,
+        ropeSin: ropeSin,
+        blocks: blocks,
+        finalNorm: finalNorm,
+        policyBoard: policyBoard,
+        policyPass: policyPass,
+        policyBoardFull: policyBoardFull,
+        policyPassFull: policyPassFull,
+        value: value,
+        misc: misc,
+        moreMisc: moreMisc,
+        scoreValue: scoreValue,
+        ownership: ownership,
+        scoring: scoring,
+        futurePos: futurePos,
+        seki: seki,
+        scoreBelief: scoreBelief,
+        scoreBeliefS2OffWeight: scoreBeliefS2OffWeight,
+        scoreBeliefS2ParWeight: scoreBeliefS2ParWeight)
+}
+
+enum TransformerComputePrecision: String {
+    case float32 = "fp32"
+    case float16 = "fp16"
+    case bfloat16 = "bf16"
+
+    var dataType: MPSDataType {
+        switch self {
+        case .float32:
+            return .float32
+        case .float16:
+            return .float16
+        case .bfloat16:
+            if #available(macOS 14.0, *) {
+                return .bFloat16
+            }
+            return .float32
+        }
+    }
+}
+
+private func deviceSupportsTransformerBFloat16(_ device: MTLDevice) -> Bool {
+    guard #available(macOS 14.0, *) else {
+        return false
+    }
+    return device.supportsFamily(.apple7) ||
+        device.supportsFamily(.apple8) ||
+        device.supportsFamily(.apple9) ||
+        device.supportsFamily(.apple10) ||
+        device.supportsFamily(.mac2)
+}
+
+private func chooseTransformerPrecision(
+    device: MTLDevice,
+    requestedMode: SWEnable
+) -> TransformerComputePrecision {
+    switch requestedMode {
+    case .False:
+        return .float32
+    case .True:
+        return .float16
+    case .Auto:
+        return deviceSupportsTransformerBFloat16(device) ? .bfloat16 : .float16
+    }
+}
+
+private func makeConstantTensor(
+    graph: MPSGraph,
+    pointer: UnsafeMutablePointer<Float32>,
+    shape: [NSNumber],
+    dataType: MPSDataType = .float32
+) -> MPSGraphTensor {
+    let data = Data(floatsNoCopy: pointer, shape: shape)
+    let tensor = graph.constant(data, shape: shape, dataType: .float32)
+    return castTensorIfNeeded(graph: graph, sourceTensor: tensor, to: dataType)
+}
+
+private func swapAxes(
+    graph: MPSGraph,
+    sourceTensor: MPSGraphTensor,
+    axis1: Int,
+    axis2: Int
+) -> MPSGraphTensor {
+    return graph.transposeTensor(sourceTensor, dimension: axis1, withDimension: axis2, name: nil)
+}
+
+private func transposeNHWCToNCHW(
+    graph: MPSGraph,
+    sourceTensor: MPSGraphTensor
+) -> MPSGraphTensor {
+    let ncwh = swapAxes(graph: graph, sourceTensor: sourceTensor, axis1: 1, axis2: 3)
+    return swapAxes(graph: graph, sourceTensor: ncwh, axis1: 2, axis2: 3)
+}
+
+private func transposeNCHWToNHWC(
+    graph: MPSGraph,
+    sourceTensor: MPSGraphTensor
+) -> MPSGraphTensor {
+    let nhcw = swapAxes(graph: graph, sourceTensor: sourceTensor, axis1: 1, axis2: 2)
+    return swapAxes(graph: graph, sourceTensor: nhcw, axis1: 2, axis2: 3)
+}
+
+private func transformerLinear(
+    graph: MPSGraph,
+    descriptor: SWMatMulLayerDesc,
+    sourceTensor: MPSGraphTensor,
+    outputShape: [NSNumber],
+    computationDataType: MPSDataType? = nil,
+    outputDataType: MPSDataType? = nil
+) -> MPSGraphTensor {
+    precondition(descriptor.weights != nil)
+    let opDataType = computationDataType ?? sourceTensor.dataType
+    let weightsTensor = makeConstantTensor(
+        graph: graph,
+        pointer: descriptor.weights!,
+        shape: [descriptor.inChannels, descriptor.outChannels],
+        dataType: opDataType)
+    let flatInput = graph.reshape(
+        castTensorIfNeeded(graph: graph, sourceTensor: sourceTensor, to: opDataType),
+        shape: [-1, descriptor.inChannels],
+        name: nil)
+    let flatOutput = graph.matrixMultiplication(primary: flatInput, secondary: weightsTensor, name: nil)
+    let reshaped = graph.reshape(flatOutput, shape: outputShape, name: nil)
+    return castTensorIfNeeded(
+        graph: graph,
+        sourceTensor: reshaped,
+        to: outputDataType ?? sourceTensor.dataType)
+}
+
+private func transformerRMSNorm(
+    graph: MPSGraph,
+    sourceTensor: MPSGraphTensor,
+    descriptor: SWTransformerRMSNormDesc
+) -> MPSGraphTensor {
+    let sourceFP32 = castTensorIfNeeded(graph: graph, sourceTensor: sourceTensor, to: .float32)
+    let squared = graph.square(with: sourceFP32, name: nil)
+    let sum = graph.reductionSum(with: squared, axes: [2], name: nil)
+    let denom = graph.constant(Double(descriptor.numChannels.intValue), dataType: .float32)
+    let mean = graph.division(sum, denom, name: nil)
+    let eps = graph.constant(1e-6, dataType: .float32)
+    let variance = graph.addition(mean, eps, name: nil)
+    let rms = graph.squareRoot(with: variance, name: nil)
+    let one = graph.constant(1.0, dataType: .float32)
+    let invRms = graph.division(one, rms, name: nil)
+    let normalized = graph.multiplication(sourceFP32, invRms, name: nil)
+    let weightTensor = makeConstantTensor(
+        graph: graph,
+        pointer: descriptor.weights,
+        shape: [1, 1, descriptor.numChannels],
+        dataType: .float32)
+    let scaled = graph.multiplication(normalized, weightTensor, name: nil)
+    return castTensorIfNeeded(graph: graph, sourceTensor: scaled, to: sourceTensor.dataType)
+}
+
+private func transformerMeanPool(
+    graph: MPSGraph,
+    sourceTensor: MPSGraphTensor,
+    seqLen: Int
+) -> MPSGraphTensor {
+    let sum = graph.reductionSum(with: sourceTensor, axes: [1], name: nil)
+    let denom = graph.constant(Double(seqLen), dataType: sourceTensor.dataType)
+    let mean = graph.division(sum, denom, name: nil)
+    return graph.reshape(mean, shape: [-1, sourceTensor.shape![2]], name: nil)
+}
+
+private func transformerApplyRoPE(
+    graph: MPSGraph,
+    sourceTensor: MPSGraphTensor,
+    ropeCosTensor: MPSGraphTensor,
+    ropeSinTensor: MPSGraphTensor
+) -> MPSGraphTensor {
+    let sourceFP32 = castTensorIfNeeded(graph: graph, sourceTensor: sourceTensor, to: .float32)
+    let halves = graph.split(sourceFP32, numSplits: 2, axis: 3, name: nil)
+    let minusOne = graph.constant(-1.0, dataType: .float32)
+    let negUpper = graph.multiplication(halves[1], minusOne, name: nil)
+    let rotated = graph.concatTensors([negUpper, halves[0]], dimension: 3, name: nil)
+    let mulCos = graph.multiplication(sourceFP32, castTensorIfNeeded(graph: graph, sourceTensor: ropeCosTensor, to: .float32), name: nil)
+    let mulSin = graph.multiplication(rotated, castTensorIfNeeded(graph: graph, sourceTensor: ropeSinTensor, to: .float32), name: nil)
+    let rotatedOut = graph.addition(mulCos, mulSin, name: nil)
+    return castTensorIfNeeded(graph: graph, sourceTensor: rotatedOut, to: sourceTensor.dataType)
+}
+
+private func transformerSwiGLU(
+    graph: MPSGraph,
+    lhs: MPSGraphTensor,
+    rhs: MPSGraphTensor
+) -> MPSGraphTensor {
+    let sigmoid = graph.sigmoid(with: lhs, name: nil)
+    let silu = graph.multiplication(lhs, sigmoid, name: nil)
+    let siluFP32 = castTensorIfNeeded(graph: graph, sourceTensor: silu, to: .float32)
+    let rhsFP32 = castTensorIfNeeded(graph: graph, sourceTensor: rhs, to: .float32)
+    let multiplied = graph.multiplication(siluFP32, rhsFP32, name: nil)
+    return castTensorIfNeeded(graph: graph, sourceTensor: multiplied, to: lhs.dataType)
+}
+
+private func transformerAdd(
+    graph: MPSGraph,
+    lhs: MPSGraphTensor,
+    rhs: MPSGraphTensor,
+    resultDataType: MPSDataType
+) -> MPSGraphTensor {
+    return graph.addition(
+        castTensorIfNeeded(graph: graph, sourceTensor: lhs, to: resultDataType),
+        castTensorIfNeeded(graph: graph, sourceTensor: rhs, to: resultDataType),
+        name: nil)
+}
+
+private func transformerScoreBeliefLogSoftmax(_ values: inout [Float32]) {
+    guard !values.isEmpty else {
+        return
+    }
+    var maxValue = values[0]
+    for value in values.dropFirst() {
+        maxValue = Swift.max(maxValue, value)
+    }
+    var sum: Double = 0.0
+    for value in values {
+        sum += Foundation.exp(Double(value - maxValue))
+    }
+    let logSum = Float32(Double(maxValue) + Foundation.log(sum))
+    for index in values.indices {
+        values[index] -= logSum
+    }
+}
+
+struct TransformerModel {
+    let device: MTLDevice
+    let commandQueue: MTLCommandQueue
+    let graph: MPSGraph
+    let desc: SWTransformerModelDesc
+    let precision: TransformerComputePrecision
+    let computeDataType: MPSDataType
+    let inputTensor: MPSGraphTensor
+    let inputGlobalTensor: MPSGraphTensor
+    let policyTensor: MPSGraphTensor
+    let policyPassTensor: MPSGraphTensor
+    let valueTensor: MPSGraphTensor
+    let scoreValueTensor: MPSGraphTensor
+    let ownershipTensor: MPSGraphTensor
+    let fullPolicyTensor: MPSGraphTensor?
+    let fullPolicyPassTensor: MPSGraphTensor?
+    let miscTensor: MPSGraphTensor?
+    let moreMiscTensor: MPSGraphTensor?
+    let scoringTensor: MPSGraphTensor?
+    let futurePosTensor: MPSGraphTensor?
+    let sekiTensor: MPSGraphTensor?
+    let scoreBeliefProjectTensor: MPSGraphTensor?
+    let subsetTargets: [MPSGraphTensor]
+    let fullTargets: [MPSGraphTensor]
+
+    init(
+        device: MTLDevice,
+        graph: MPSGraph,
+        descriptor: SWTransformerModelDesc,
+        precision: TransformerComputePrecision
+    ) {
+        self.device = device
+        self.commandQueue = device.makeCommandQueue()!
+        self.graph = graph
+        self.desc = descriptor
+        self.precision = precision
+        self.computeDataType = precision.dataType
+
+        inputTensor = graph.placeholder(
+            shape: [-1, descriptor.posLen, descriptor.posLen, descriptor.numInputChannels],
+            dataType: .float32,
+            name: nil)
+        inputGlobalTensor = graph.placeholder(
+            shape: [-1, descriptor.numInputGlobalChannels],
+            dataType: .float32,
+            name: nil)
+
+        let inputCompute = castTensorIfNeeded(graph: graph, sourceTensor: inputTensor, to: computeDataType)
+        let inputGlobalCompute = castTensorIfNeeded(graph: graph, sourceTensor: inputGlobalTensor, to: computeDataType)
+        let inputNCHW = transposeNHWCToNCHW(graph: graph, sourceTensor: inputCompute)
+        let stableLinearDataType = computeDataType
+        let stemConv = ConvLayer(
+            graph: graph,
+            sourceTensor: inputNCHW,
+            descriptor: descriptor.stemConv,
+            nnXLen: descriptor.posLen,
+            nnYLen: descriptor.posLen,
+            computationDataType: stableLinearDataType,
+            outputDataType: computeDataType)
+        let stemSpatialNHWC = transposeNCHWToNHWC(graph: graph, sourceTensor: stemConv.resultTensor)
+        let seqLen = descriptor.posLen.intValue * descriptor.posLen.intValue
+        let numHeads = descriptor.numHeads.intValue
+        let headDim = descriptor.headDim.intValue
+        let ropeShape: [NSNumber] = [1, seqLen as NSNumber, 1, descriptor.headDim]
+
+        var x = graph.reshape(stemSpatialNHWC, shape: [-1, seqLen as NSNumber, descriptor.hiddenSize], name: nil)
+        let stemGlobal = transformerLinear(
+            graph: graph,
+            descriptor: descriptor.stemGlobal,
+            sourceTensor: inputGlobalCompute,
+            outputShape: [-1, descriptor.hiddenSize],
+            computationDataType: stableLinearDataType)
+        let stemGlobalBroadcast = graph.reshape(stemGlobal, shape: [-1, 1, descriptor.hiddenSize], name: nil)
+        x = transformerAdd(graph: graph, lhs: x, rhs: stemGlobalBroadcast, resultDataType: computeDataType)
+
+        if descriptor.hasPosEmbed {
+            let posTensor = makeConstantTensor(
+                graph: graph,
+                pointer: descriptor.posEmbed!,
+                shape: [1, seqLen as NSNumber, descriptor.hiddenSize],
+                dataType: computeDataType)
+            x = transformerAdd(graph: graph, lhs: x, rhs: posTensor, resultDataType: computeDataType)
+        }
+
+        let ropeCosTensor = makeConstantTensor(
+            graph: graph,
+            pointer: descriptor.ropeCos,
+            shape: ropeShape,
+            dataType: .float32)
+        let ropeSinTensor = makeConstantTensor(
+            graph: graph,
+            pointer: descriptor.ropeSin,
+            shape: ropeShape,
+            dataType: .float32)
+
+        for block in descriptor.blocks {
+            let norm1 = transformerRMSNorm(graph: graph, sourceTensor: x, descriptor: block.norm1)
+            var q = transformerLinear(
+                graph: graph,
+                descriptor: block.qProj,
+                sourceTensor: norm1,
+                outputShape: [-1, seqLen as NSNumber, descriptor.hiddenSize],
+                computationDataType: stableLinearDataType)
+            var k = transformerLinear(
+                graph: graph,
+                descriptor: block.kProj,
+                sourceTensor: norm1,
+                outputShape: [-1, seqLen as NSNumber, descriptor.hiddenSize],
+                computationDataType: stableLinearDataType)
+            let v = transformerLinear(
+                graph: graph,
+                descriptor: block.vProj,
+                sourceTensor: norm1,
+                outputShape: [-1, seqLen as NSNumber, descriptor.hiddenSize],
+                computationDataType: stableLinearDataType)
+
+            q = graph.reshape(q, shape: [-1, seqLen as NSNumber, numHeads as NSNumber, headDim as NSNumber], name: nil)
+            k = graph.reshape(k, shape: [-1, seqLen as NSNumber, numHeads as NSNumber, headDim as NSNumber], name: nil)
+            let vHeads = graph.reshape(v, shape: [-1, seqLen as NSNumber, numHeads as NSNumber, headDim as NSNumber], name: nil)
+
+            q = transformerApplyRoPE(graph: graph, sourceTensor: q, ropeCosTensor: ropeCosTensor, ropeSinTensor: ropeSinTensor)
+            k = transformerApplyRoPE(graph: graph, sourceTensor: k, ropeCosTensor: ropeCosTensor, ropeSinTensor: ropeSinTensor)
+
+            let qAttention = swapAxes(graph: graph, sourceTensor: q, axis1: 1, axis2: 2)
+            let kAttention = swapAxes(graph: graph, sourceTensor: k, axis1: 1, axis2: 2)
+            let vAttention = swapAxes(graph: graph, sourceTensor: vHeads, axis1: 1, axis2: 2)
+            let attn = graph.scaledDotProductAttention(
+                query: qAttention,
+                key: kAttention,
+                value: vAttention,
+                scale: Float(1.0 / Foundation.sqrt(Double(headDim))),
+                name: nil)
+            let attnTransposed = swapAxes(graph: graph, sourceTensor: attn, axis1: 1, axis2: 2)
+            let attnFlat = graph.reshape(attnTransposed, shape: [-1, seqLen as NSNumber, descriptor.hiddenSize], name: nil)
+            let attnProj = transformerLinear(
+                graph: graph,
+                descriptor: block.outProj,
+                sourceTensor: attnFlat,
+                outputShape: [-1, seqLen as NSNumber, descriptor.hiddenSize],
+                computationDataType: stableLinearDataType)
+            x = transformerAdd(graph: graph, lhs: x, rhs: attnProj, resultDataType: computeDataType)
+
+            let norm2 = transformerRMSNorm(graph: graph, sourceTensor: x, descriptor: block.norm2)
+            let ffn1 = transformerLinear(
+                graph: graph,
+                descriptor: block.ffnW1,
+                sourceTensor: norm2,
+                outputShape: [-1, seqLen as NSNumber, descriptor.ffnDim],
+                computationDataType: stableLinearDataType)
+            let ffnGate = transformerLinear(
+                graph: graph,
+                descriptor: block.ffnWGate,
+                sourceTensor: norm2,
+                outputShape: [-1, seqLen as NSNumber, descriptor.ffnDim],
+                computationDataType: stableLinearDataType)
+            let ffnAct = transformerSwiGLU(graph: graph, lhs: ffn1, rhs: ffnGate)
+            let ffnOut = transformerLinear(
+                graph: graph,
+                descriptor: block.ffnW2,
+                sourceTensor: ffnAct,
+                outputShape: [-1, seqLen as NSNumber, descriptor.hiddenSize],
+                computationDataType: stableLinearDataType)
+            x = transformerAdd(graph: graph, lhs: x, rhs: ffnOut, resultDataType: computeDataType)
+        }
+
+        let xFinal = transformerRMSNorm(graph: graph, sourceTensor: x, descriptor: descriptor.finalNorm)
+        let pooled = transformerMeanPool(graph: graph, sourceTensor: xFinal, seqLen: seqLen)
+
+        policyTensor = castTensorIfNeeded(graph: graph, sourceTensor: transformerLinear(
+            graph: graph,
+            descriptor: descriptor.policyBoard,
+            sourceTensor: xFinal,
+            outputShape: [-1, seqLen as NSNumber, descriptor.policyBoard.outChannels],
+            computationDataType: stableLinearDataType), to: .float32)
+        policyPassTensor = castTensorIfNeeded(graph: graph, sourceTensor: transformerLinear(
+            graph: graph,
+            descriptor: descriptor.policyPass,
+            sourceTensor: pooled,
+            outputShape: [-1, descriptor.policyPass.outChannels],
+            computationDataType: stableLinearDataType), to: .float32)
+        valueTensor = castTensorIfNeeded(graph: graph, sourceTensor: transformerLinear(
+            graph: graph,
+            descriptor: descriptor.value,
+            sourceTensor: pooled,
+            outputShape: [-1, descriptor.value.outChannels],
+            computationDataType: stableLinearDataType), to: .float32)
+        scoreValueTensor = castTensorIfNeeded(graph: graph, sourceTensor: transformerLinear(
+            graph: graph,
+            descriptor: descriptor.scoreValue,
+            sourceTensor: pooled,
+            outputShape: [-1, descriptor.scoreValue.outChannels],
+            computationDataType: stableLinearDataType), to: .float32)
+        let ownershipExpanded = transformerLinear(
+            graph: graph,
+            descriptor: descriptor.ownership,
+            sourceTensor: xFinal,
+            outputShape: [-1, seqLen as NSNumber, 1],
+            computationDataType: stableLinearDataType)
+        ownershipTensor = castTensorIfNeeded(
+            graph: graph,
+            sourceTensor: graph.reshape(ownershipExpanded, shape: [-1, seqLen as NSNumber], name: nil),
+            to: .float32)
+
+        if descriptor.supportsFullRawOutputs {
+            fullPolicyTensor = castTensorIfNeeded(graph: graph, sourceTensor: transformerLinear(
+                graph: graph,
+                descriptor: descriptor.policyBoardFull,
+                sourceTensor: xFinal,
+                outputShape: [-1, seqLen as NSNumber, descriptor.policyBoardFull.outChannels],
+                computationDataType: stableLinearDataType), to: .float32)
+            fullPolicyPassTensor = castTensorIfNeeded(graph: graph, sourceTensor: transformerLinear(
+                graph: graph,
+                descriptor: descriptor.policyPassFull,
+                sourceTensor: pooled,
+                outputShape: [-1, descriptor.policyPassFull.outChannels],
+                computationDataType: stableLinearDataType), to: .float32)
+            miscTensor = castTensorIfNeeded(graph: graph, sourceTensor: transformerLinear(
+                graph: graph,
+                descriptor: descriptor.misc,
+                sourceTensor: pooled,
+                outputShape: [-1, descriptor.misc.outChannels],
+                computationDataType: stableLinearDataType), to: .float32)
+            moreMiscTensor = castTensorIfNeeded(graph: graph, sourceTensor: transformerLinear(
+                graph: graph,
+                descriptor: descriptor.moreMisc,
+                sourceTensor: pooled,
+                outputShape: [-1, descriptor.moreMisc.outChannels],
+                computationDataType: stableLinearDataType), to: .float32)
+            let scoringExpanded = transformerLinear(
+                graph: graph,
+                descriptor: descriptor.scoring,
+                sourceTensor: xFinal,
+                outputShape: [-1, seqLen as NSNumber, 1],
+                computationDataType: stableLinearDataType)
+            scoringTensor = castTensorIfNeeded(
+                graph: graph,
+                sourceTensor: graph.reshape(scoringExpanded, shape: [-1, seqLen as NSNumber], name: nil),
+                to: .float32)
+            futurePosTensor = castTensorIfNeeded(graph: graph, sourceTensor: transformerLinear(
+                graph: graph,
+                descriptor: descriptor.futurePos,
+                sourceTensor: xFinal,
+                outputShape: [-1, seqLen as NSNumber, descriptor.futurePos.outChannels],
+                computationDataType: stableLinearDataType), to: .float32)
+            sekiTensor = castTensorIfNeeded(graph: graph, sourceTensor: transformerLinear(
+                graph: graph,
+                descriptor: descriptor.seki,
+                sourceTensor: xFinal,
+                outputShape: [-1, seqLen as NSNumber, descriptor.seki.outChannels],
+                computationDataType: stableLinearDataType), to: .float32)
+            scoreBeliefProjectTensor = castTensorIfNeeded(graph: graph, sourceTensor: transformerLinear(
+                graph: graph,
+                descriptor: descriptor.scoreBelief,
+                sourceTensor: pooled,
+                outputShape: [-1, descriptor.scoreBelief.outChannels],
+                computationDataType: stableLinearDataType), to: .float32)
+            fullTargets = [
+                fullPolicyPassTensor!,
+                fullPolicyTensor!,
+                valueTensor,
+                miscTensor!,
+                moreMiscTensor!,
+                ownershipTensor,
+                scoringTensor!,
+                futurePosTensor!,
+                sekiTensor!,
+                scoreBeliefProjectTensor!,
+            ]
+        } else {
+            fullPolicyTensor = nil
+            fullPolicyPassTensor = nil
+            miscTensor = nil
+            moreMiscTensor = nil
+            scoringTensor = nil
+            futurePosTensor = nil
+            sekiTensor = nil
+            scoreBeliefProjectTensor = nil
+            fullTargets = []
+        }
+
+        subsetTargets = [
+            policyPassTensor,
+            policyTensor,
+            valueTensor,
+            scoreValueTensor,
+            ownershipTensor,
+        ]
+    }
+
+    private func makeInputArray(
+        pointer: UnsafeMutablePointer<Float32>,
+        shape: [NSNumber]
+    ) -> MPSNDArray {
+        let descriptor = MPSNDArrayDescriptor(dataType: .float32, shape: shape)
+        let array = MPSNDArray(device: device, descriptor: descriptor)
+        array.writeBytes(pointer)
+        return array
+    }
+
+    private func run(
+        batchSize: Int,
+        targetTensors: [MPSGraphTensor],
+        inputPointer: UnsafeMutablePointer<Float32>,
+        inputGlobalPointer: UnsafeMutablePointer<Float32>
+    ) -> [MPSGraphTensor : MPSGraphTensorData] {
+        let inputArray = makeInputArray(
+            pointer: inputPointer,
+            shape: [batchSize as NSNumber, desc.posLen, desc.posLen, desc.numInputChannels])
+        let inputGlobalArray = makeInputArray(
+            pointer: inputGlobalPointer,
+            shape: [batchSize as NSNumber, desc.numInputGlobalChannels])
+        let feeds = [
+            inputTensor: MPSGraphTensorData(inputArray),
+            inputGlobalTensor: MPSGraphTensorData(inputGlobalArray),
+        ]
+        return graph.run(
+            with: commandQueue,
+            feeds: feeds,
+            targetTensors: targetTensors,
+            targetOperations: nil)
+    }
+
+    private func finalizeScoreBelief(
+        inputGlobal: UnsafeMutablePointer<Float32>,
+        project: UnsafeMutablePointer<Float32>,
+        output: UnsafeMutablePointer<Float32>,
+        batchSize: Int
+    ) {
+        let scoreBeliefLen = desc.scoreBeliefLen.intValue
+        let projectSize = desc.scoreBeliefProjectSize
+        let numBeliefs = desc.numScoreBeliefs.intValue
+        let numGlobal = desc.numInputGlobalChannels.intValue
+
+        for batchIdx in 0 ..< batchSize {
+            let projectBase = batchIdx * projectSize
+            let outputBase = batchIdx * scoreBeliefLen
+            if desc.scoreMode == 0 {
+                var logits = Array(UnsafeBufferPointer(start: project + projectBase, count: scoreBeliefLen))
+                transformerScoreBeliefLogSoftmax(&logits)
+                for index in 0 ..< scoreBeliefLen {
+                    output[outputBase + index] = logits[index]
+                }
+                continue
+            }
+
+            var belief = Array(
+                UnsafeBufferPointer(
+                    start: project + projectBase,
+                    count: scoreBeliefLen * numBeliefs))
+            var mixLogits = Array(
+                UnsafeBufferPointer(
+                    start: project + projectBase + scoreBeliefLen * numBeliefs,
+                    count: numBeliefs))
+
+            if desc.scoreMode == 2 {
+                let scoreParity = inputGlobal[batchIdx * numGlobal + numGlobal - 1]
+                let mid = scoreBeliefLen / 2
+                for i in 0 ..< scoreBeliefLen {
+                    let diff = i - mid
+                    let parityBit = ((diff % 2) + 2) % 2
+                    let offsetTerm = Float32(0.05) * (Float32(diff) + Float32(0.5))
+                    let parityTerm = (Float32(0.5) - Float32(parityBit)) * scoreParity
+                    for j in 0 ..< numBeliefs {
+                        belief[i * numBeliefs + j] +=
+                            offsetTerm * desc.scoreBeliefS2OffWeight![j] +
+                            parityTerm * desc.scoreBeliefS2ParWeight![j]
+                    }
+                }
+            }
+
+            for beliefIdx in 0 ..< numBeliefs {
+                var slice = [Float32](repeating: 0.0, count: scoreBeliefLen)
+                for scoreIdx in 0 ..< scoreBeliefLen {
+                    slice[scoreIdx] = belief[scoreIdx * numBeliefs + beliefIdx]
+                }
+                transformerScoreBeliefLogSoftmax(&slice)
+                for scoreIdx in 0 ..< scoreBeliefLen {
+                    belief[scoreIdx * numBeliefs + beliefIdx] = slice[scoreIdx]
+                }
+            }
+
+            transformerScoreBeliefLogSoftmax(&mixLogits)
+            for scoreIdx in 0 ..< scoreBeliefLen {
+                var maxValue = belief[scoreIdx * numBeliefs] + mixLogits[0]
+                for beliefIdx in 1 ..< numBeliefs {
+                    maxValue = Swift.max(maxValue, belief[scoreIdx * numBeliefs + beliefIdx] + mixLogits[beliefIdx])
+                }
+                var sum: Double = 0.0
+                for beliefIdx in 0 ..< numBeliefs {
+                    sum += Foundation.exp(
+                        Double(belief[scoreIdx * numBeliefs + beliefIdx] + mixLogits[beliefIdx] - maxValue))
+                }
+                output[outputBase + scoreIdx] = Float32(Double(maxValue) + Foundation.log(sum))
+            }
+        }
+    }
+
+    func apply(
+        input inputPointer: UnsafeMutablePointer<Float32>,
+        inputGlobal inputGlobalPointer: UnsafeMutablePointer<Float32>,
+        policyPass: UnsafeMutablePointer<Float32>,
+        policy: UnsafeMutablePointer<Float32>,
+        value: UnsafeMutablePointer<Float32>,
+        scoreValue: UnsafeMutablePointer<Float32>,
+        ownership: UnsafeMutablePointer<Float32>,
+        batchSize: Int
+    ) {
+        let fetch = run(
+            batchSize: batchSize,
+            targetTensors: subsetTargets,
+            inputPointer: inputPointer,
+            inputGlobalPointer: inputGlobalPointer)
+        fetch[policyPassTensor]?.mpsndarray().readBytes(policyPass)
+        fetch[policyTensor]?.mpsndarray().readBytes(policy)
+        fetch[valueTensor]?.mpsndarray().readBytes(value)
+        fetch[scoreValueTensor]?.mpsndarray().readBytes(scoreValue)
+        fetch[ownershipTensor]?.mpsndarray().readBytes(ownership)
+    }
+
+    func applyFull(
+        input inputPointer: UnsafeMutablePointer<Float32>,
+        inputGlobal inputGlobalPointer: UnsafeMutablePointer<Float32>,
+        policyPass: UnsafeMutablePointer<Float32>,
+        policy: UnsafeMutablePointer<Float32>,
+        value: UnsafeMutablePointer<Float32>,
+        misc: UnsafeMutablePointer<Float32>,
+        moreMisc: UnsafeMutablePointer<Float32>,
+        ownership: UnsafeMutablePointer<Float32>,
+        scoring: UnsafeMutablePointer<Float32>,
+        futurePos: UnsafeMutablePointer<Float32>,
+        seki: UnsafeMutablePointer<Float32>,
+        scoreBelief: UnsafeMutablePointer<Float32>,
+        batchSize: Int
+    ) {
+        precondition(desc.supportsFullRawOutputs)
+        let fetch = run(
+            batchSize: batchSize,
+            targetTensors: fullTargets,
+            inputPointer: inputPointer,
+            inputGlobalPointer: inputGlobalPointer)
+        fetch[fullPolicyPassTensor!]?.mpsndarray().readBytes(policyPass)
+        fetch[fullPolicyTensor!]?.mpsndarray().readBytes(policy)
+        fetch[valueTensor]?.mpsndarray().readBytes(value)
+        fetch[miscTensor!]?.mpsndarray().readBytes(misc)
+        fetch[moreMiscTensor!]?.mpsndarray().readBytes(moreMisc)
+        fetch[ownershipTensor]?.mpsndarray().readBytes(ownership)
+        fetch[scoringTensor!]?.mpsndarray().readBytes(scoring)
+        fetch[futurePosTensor!]?.mpsndarray().readBytes(futurePos)
+        fetch[sekiTensor!]?.mpsndarray().readBytes(seki)
+
+        let projectCount = batchSize * desc.scoreBeliefProjectSize
+        let projectBuffer = UnsafeMutablePointer<Float32>.allocate(capacity: projectCount)
+        defer { projectBuffer.deallocate() }
+        fetch[scoreBeliefProjectTensor!]?.mpsndarray().readBytes(projectBuffer)
+        finalizeScoreBelief(
+            inputGlobal: inputGlobalPointer,
+            project: projectBuffer,
+            output: scoreBelief,
+            batchSize: batchSize)
+    }
+}
+
+public class MetalTransformerComputeHandle {
+    let model: TransformerModel
+
+    init(model: TransformerModel) {
+        self.model = model
+    }
+
+    public func apply(
+        _ batchSize: Int,
+        input inputPointer: UnsafeMutablePointer<Float32>,
+        inputGlobal inputGlobalPointer: UnsafeMutablePointer<Float32>,
+        policyPass: UnsafeMutablePointer<Float32>,
+        policy: UnsafeMutablePointer<Float32>,
+        value: UnsafeMutablePointer<Float32>,
+        scoreValue: UnsafeMutablePointer<Float32>,
+        ownership: UnsafeMutablePointer<Float32>
+    ) {
+        autoreleasepool {
+            model.apply(
+                input: inputPointer,
+                inputGlobal: inputGlobalPointer,
+                policyPass: policyPass,
+                policy: policy,
+                value: value,
+                scoreValue: scoreValue,
+                ownership: ownership,
+                batchSize: batchSize)
+        }
+    }
+
+    public func applyFull(
+        _ batchSize: Int,
+        input inputPointer: UnsafeMutablePointer<Float32>,
+        inputGlobal inputGlobalPointer: UnsafeMutablePointer<Float32>,
+        policyPass: UnsafeMutablePointer<Float32>,
+        policy: UnsafeMutablePointer<Float32>,
+        value: UnsafeMutablePointer<Float32>,
+        misc: UnsafeMutablePointer<Float32>,
+        moreMisc: UnsafeMutablePointer<Float32>,
+        ownership: UnsafeMutablePointer<Float32>,
+        scoring: UnsafeMutablePointer<Float32>,
+        futurePos: UnsafeMutablePointer<Float32>,
+        seki: UnsafeMutablePointer<Float32>,
+        scoreBelief: UnsafeMutablePointer<Float32>
+    ) {
+        autoreleasepool {
+            model.applyFull(
+                input: inputPointer,
+                inputGlobal: inputGlobalPointer,
+                policyPass: policyPass,
+                policy: policy,
+                value: value,
+                misc: misc,
+                moreMisc: moreMisc,
+                ownership: ownership,
+                scoring: scoring,
+                futurePos: futurePos,
+                seki: seki,
+                scoreBelief: scoreBelief,
+                batchSize: batchSize)
+        }
+    }
+}
+
+public func maybeCreateMetalTransformerComputeHandle(
+    _ condition: Bool,
+    _ serverThreadIdx: Int = 0,
+    _ descriptor: SWTransformerModelDesc,
+    _ context: MetalComputeContext
+) -> MetalTransformerComputeHandle? {
+    guard condition else { return nil }
+
+    let device = MTLCreateSystemDefaultDevice()!
+    let precision = chooseTransformerPrecision(device: device, requestedMode: context.useFP16Mode)
+    let model = TransformerModel(
+        device: device,
+        graph: MPSGraph(),
+        descriptor: descriptor,
+        precision: precision)
+    let handle = MetalTransformerComputeHandle(model: model)
+
+    printError(
+        "Metal backend \(serverThreadIdx): \(device.name), Transformer model version \(descriptor.version) \(descriptor.name), \(context.nnXLen)x\(context.nnYLen), precision \(precision.rawValue)"
+    )
+    if precision == .float16 {
+        printError(
+            "WARNING: Metal Transformer fp16 inference may overflow to NaN/Inf on some models or positions. This is more likely when the checkpoint was trained with bf16/fp32 or mixed precision. Validate raw outputs before relying on fp16."
+        )
+    }
+
+    return handle
+}
+
 // A enum to represent enabled/disabled/auto option of a feature.
 public enum SWEnable {
     case False
@@ -3177,6 +4149,8 @@ public enum SWEnable {
 public class MetalComputeContext {
     public let nnXLen: Int32
     public let nnYLen: Int32
+    let useFP16Mode: SWEnable
+    let useNHWCMode: SWEnable
 
     /// Initialize a context.
     /// - Parameters:
@@ -3184,20 +4158,28 @@ public class MetalComputeContext {
     ///   - nnYLen: The height of the input tensor.
     init(
         nnXLen: Int32,
-        nnYLen: Int32
+        nnYLen: Int32,
+        useFP16Mode: SWEnable,
+        useNHWCMode: SWEnable
     ) {
         self.nnXLen = nnXLen
         self.nnYLen = nnYLen
+        self.useFP16Mode = useFP16Mode
+        self.useNHWCMode = useNHWCMode
     }
 }
 
 public func createMetalComputeContext(
     nnXLen: Int32,
-    nnYLen: Int32
+    nnYLen: Int32,
+    useFP16Mode: SWEnable,
+    useNHWCMode: SWEnable
 ) -> MetalComputeContext {
     return MetalComputeContext(
         nnXLen: nnXLen,
-        nnYLen: nnYLen)
+        nnYLen: nnYLen,
+        useFP16Mode: useFP16Mode,
+        useNHWCMode: useNHWCMode)
 }
 
 /// A class that represents a handle of GPU device.

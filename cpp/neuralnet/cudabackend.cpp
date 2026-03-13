@@ -10,6 +10,7 @@
 #include "../neuralnet/sgfmetadata.h"
 #include "../neuralnet/nneval.h"
 #include "../neuralnet/desc.h"
+#include "../neuralnet/transformerdesc.h"
 
 #include "../core/simpleallocator.h"
 #include "../core/test.h"
@@ -2120,12 +2121,652 @@ struct Model {
 
 //------------------------------------------------------------------------------
 
+static MatMulLayerDesc makeTransformerMatMulDesc(
+  const string& name,
+  int inChannels,
+  int outChannels,
+  const vector<float>& weights
+) {
+  MatMulLayerDesc desc;
+  desc.name = name;
+  desc.inChannels = inChannels;
+  desc.outChannels = outChannels;
+  desc.weights = weights;
+  return desc;
+}
+
+static ConvLayerDesc makeTransformerConvDesc(
+  const string& name,
+  int inChannels,
+  int outChannels,
+  int kernelSize,
+  const vector<float>& weights
+) {
+  ConvLayerDesc desc;
+  desc.name = name;
+  desc.convYSize = kernelSize;
+  desc.convXSize = kernelSize;
+  desc.inChannels = inChannels;
+  desc.outChannels = outChannels;
+  desc.dilationY = 1;
+  desc.dilationX = 1;
+  desc.weights = weights;
+  return desc;
+}
+
+struct TransformerRMSNorm {
+  const string name;
+  const int channels;
+  float* weightBuf;
+
+  TransformerRMSNorm(const string& name_, const vector<float>& weights)
+    : name(name_), channels((int)weights.size()), weightBuf(nullptr)
+  {
+    void* buf = nullptr;
+    CudaUtils::mallocAndCopyToDevice(name, weights, buf, false);
+    weightBuf = reinterpret_cast<float*>(buf);
+  }
+
+  ~TransformerRMSNorm() {
+    cudaFree(weightBuf);
+  }
+
+  TransformerRMSNorm() = delete;
+  TransformerRMSNorm(const TransformerRMSNorm&) = delete;
+  TransformerRMSNorm& operator=(const TransformerRMSNorm&) = delete;
+
+  void apply(int rows, const float* inputBuf, float* outputBuf) const {
+    customCudaRMSNorm(inputBuf, outputBuf, weightBuf, rows, channels, 1e-6f);
+    CUDA_ERR(name.c_str(), cudaPeekAtLastError());
+  }
+};
+
+struct TransformerLinear {
+  MatMulLayerDesc desc;
+  MatMulLayer layer;
+
+  TransformerLinear(
+    CudaHandles* cudaHandles,
+    const string& name,
+    int inChannels,
+    int outChannels,
+    const vector<float>& weights
+  ) :
+    desc(makeTransformerMatMulDesc(name, inChannels, outChannels, weights)),
+    layer(cudaHandles, &desc, false)
+  {}
+
+  TransformerLinear() = delete;
+  TransformerLinear(const TransformerLinear&) = delete;
+  TransformerLinear& operator=(const TransformerLinear&) = delete;
+
+  void apply(
+    CudaHandles* cudaHandles,
+    ScratchBuffers* scratch,
+    int batchSize,
+    void* inputBuf,
+    void* outputBuf
+  ) const {
+    layer.apply(cudaHandles, scratch, batchSize, inputBuf, outputBuf, nullptr, 0);
+  }
+};
+
+struct TransformerBlock {
+  const string name;
+  const int hiddenSize;
+  const int numHeads;
+  const int headDim;
+  const int ffnDim;
+  const int seqLen;
+
+  TransformerRMSNorm norm1;
+  TransformerLinear qProj;
+  TransformerLinear kProj;
+  TransformerLinear vProj;
+  TransformerLinear outProj;
+  TransformerRMSNorm norm2;
+  TransformerLinear ffnW1;
+  TransformerLinear ffnWGate;
+  TransformerLinear ffnW2;
+
+  TransformerBlock() = delete;
+  TransformerBlock(const TransformerBlock&) = delete;
+  TransformerBlock& operator=(const TransformerBlock&) = delete;
+
+  TransformerBlock(
+    CudaHandles* cudaHandles,
+    const TransformerBlockDesc& desc,
+    int hiddenSize_,
+    int numHeads_,
+    int headDim_,
+    int ffnDim_,
+    int seqLen_,
+    int blockIdx
+  ) :
+    name("transformer_block_" + Global::intToString(blockIdx)),
+    hiddenSize(hiddenSize_),
+    numHeads(numHeads_),
+    headDim(headDim_),
+    ffnDim(ffnDim_),
+    seqLen(seqLen_),
+    norm1(name + "_norm1", desc.norm1Weight),
+    qProj(cudaHandles, name + "_q", hiddenSize, hiddenSize, desc.qWeight),
+    kProj(cudaHandles, name + "_k", hiddenSize, hiddenSize, desc.kWeight),
+    vProj(cudaHandles, name + "_v", hiddenSize, hiddenSize, desc.vWeight),
+    outProj(cudaHandles, name + "_out", hiddenSize, hiddenSize, desc.outWeight),
+    norm2(name + "_norm2", desc.norm2Weight),
+    ffnW1(cudaHandles, name + "_ff1", hiddenSize, ffnDim, desc.ffnW1Weight),
+    ffnWGate(cudaHandles, name + "_ffg", hiddenSize, ffnDim, desc.ffnWGateWeight),
+    ffnW2(cudaHandles, name + "_ff2", ffnDim, hiddenSize, desc.ffnW2Weight)
+  {}
+
+  void apply(
+    CudaHandles* cudaHandles,
+    ScratchBuffers* scratch,
+    int batchSize,
+    const float* ropeCosBuf,
+    const float* ropeSinBuf,
+    float* xBuf
+  ) const {
+    int tokenCount = batchSize * seqLen;
+    size_t hiddenBytes = (size_t)tokenCount * hiddenSize * sizeof(float);
+    size_t ffnBytes = (size_t)tokenCount * ffnDim * sizeof(float);
+    size_t logitsBytes = (size_t)batchSize * numHeads * seqLen * seqLen * sizeof(float);
+
+    SizedBuf<void*> normBuf(scratch->allocator, hiddenBytes);
+    SizedBuf<void*> qBuf(scratch->allocator, hiddenBytes);
+    SizedBuf<void*> kBuf(scratch->allocator, hiddenBytes);
+    SizedBuf<void*> vBuf(scratch->allocator, hiddenBytes);
+    SizedBuf<void*> logitsBuf(scratch->allocator, logitsBytes);
+    SizedBuf<void*> attnBuf(scratch->allocator, hiddenBytes);
+    SizedBuf<void*> projBuf(scratch->allocator, hiddenBytes);
+    SizedBuf<void*> norm2Buf(scratch->allocator, hiddenBytes);
+    SizedBuf<void*> ffn1Buf(scratch->allocator, ffnBytes);
+    SizedBuf<void*> ffnGateBuf(scratch->allocator, ffnBytes);
+    SizedBuf<void*> ffnActBuf(scratch->allocator, ffnBytes);
+    SizedBuf<void*> ffnOutBuf(scratch->allocator, hiddenBytes);
+
+    norm1.apply(tokenCount, xBuf, reinterpret_cast<float*>(normBuf.buf));
+    qProj.apply(cudaHandles, scratch, tokenCount, normBuf.buf, qBuf.buf);
+    kProj.apply(cudaHandles, scratch, tokenCount, normBuf.buf, kBuf.buf);
+    vProj.apply(cudaHandles, scratch, tokenCount, normBuf.buf, vBuf.buf);
+
+    customCudaApplyRotaryInplace(
+      reinterpret_cast<float*>(qBuf.buf),
+      reinterpret_cast<float*>(kBuf.buf),
+      ropeCosBuf,
+      ropeSinBuf,
+      batchSize,
+      seqLen,
+      numHeads,
+      headDim
+    );
+    CUDA_ERR(name.c_str(), cudaPeekAtLastError());
+
+    customCudaAttentionLogits(
+      reinterpret_cast<float*>(qBuf.buf),
+      reinterpret_cast<float*>(kBuf.buf),
+      reinterpret_cast<float*>(logitsBuf.buf),
+      batchSize,
+      seqLen,
+      numHeads,
+      headDim,
+      1.0f / sqrt((float)headDim)
+    );
+    CUDA_ERR(name.c_str(), cudaPeekAtLastError());
+
+    customCudaAttentionSoftmaxInplace(reinterpret_cast<float*>(logitsBuf.buf), batchSize, seqLen, numHeads);
+    CUDA_ERR(name.c_str(), cudaPeekAtLastError());
+
+    customCudaAttentionValues(
+      reinterpret_cast<float*>(logitsBuf.buf),
+      reinterpret_cast<float*>(vBuf.buf),
+      reinterpret_cast<float*>(attnBuf.buf),
+      batchSize,
+      seqLen,
+      numHeads,
+      headDim
+    );
+    CUDA_ERR(name.c_str(), cudaPeekAtLastError());
+
+    outProj.apply(cudaHandles, scratch, tokenCount, attnBuf.buf, projBuf.buf);
+    customCudaAddResidual(xBuf, reinterpret_cast<float*>(projBuf.buf), tokenCount * hiddenSize);
+    CUDA_ERR(name.c_str(), cudaPeekAtLastError());
+
+    norm2.apply(tokenCount, xBuf, reinterpret_cast<float*>(norm2Buf.buf));
+    ffnW1.apply(cudaHandles, scratch, tokenCount, norm2Buf.buf, ffn1Buf.buf);
+    ffnWGate.apply(cudaHandles, scratch, tokenCount, norm2Buf.buf, ffnGateBuf.buf);
+    customCudaSiluMultiply(
+      reinterpret_cast<float*>(ffn1Buf.buf),
+      reinterpret_cast<float*>(ffnGateBuf.buf),
+      reinterpret_cast<float*>(ffnActBuf.buf),
+      tokenCount * ffnDim
+    );
+    CUDA_ERR(name.c_str(), cudaPeekAtLastError());
+    ffnW2.apply(cudaHandles, scratch, tokenCount, ffnActBuf.buf, ffnOutBuf.buf);
+    customCudaAddResidual(xBuf, reinterpret_cast<float*>(ffnOutBuf.buf), tokenCount * hiddenSize);
+    CUDA_ERR(name.c_str(), cudaPeekAtLastError());
+  }
+};
+
+struct TransformerModel {
+  const string name;
+  const int modelVersion;
+  const int posLen;
+  const int maxBatchSize;
+  const int nnXLen;
+  const int nnYLen;
+  const int hiddenSize;
+  const int numHeads;
+  const int headDim;
+  const int numInputChannels;
+  const int numInputGlobalChannels;
+  const int numInputMetaChannels;
+  const int numPolicyChannels;
+  const int numFullPolicyChannels;
+  const int numValueChannels;
+  const int numScoreValueChannels;
+  const int numOwnershipChannels;
+  const int numMiscChannels;
+  const int numMoreMiscChannels;
+  const int numScoringChannels;
+  const int numFuturePosChannels;
+  const int numSekiChannels;
+  const int scoreMode;
+  const int numScoreBeliefs;
+  const int scoreBeliefLen;
+  const int scoreBeliefProjectSize;
+  const bool inputsUsingNHWC;
+
+  unique_ptr<CudnnManager> manager;
+  unique_ptr<ConvLayer> stemConv;
+  unique_ptr<TransformerLinear> stemGlobal;
+  float* posBuf;
+  float* ropeCosBuf;
+  float* ropeSinBuf;
+  vector<unique_ptr<TransformerBlock>> blocks;
+  unique_ptr<TransformerRMSNorm> finalNorm;
+  unique_ptr<TransformerLinear> policyBoard;
+  unique_ptr<TransformerLinear> policyPass;
+  unique_ptr<TransformerLinear> policyBoardFull;
+  unique_ptr<TransformerLinear> policyPassFull;
+  unique_ptr<TransformerLinear> valueHead;
+  unique_ptr<TransformerLinear> miscHead;
+  unique_ptr<TransformerLinear> moreMiscHead;
+  unique_ptr<TransformerLinear> scoreValueHead;
+  unique_ptr<TransformerLinear> ownershipHead;
+  unique_ptr<TransformerLinear> scoringHead;
+  unique_ptr<TransformerLinear> futurePosHead;
+  unique_ptr<TransformerLinear> sekiHead;
+  unique_ptr<TransformerLinear> scoreBeliefHead;
+  vector<float> scoreBeliefS2OffWeight;
+  vector<float> scoreBeliefS2ParWeight;
+
+  TransformerModel() = delete;
+  TransformerModel(const TransformerModel&) = delete;
+  TransformerModel& operator=(const TransformerModel&) = delete;
+
+  TransformerModel(
+    CudaHandles* cudaHandles,
+    const TransformerModelDesc* desc,
+    int maxBatchSz,
+    int nnX,
+    int nnY,
+    bool inputsUseNHWC
+  ) :
+    name(desc->name),
+    modelVersion(desc->modelVersion),
+    posLen(desc->posLen),
+    maxBatchSize(maxBatchSz),
+    nnXLen(nnX),
+    nnYLen(nnY),
+    hiddenSize(desc->hiddenSize),
+    numHeads(desc->numHeads),
+    headDim(desc->headDim),
+    numInputChannels(desc->numInputChannels),
+    numInputGlobalChannels(desc->numInputGlobalChannels),
+    numInputMetaChannels(0),
+    numPolicyChannels(2),
+    numFullPolicyChannels(6),
+    numValueChannels(3),
+    numScoreValueChannels(6),
+    numOwnershipChannels(1),
+    numMiscChannels(10),
+    numMoreMiscChannels(8),
+    numScoringChannels(1),
+    numFuturePosChannels(2),
+    numSekiChannels(4),
+    scoreMode(desc->scoreMode),
+    numScoreBeliefs(desc->numScoreBeliefs),
+    scoreBeliefLen(desc->scoreBeliefLen),
+    scoreBeliefProjectSize(
+      desc->scoreMode == 0 ? desc->scoreBeliefLen :
+      (desc->scoreBeliefLen > 0 && desc->numScoreBeliefs > 0 ? desc->scoreBeliefLen * desc->numScoreBeliefs + desc->numScoreBeliefs : 0)
+    ),
+    inputsUsingNHWC(inputsUseNHWC),
+    posBuf(nullptr),
+    ropeCosBuf(nullptr),
+    ropeSinBuf(nullptr)
+  {
+    if(desc->modelVersion != 15)
+      throw StringError("Transformer CUDA backend 当前只支持 model version 15");
+    if(nnXLen != posLen || nnYLen != posLen)
+      throw StringError("Transformer CUDA backend 仅支持与导出 pos_len 完全一致的棋盘尺寸");
+
+    int numFeatures = NNModelVersion::getNumSpatialFeatures(modelVersion);
+    if(numInputChannels != numFeatures)
+      throw StringError("Transformer 模型的空间输入特征数量与 model version 不匹配");
+    int numGlobalFeatures = NNModelVersion::getNumGlobalFeatures(modelVersion);
+    if(numInputGlobalChannels != numGlobalFeatures)
+      throw StringError("Transformer 模型的全局输入特征数量与 model version 不匹配");
+
+    manager = std::make_unique<CudnnManager>(name + "_tf", maxBatchSize, nnXLen, nnYLen);
+
+    ConvLayerDesc stemConvDesc = makeTransformerConvDesc(name + "_stem_conv", numInputChannels, hiddenSize, desc->stemKernelSize, desc->stemConvWeight);
+    stemConv = std::make_unique<ConvLayer>(cudaHandles, manager.get(), &stemConvDesc, false, inputsUseNHWC, false);
+
+    stemGlobal = std::make_unique<TransformerLinear>(cudaHandles, name + "_stem_global", numInputGlobalChannels, hiddenSize, desc->stemGlobalWeight);
+
+    if(desc->hasPosEmbed) {
+      void* buf = nullptr;
+      CudaUtils::mallocAndCopyToDevice(name + "_pos_embed", desc->posEmbed, buf, false);
+      posBuf = reinterpret_cast<float*>(buf);
+    }
+    {
+      void* buf = nullptr;
+      CudaUtils::mallocAndCopyToDevice(name + "_rope_cos", desc->ropeCos, buf, false);
+      ropeCosBuf = reinterpret_cast<float*>(buf);
+    }
+    {
+      void* buf = nullptr;
+      CudaUtils::mallocAndCopyToDevice(name + "_rope_sin", desc->ropeSin, buf, false);
+      ropeSinBuf = reinterpret_cast<float*>(buf);
+    }
+
+    for(int i = 0; i < desc->numLayers; i++) {
+      blocks.push_back(make_unique<TransformerBlock>(
+        cudaHandles,
+        desc->blocks[i],
+        hiddenSize,
+        numHeads,
+        headDim,
+        desc->ffnDim,
+        posLen * posLen,
+        i
+      ));
+    }
+
+    finalNorm = make_unique<TransformerRMSNorm>(name + "_final_norm", desc->finalNormWeight);
+
+    policyBoard = make_unique<TransformerLinear>(cudaHandles, name + "_policy_board", hiddenSize, 2, desc->policyBoardWeight);
+    policyPass = make_unique<TransformerLinear>(cudaHandles, name + "_policy_pass", hiddenSize, 2, desc->policyPassWeight);
+    if(!desc->policyBoardFullWeight.empty()) {
+      policyBoardFull = make_unique<TransformerLinear>(cudaHandles, name + "_policy_board_full", hiddenSize, numFullPolicyChannels, desc->policyBoardFullWeight);
+      policyPassFull = make_unique<TransformerLinear>(cudaHandles, name + "_policy_pass_full", hiddenSize, numFullPolicyChannels, desc->policyPassFullWeight);
+      miscHead = make_unique<TransformerLinear>(cudaHandles, name + "_misc", hiddenSize, numMiscChannels, desc->miscWeight);
+      moreMiscHead = make_unique<TransformerLinear>(cudaHandles, name + "_moremisc", hiddenSize, numMoreMiscChannels, desc->moreMiscWeight);
+      scoringHead = make_unique<TransformerLinear>(cudaHandles, name + "_scoring", hiddenSize, numScoringChannels, desc->scoringWeight);
+      futurePosHead = make_unique<TransformerLinear>(cudaHandles, name + "_futurepos", hiddenSize, numFuturePosChannels, desc->futurePosWeight);
+      sekiHead = make_unique<TransformerLinear>(cudaHandles, name + "_seki", hiddenSize, numSekiChannels, desc->sekiWeight);
+      if(scoreBeliefProjectSize > 0) {
+        if(scoreMode == 0)
+          scoreBeliefHead = make_unique<TransformerLinear>(cudaHandles, name + "_scorebelief_simple", hiddenSize, scoreBeliefProjectSize, desc->scoreBeliefSimpleWeight);
+        else
+          scoreBeliefHead = make_unique<TransformerLinear>(cudaHandles, name + "_scorebelief_mix", hiddenSize, scoreBeliefProjectSize, desc->scoreBeliefMixWeight);
+      }
+      scoreBeliefS2OffWeight = desc->scoreBeliefS2OffWeight;
+      scoreBeliefS2ParWeight = desc->scoreBeliefS2ParWeight;
+    }
+    valueHead = make_unique<TransformerLinear>(cudaHandles, name + "_value", hiddenSize, 3, desc->valueWeight);
+    scoreValueHead = make_unique<TransformerLinear>(cudaHandles, name + "_scorevalue", hiddenSize, 6, desc->scoreValueWeight);
+    ownershipHead = make_unique<TransformerLinear>(cudaHandles, name + "_ownership", hiddenSize, 1, desc->ownershipWeight);
+  }
+
+  ~TransformerModel() {
+    if(posBuf != nullptr)
+      cudaFree(posBuf);
+    cudaFree(ropeCosBuf);
+    cudaFree(ropeSinBuf);
+  }
+
+  size_t requiredWorkspaceBytes(CudaHandles* cudaHandles, int batchSize) const {
+    return stemConv->requiredWorkspaceBytes(cudaHandles, batchSize);
+  }
+
+  bool supportsFullRawOutputs() const {
+    return policyBoardFull != nullptr && policyPassFull != nullptr && miscHead != nullptr && moreMiscHead != nullptr &&
+      scoringHead != nullptr && futurePosHead != nullptr && sekiHead != nullptr && scoreBeliefHead != nullptr;
+  }
+
+  void apply(
+    CudaHandles* cudaHandles,
+    ScratchBuffers* scratch,
+    int batchSize,
+    float* inputBuf,
+    float* inputGlobalBuf,
+    float* policyPassBuf,
+    float* policyBuf,
+    float* valueBuf,
+    float* scoreValueBuf,
+    float* ownershipBuf,
+    void* workspaceBuf,
+    size_t workspaceBytes
+  ) const {
+    int seqLen = posLen * posLen;
+    int tokenCount = batchSize * seqLen;
+    size_t stemBytes = (size_t)batchSize * hiddenSize * seqLen * sizeof(float);
+    size_t globalBytes = (size_t)batchSize * hiddenSize * sizeof(float);
+    size_t nlcBytes = (size_t)tokenCount * hiddenSize * sizeof(float);
+
+    SizedBuf<void*> stemSpatialBuf(scratch->allocator, stemBytes);
+    SizedBuf<void*> stemGlobalBuf(scratch->allocator, globalBytes);
+    SizedBuf<void*> xBuf(scratch->allocator, nlcBytes);
+    SizedBuf<void*> pooledBuf(scratch->allocator, globalBytes);
+
+    stemConv->apply(cudaHandles, batchSize, false, inputBuf, stemSpatialBuf.buf, workspaceBuf, workspaceBytes);
+    stemGlobal->apply(cudaHandles, scratch, batchSize, inputGlobalBuf, stemGlobalBuf.buf);
+    customCudaNCHWToNLCAddBiasPos(
+      reinterpret_cast<float*>(stemSpatialBuf.buf),
+      reinterpret_cast<float*>(stemGlobalBuf.buf),
+      posBuf,
+      reinterpret_cast<float*>(xBuf.buf),
+      batchSize,
+      hiddenSize,
+      posLen,
+      posLen
+    );
+    CUDA_ERR(name.c_str(), cudaPeekAtLastError());
+
+    for(const auto& block : blocks)
+      block->apply(cudaHandles, scratch, batchSize, ropeCosBuf, ropeSinBuf, reinterpret_cast<float*>(xBuf.buf));
+
+    finalNorm->apply(tokenCount, reinterpret_cast<float*>(xBuf.buf), reinterpret_cast<float*>(xBuf.buf));
+
+    policyBoard->apply(cudaHandles, scratch, tokenCount, xBuf.buf, policyBuf);
+    customCudaMeanPoolNLC(reinterpret_cast<float*>(xBuf.buf), reinterpret_cast<float*>(pooledBuf.buf), batchSize, seqLen, hiddenSize);
+    CUDA_ERR(name.c_str(), cudaPeekAtLastError());
+    policyPass->apply(cudaHandles, scratch, batchSize, pooledBuf.buf, policyPassBuf);
+    valueHead->apply(cudaHandles, scratch, batchSize, pooledBuf.buf, valueBuf);
+    scoreValueHead->apply(cudaHandles, scratch, batchSize, pooledBuf.buf, scoreValueBuf);
+    ownershipHead->apply(cudaHandles, scratch, tokenCount, xBuf.buf, ownershipBuf);
+  }
+
+  void applyFull(
+    CudaHandles* cudaHandles,
+    ScratchBuffers* scratch,
+    int batchSize,
+    float* inputBuf,
+    float* inputGlobalBuf,
+    float* policyPassFullBuf,
+    float* policyFullBuf,
+    float* valueBuf,
+    float* miscBuf,
+    float* moreMiscBuf,
+    float* ownershipBuf,
+    float* scoringBuf,
+    float* futurePosBuf,
+    float* sekiBuf,
+    float* scoreBeliefProjectBuf,
+    void* workspaceBuf,
+    size_t workspaceBytes
+  ) const {
+    if(!supportsFullRawOutputs())
+      throw StringError("Transformer CUDA backend full raw outputs unavailable: model file lacks full head weights");
+
+    int seqLen = posLen * posLen;
+    int tokenCount = batchSize * seqLen;
+    size_t stemBytes = (size_t)batchSize * hiddenSize * seqLen * sizeof(float);
+    size_t globalBytes = (size_t)batchSize * hiddenSize * sizeof(float);
+    size_t nlcBytes = (size_t)tokenCount * hiddenSize * sizeof(float);
+
+    SizedBuf<void*> stemSpatialBuf(scratch->allocator, stemBytes);
+    SizedBuf<void*> stemGlobalBuf(scratch->allocator, globalBytes);
+    SizedBuf<void*> xBuf(scratch->allocator, nlcBytes);
+    SizedBuf<void*> pooledBuf(scratch->allocator, globalBytes);
+
+    stemConv->apply(cudaHandles, batchSize, false, inputBuf, stemSpatialBuf.buf, workspaceBuf, workspaceBytes);
+    stemGlobal->apply(cudaHandles, scratch, batchSize, inputGlobalBuf, stemGlobalBuf.buf);
+    customCudaNCHWToNLCAddBiasPos(
+      reinterpret_cast<float*>(stemSpatialBuf.buf),
+      reinterpret_cast<float*>(stemGlobalBuf.buf),
+      posBuf,
+      reinterpret_cast<float*>(xBuf.buf),
+      batchSize,
+      hiddenSize,
+      posLen,
+      posLen
+    );
+    CUDA_ERR(name.c_str(), cudaPeekAtLastError());
+
+    for(const auto& block : blocks)
+      block->apply(cudaHandles, scratch, batchSize, ropeCosBuf, ropeSinBuf, reinterpret_cast<float*>(xBuf.buf));
+
+    finalNorm->apply(tokenCount, reinterpret_cast<float*>(xBuf.buf), reinterpret_cast<float*>(xBuf.buf));
+
+    policyBoardFull->apply(cudaHandles, scratch, tokenCount, xBuf.buf, policyFullBuf);
+    ownershipHead->apply(cudaHandles, scratch, tokenCount, xBuf.buf, ownershipBuf);
+    scoringHead->apply(cudaHandles, scratch, tokenCount, xBuf.buf, scoringBuf);
+    futurePosHead->apply(cudaHandles, scratch, tokenCount, xBuf.buf, futurePosBuf);
+    sekiHead->apply(cudaHandles, scratch, tokenCount, xBuf.buf, sekiBuf);
+    customCudaMeanPoolNLC(reinterpret_cast<float*>(xBuf.buf), reinterpret_cast<float*>(pooledBuf.buf), batchSize, seqLen, hiddenSize);
+    CUDA_ERR(name.c_str(), cudaPeekAtLastError());
+    policyPassFull->apply(cudaHandles, scratch, batchSize, pooledBuf.buf, policyPassFullBuf);
+    valueHead->apply(cudaHandles, scratch, batchSize, pooledBuf.buf, valueBuf);
+    miscHead->apply(cudaHandles, scratch, batchSize, pooledBuf.buf, miscBuf);
+    moreMiscHead->apply(cudaHandles, scratch, batchSize, pooledBuf.buf, moreMiscBuf);
+    scoreBeliefHead->apply(cudaHandles, scratch, batchSize, pooledBuf.buf, scoreBeliefProjectBuf);
+  }
+};
+
+static void logSoftmax1DInplace(vector<float>& values) {
+  if(values.empty())
+    return;
+  float maxVal = values[0];
+  for(size_t i = 1; i < values.size(); i++)
+    maxVal = std::max(maxVal, values[i]);
+  float sum = 0.0f;
+  for(size_t i = 0; i < values.size(); i++)
+    sum += std::exp(values[i] - maxVal);
+  float logSum = maxVal + std::log(sum);
+  for(size_t i = 0; i < values.size(); i++)
+    values[i] -= logSum;
+}
+
+static void finalizeTransformerScoreBelief(
+  const TransformerModel& model,
+  const float* globalInput,
+  const vector<float>& scoreBeliefProject,
+  float* scoreBeliefOut
+) {
+  if(model.scoreMode == 0) {
+    vector<float> logits = scoreBeliefProject;
+    logSoftmax1DInplace(logits);
+    std::copy(logits.begin(), logits.end(), scoreBeliefOut);
+    return;
+  }
+
+  const int len = model.scoreBeliefLen;
+  const int numBeliefs = model.numScoreBeliefs;
+  vector<float> belief(scoreBeliefProject.begin(), scoreBeliefProject.begin() + (size_t)len * numBeliefs);
+  vector<float> mixLogits(scoreBeliefProject.begin() + (size_t)len * numBeliefs, scoreBeliefProject.end());
+
+  if(model.scoreMode == 2) {
+    const int mid = len / 2;
+    const float scoreParity = globalInput[model.numInputGlobalChannels - 1];
+    for(int i = 0; i < len; i++) {
+      int diff = i - mid;
+      int parityBit = ((diff % 2) + 2) % 2;
+      float offsetTerm = 0.05f * ((float)diff + 0.5f);
+      float parityTerm = (0.5f - (float)parityBit) * scoreParity;
+      for(int j = 0; j < numBeliefs; j++) {
+        belief[(size_t)i * numBeliefs + j] +=
+          offsetTerm * model.scoreBeliefS2OffWeight[j] +
+          parityTerm * model.scoreBeliefS2ParWeight[j];
+      }
+    }
+  }
+
+  for(int j = 0; j < numBeliefs; j++) {
+    float maxVal = belief[j];
+    for(int i = 1; i < len; i++)
+      maxVal = std::max(maxVal, belief[(size_t)i * numBeliefs + j]);
+    float sum = 0.0f;
+    for(int i = 0; i < len; i++)
+      sum += std::exp(belief[(size_t)i * numBeliefs + j] - maxVal);
+    float logSum = maxVal + std::log(sum);
+    for(int i = 0; i < len; i++)
+      belief[(size_t)i * numBeliefs + j] -= logSum;
+  }
+
+  logSoftmax1DInplace(mixLogits);
+  for(int i = 0; i < len; i++) {
+    float maxVal = belief[(size_t)i * numBeliefs] + mixLogits[0];
+    for(int j = 1; j < numBeliefs; j++)
+      maxVal = std::max(maxVal, belief[(size_t)i * numBeliefs + j] + mixLogits[j]);
+    float sum = 0.0f;
+    for(int j = 0; j < numBeliefs; j++)
+      sum += std::exp(belief[(size_t)i * numBeliefs + j] + mixLogits[j] - maxVal);
+    scoreBeliefOut[i] = maxVal + std::log(sum);
+  }
+}
+
+
+//------------------------------------------------------------------------------
+
 struct LoadedModel {
+  bool isTransformer;
   ModelDesc modelDesc;
+  unique_ptr<TransformerModelDesc> transformerDesc;
 
   LoadedModel(const string& fileName, const string& expectedSha256) {
-    ModelDesc::loadFromFileMaybeGZipped(fileName,modelDesc,expectedSha256);
-    modelDesc.applyScale8ToReduceActivations();
+    transformerDesc = std::make_unique<TransformerModelDesc>();
+    if(TransformerModelDesc::tryLoadFromFileMaybeGZipped(fileName, expectedSha256, *transformerDesc)) {
+      isTransformer = true;
+      modelDesc.name = transformerDesc->name;
+      modelDesc.sha256 = transformerDesc->sha256;
+      modelDesc.modelVersion = transformerDesc->modelVersion;
+      modelDesc.numInputChannels = transformerDesc->numInputChannels;
+      modelDesc.numInputGlobalChannels = transformerDesc->numInputGlobalChannels;
+      modelDesc.numInputMetaChannels = 0;
+      modelDesc.numPolicyChannels = 2;
+      modelDesc.numValueChannels = 3;
+      modelDesc.numScoreValueChannels = 6;
+      modelDesc.numOwnershipChannels = 1;
+      modelDesc.metaEncoderVersion = 0;
+      modelDesc.postProcessParams = transformerDesc->postProcessParams;
+      modelDesc.trunk.trunkNumChannels = transformerDesc->hiddenSize;
+      modelDesc.trunk.numBlocks = transformerDesc->numLayers;
+      modelDesc.trunk.initialConv.convXSize = transformerDesc->stemKernelSize;
+      modelDesc.trunk.initialConv.convYSize = transformerDesc->stemKernelSize;
+      modelDesc.trunk.initialConv.inChannels = transformerDesc->numInputChannels;
+      modelDesc.trunk.initialConv.outChannels = transformerDesc->hiddenSize;
+    }
+    else {
+      isTransformer = false;
+      transformerDesc.reset();
+      ModelDesc::loadFromFileMaybeGZipped(fileName,modelDesc,expectedSha256);
+      modelDesc.applyScale8ToReduceActivations();
+    }
   }
 
   LoadedModel() = delete;
@@ -2269,6 +2910,74 @@ struct Buffers {
 
 //------------------------------------------------------------------------------
 
+struct TransformerBuffers {
+  float* inputBuf;
+  float* inputGlobalBuf;
+  float* policyPassBuf;
+  float* policyBuf;
+  float* valueBuf;
+  float* scoreValueBuf;
+  float* ownershipBuf;
+  void* workspaceBuf;
+
+  size_t inputBufBytes;
+  size_t inputGlobalBufBytes;
+  size_t policyPassBufBytes;
+  size_t policyBufBytes;
+  size_t valueBufBytes;
+  size_t scoreValueBufBytes;
+  size_t ownershipBufBytes;
+  size_t workspaceBytes;
+
+  TransformerBuffers() = delete;
+  TransformerBuffers(const TransformerBuffers&) = delete;
+  TransformerBuffers& operator=(const TransformerBuffers&) = delete;
+
+  TransformerBuffers(CudaHandles* cudaHandles, const TransformerModel& m, int maxBatchSize) {
+    size_t seqLen = (size_t)m.nnXLen * m.nnYLen;
+
+    inputBufBytes = (size_t)m.numInputChannels * maxBatchSize * seqLen * sizeof(float);
+    inputGlobalBufBytes = (size_t)m.numInputGlobalChannels * maxBatchSize * sizeof(float);
+    policyPassBufBytes = (size_t)m.numPolicyChannels * maxBatchSize * sizeof(float);
+    policyBufBytes = (size_t)m.numPolicyChannels * maxBatchSize * seqLen * sizeof(float);
+    valueBufBytes = (size_t)m.numValueChannels * maxBatchSize * sizeof(float);
+    scoreValueBufBytes = (size_t)m.numScoreValueChannels * maxBatchSize * sizeof(float);
+    ownershipBufBytes = (size_t)m.numOwnershipChannels * maxBatchSize * seqLen * sizeof(float);
+
+    CUDA_ERR("TransformerBuffers", cudaMalloc(reinterpret_cast<void**>(&inputBuf), inputBufBytes));
+    CUDA_ERR("TransformerBuffers", cudaMalloc(reinterpret_cast<void**>(&inputGlobalBuf), inputGlobalBufBytes));
+    CUDA_ERR("TransformerBuffers", cudaMalloc(reinterpret_cast<void**>(&policyPassBuf), policyPassBufBytes));
+    CUDA_ERR("TransformerBuffers", cudaMalloc(reinterpret_cast<void**>(&policyBuf), policyBufBytes));
+    CUDA_ERR("TransformerBuffers", cudaMalloc(reinterpret_cast<void**>(&valueBuf), valueBufBytes));
+    CUDA_ERR("TransformerBuffers", cudaMalloc(reinterpret_cast<void**>(&scoreValueBuf), scoreValueBufBytes));
+    CUDA_ERR("TransformerBuffers", cudaMalloc(reinterpret_cast<void**>(&ownershipBuf), ownershipBufBytes));
+
+    size_t bytes = 0;
+    for(int batchSize = 1; batchSize <= maxBatchSize; batchSize++) {
+      bytes = std::max(bytes, m.requiredWorkspaceBytes(cudaHandles, batchSize));
+    }
+    workspaceBytes = bytes;
+    if(workspaceBytes > 0)
+      CUDA_ERR("TransformerBuffers", cudaMalloc(&workspaceBuf, workspaceBytes));
+    else
+      workspaceBuf = nullptr;
+  }
+
+  ~TransformerBuffers() {
+    cudaFree(inputBuf);
+    cudaFree(inputGlobalBuf);
+    cudaFree(policyPassBuf);
+    cudaFree(policyBuf);
+    cudaFree(valueBuf);
+    cudaFree(scoreValueBuf);
+    cudaFree(ownershipBuf);
+    if(workspaceBuf != nullptr)
+      cudaFree(workspaceBuf);
+  }
+};
+
+//------------------------------------------------------------------------------
+
 struct ComputeContext {
   int nnXLen;
   int nnYLen;
@@ -2311,9 +3020,12 @@ void NeuralNet::freeComputeContext(ComputeContext* computeContext) {
 
 struct ComputeHandle {
   std::unique_ptr<CudaHandles> cudaHandles;
+  bool isTransformer;
   std::unique_ptr<Model> model;
+  std::unique_ptr<TransformerModel> transformerModel;
   std::unique_ptr<ScratchBuffers> scratch;
   std::unique_ptr<Buffers> buffers;
+  std::unique_ptr<TransformerBuffers> transformerBuffers;
   const bool usingFP16;
   const int nnXLen;
   const int nnYLen;
@@ -2332,6 +3044,7 @@ struct ComputeHandle {
     bool useFP16,
     bool useNHWC
   ) :
+    isTransformer(loadedModel->isTransformer),
     usingFP16(useFP16),
     nnXLen(context->nnXLen),
     nnYLen(context->nnYLen),
@@ -2340,12 +3053,22 @@ struct ComputeHandle {
     usingNHWC(useNHWC)
   {
     cudaHandles = std::make_unique<CudaHandles>(majorComputeCapability,minorComputeCapability);
-    model = std::make_unique<Model>(
-      cudaHandles.get(), &(loadedModel->modelDesc), maxBatchSize,
-      nnXLen, nnYLen, inputsUseNHWC, useFP16, useNHWC
-    );
-    scratch = std::make_unique<ScratchBuffers>(maxBatchSize, nnXLen, nnYLen, useFP16);
-    buffers = std::make_unique<Buffers>(cudaHandles.get(), *model, *scratch);
+    if(!isTransformer) {
+      model = std::make_unique<Model>(
+        cudaHandles.get(), &(loadedModel->modelDesc), maxBatchSize,
+        nnXLen, nnYLen, inputsUseNHWC, useFP16, useNHWC
+      );
+      scratch = std::make_unique<ScratchBuffers>(maxBatchSize, nnXLen, nnYLen, useFP16);
+      buffers = std::make_unique<Buffers>(cudaHandles.get(), *model, *scratch);
+    }
+    else {
+      transformerModel = std::make_unique<TransformerModel>(
+        cudaHandles.get(), loadedModel->transformerDesc.get(), maxBatchSize,
+        nnXLen, nnYLen, inputsUseNHWC
+      );
+      scratch = std::make_unique<ScratchBuffers>(maxBatchSize, nnXLen, nnYLen, false);
+      transformerBuffers = std::make_unique<TransformerBuffers>(cudaHandles.get(), *transformerModel, maxBatchSize);
+    }
 
     //Synchronize after creating buffers and copying all the weights, just in case
     CUDA_ERR("ComputeHandle", cudaDeviceSynchronize());
@@ -2410,6 +3133,14 @@ ComputeHandle* NeuralNet::createComputeHandle(
       useNHWC = true;
   }
 
+  if(loadedModel->isTransformer) {
+    useFP16 = false;
+    useNHWC = false;
+    if(!requireExactNNLen) {
+      throw StringError("Transformer CUDA backend 仅支持 requireExactNNLen=true，且棋盘尺寸必须固定等于模型 pos_len");
+    }
+  }
+
   if(logger != NULL) {
     logger->write(
       "Cuda backend thread " + Global::intToString(serverThreadIdx) + ": Found GPU " + string(prop.name)
@@ -2420,7 +3151,8 @@ ComputeHandle* NeuralNet::createComputeHandle(
     logger->write(
       "Cuda backend thread " + Global::intToString(serverThreadIdx) + ": Model version " + Global::intToString(loadedModel->modelDesc.modelVersion) +
       " useFP16 = " + Global::boolToString(useFP16) +
-      " useNHWC = " + Global::boolToString(useNHWC)
+      " useNHWC = " + Global::boolToString(useNHWC) +
+      " modelType = " + string(loadedModel->isTransformer ? "transformer" : "cnn")
     );
     logger->write(
       "Cuda backend thread " + Global::intToString(serverThreadIdx) + ": Model name: " + loadedModel->modelDesc.name
@@ -2586,6 +3318,112 @@ void NeuralNet::getOutput(
   const int batchSize = numBatchEltsFilled;
   const int nnXLen = gpuHandle->nnXLen;
   const int nnYLen = gpuHandle->nnYLen;
+  float policyProbsTmp[NNPos::MAX_NN_POLICY_SIZE];
+  if(gpuHandle->isTransformer) {
+    const int modelVersion = gpuHandle->transformerModel->modelVersion;
+    const int numSpatialFeatures = NNModelVersion::getNumSpatialFeatures(modelVersion);
+    const int numGlobalFeatures = NNModelVersion::getNumGlobalFeatures(modelVersion);
+    const int numPolicyChannels = gpuHandle->transformerModel->numPolicyChannels;
+    assert(numSpatialFeatures == gpuHandle->transformerModel->numInputChannels);
+    assert(numGlobalFeatures == gpuHandle->transformerModel->numInputGlobalChannels);
+    assert(inputBuffers->singleInputElts == (size_t)numSpatialFeatures * nnXLen * nnYLen);
+    assert(inputBuffers->singleInputBytes == inputBuffers->singleInputElts * sizeof(float));
+    assert(inputBuffers->singleInputGlobalElts == (size_t)numGlobalFeatures);
+    assert(inputBuffers->singleInputGlobalBytes == inputBuffers->singleInputGlobalElts * sizeof(float));
+    assert(inputBuffers->singleInputMetaElts == 0);
+    assert(inputBuffers->singleInputMetaBytes == 0);
+    assert(inputBuffers->singlePolicyPassResultElts == (size_t)numPolicyChannels);
+    assert(inputBuffers->singlePolicyPassResultBytes == (size_t)numPolicyChannels * sizeof(float));
+    assert(inputBuffers->singlePolicyResultElts == (size_t)numPolicyChannels * nnXLen * nnYLen);
+    assert(inputBuffers->singlePolicyResultBytes == inputBuffers->singlePolicyResultElts * sizeof(float));
+    assert(inputBuffers->singleValueResultElts == 3);
+    assert(inputBuffers->singleValueResultBytes == 3 * sizeof(float));
+    assert(inputBuffers->singleScoreValueResultElts == 6);
+    assert(inputBuffers->singleScoreValueResultBytes == 6 * sizeof(float));
+    assert(inputBuffers->singleOwnershipResultElts == (size_t)nnXLen * nnYLen);
+    assert(inputBuffers->singleOwnershipResultBytes == inputBuffers->singleOwnershipResultElts * sizeof(float));
+
+    for(int nIdx = 0; nIdx < batchSize; nIdx++) {
+      if(
+        inputBufs[nIdx]->boardXSizeForServer != nnXLen ||
+        inputBufs[nIdx]->boardYSizeForServer != nnYLen
+      ) {
+        throw StringError("Transformer CUDA backend 仅支持与模型 pos_len 完全一致的棋盘尺寸");
+      }
+
+      float* rowSpatialInput = inputBuffers->userInputBuffer + (inputBuffers->singleInputElts * nIdx);
+      float* rowGlobalInput = inputBuffers->userInputGlobalBuffer + (inputBuffers->singleInputGlobalElts * nIdx);
+      const float* rowGlobal = inputBufs[nIdx]->rowGlobalBuf.data();
+      const float* rowSpatial = inputBufs[nIdx]->rowSpatialBuf.data();
+      std::copy(rowGlobal, rowGlobal + numGlobalFeatures, rowGlobalInput);
+      SymmetryHelpers::copyInputsWithSymmetry(
+        rowSpatial, rowSpatialInput, 1, nnYLen, nnXLen, numSpatialFeatures, gpuHandle->inputsUseNHWC, inputBufs[nIdx]->symmetry
+      );
+    }
+
+    TransformerBuffers* buffers = gpuHandle->transformerBuffers.get();
+    ScratchBuffers* scratch = gpuHandle->scratch.get();
+    CUDA_ERR("getOutput", cudaMemcpy(buffers->inputBuf, inputBuffers->userInputBuffer, inputBuffers->singleInputBytes * batchSize, cudaMemcpyHostToDevice));
+    CUDA_ERR("getOutput", cudaMemcpy(buffers->inputGlobalBuf, inputBuffers->userInputGlobalBuffer, inputBuffers->singleInputGlobalBytes * batchSize, cudaMemcpyHostToDevice));
+
+    gpuHandle->transformerModel->apply(
+      gpuHandle->cudaHandles.get(),
+      scratch,
+      batchSize,
+      buffers->inputBuf,
+      buffers->inputGlobalBuf,
+      buffers->policyPassBuf,
+      buffers->policyBuf,
+      buffers->valueBuf,
+      buffers->scoreValueBuf,
+      buffers->ownershipBuf,
+      buffers->workspaceBuf,
+      buffers->workspaceBytes
+    );
+
+    CUDA_ERR("getOutput", cudaMemcpy(inputBuffers->policyPassResults, buffers->policyPassBuf, inputBuffers->singlePolicyPassResultBytes * batchSize, cudaMemcpyDeviceToHost));
+    CUDA_ERR("getOutput", cudaMemcpy(inputBuffers->policyResults, buffers->policyBuf, inputBuffers->singlePolicyResultBytes * batchSize, cudaMemcpyDeviceToHost));
+    CUDA_ERR("getOutput", cudaMemcpy(inputBuffers->valueResults, buffers->valueBuf, inputBuffers->singleValueResultBytes * batchSize, cudaMemcpyDeviceToHost));
+    CUDA_ERR("getOutput", cudaMemcpy(inputBuffers->scoreValueResults, buffers->scoreValueBuf, inputBuffers->singleScoreValueResultBytes * batchSize, cudaMemcpyDeviceToHost));
+    CUDA_ERR("getOutput", cudaMemcpy(inputBuffers->ownershipResults, buffers->ownershipBuf, inputBuffers->singleOwnershipResultBytes * batchSize, cudaMemcpyDeviceToHost));
+
+    assert(outputs.size() == batchSize);
+
+    for(int row = 0; row < batchSize; row++) {
+      NNOutput* output = outputs[row];
+      assert(output->nnXLen == nnXLen);
+      assert(output->nnYLen == nnYLen);
+      float policyOptimism = (float)inputBufs[row]->policyOptimism;
+
+      const float* policyPassSrcBuf = inputBuffers->policyPassResults + row * numPolicyChannels;
+      const float* policySrcBuf = inputBuffers->policyResults + row * numPolicyChannels * nnXLen * nnYLen;
+      float* policyProbs = output->policyProbs;
+      for(int i = 0; i < nnXLen * nnYLen; i++) {
+        float p = policySrcBuf[i * numPolicyChannels];
+        float pOpt = policySrcBuf[i * numPolicyChannels + 1];
+        policyProbsTmp[i] = p + (pOpt - p) * policyOptimism;
+      }
+      SymmetryHelpers::copyOutputsWithSymmetry(policyProbsTmp, policyProbs, 1, nnYLen, nnXLen, inputBufs[row]->symmetry);
+      policyProbs[nnXLen * nnYLen] = policyPassSrcBuf[0] + (policyPassSrcBuf[1] - policyPassSrcBuf[0]) * policyOptimism;
+
+      output->whiteWinProb = inputBuffers->valueResults[row * 3];
+      output->whiteLossProb = inputBuffers->valueResults[row * 3 + 1];
+      output->whiteNoResultProb = inputBuffers->valueResults[row * 3 + 2];
+
+      if(output->whiteOwnerMap != NULL) {
+        const float* ownershipSrcBuf = inputBuffers->ownershipResults + row * nnXLen * nnYLen;
+        SymmetryHelpers::copyOutputsWithSymmetry(ownershipSrcBuf, output->whiteOwnerMap, 1, nnYLen, nnXLen, inputBufs[row]->symmetry);
+      }
+
+      output->whiteScoreMean = inputBuffers->scoreValueResults[row * 6];
+      output->whiteScoreMeanSq = inputBuffers->scoreValueResults[row * 6 + 1];
+      output->whiteLead = inputBuffers->scoreValueResults[row * 6 + 2];
+      output->varTimeLeft = inputBuffers->scoreValueResults[row * 6 + 3];
+      output->shorttermWinlossError = inputBuffers->scoreValueResults[row * 6 + 4];
+      output->shorttermScoreError = inputBuffers->scoreValueResults[row * 6 + 5];
+    }
+    return;
+  }
   const int modelVersion = gpuHandle->model->modelVersion;
 
   const int numSpatialFeatures = NNModelVersion::getNumSpatialFeatures(modelVersion);
@@ -2711,8 +3549,6 @@ void NeuralNet::getOutput(
 
   assert(outputs.size() == batchSize);
 
-  float policyProbsTmp[NNPos::MAX_NN_POLICY_SIZE];
-
   for(int row = 0; row < batchSize; row++) {
     NNOutput* output = outputs[row];
     assert(output->nnXLen == nnXLen);
@@ -2813,6 +3649,200 @@ void NeuralNet::getOutput(
     }
   }
 
+}
+
+bool NeuralNet::getTransformerRawOutputs(
+  ComputeHandle* gpuHandle,
+  InputBuffers* inputBuffers,
+  int numBatchEltsFilled,
+  NNResultBuf** inputBufs,
+  TransformerRawOutputs& outputs
+) {
+  if(!gpuHandle->isTransformer)
+    return false;
+
+  assert(numBatchEltsFilled <= inputBuffers->maxBatchSize);
+  assert(numBatchEltsFilled > 0);
+  const int batchSize = numBatchEltsFilled;
+  const int nnXLen = gpuHandle->nnXLen;
+  const int nnYLen = gpuHandle->nnYLen;
+  const int modelVersion = gpuHandle->transformerModel->modelVersion;
+  const int numSpatialFeatures = NNModelVersion::getNumSpatialFeatures(modelVersion);
+  const int numGlobalFeatures = NNModelVersion::getNumGlobalFeatures(modelVersion);
+  const int numPolicyChannels = gpuHandle->transformerModel->numPolicyChannels;
+
+  for(int nIdx = 0; nIdx < batchSize; nIdx++) {
+    if(
+      inputBufs[nIdx]->boardXSizeForServer != nnXLen ||
+      inputBufs[nIdx]->boardYSizeForServer != nnYLen
+    ) {
+      throw StringError("Transformer CUDA backend 仅支持与模型 pos_len 完全一致的棋盘尺寸");
+    }
+
+    float* rowSpatialInput = inputBuffers->userInputBuffer + (inputBuffers->singleInputElts * nIdx);
+    float* rowGlobalInput = inputBuffers->userInputGlobalBuffer + (inputBuffers->singleInputGlobalElts * nIdx);
+    const float* rowGlobal = inputBufs[nIdx]->rowGlobalBuf.data();
+    const float* rowSpatial = inputBufs[nIdx]->rowSpatialBuf.data();
+    std::copy(rowGlobal, rowGlobal + numGlobalFeatures, rowGlobalInput);
+    SymmetryHelpers::copyInputsWithSymmetry(
+      rowSpatial, rowSpatialInput, 1, nnYLen, nnXLen, numSpatialFeatures, gpuHandle->inputsUseNHWC, inputBufs[nIdx]->symmetry
+    );
+  }
+
+  TransformerBuffers* buffers = gpuHandle->transformerBuffers.get();
+  ScratchBuffers* scratch = gpuHandle->scratch.get();
+  CUDA_ERR("getTransformerRawOutputs", cudaMemcpy(buffers->inputBuf, inputBuffers->userInputBuffer, inputBuffers->singleInputBytes * batchSize, cudaMemcpyHostToDevice));
+  CUDA_ERR("getTransformerRawOutputs", cudaMemcpy(buffers->inputGlobalBuf, inputBuffers->userInputGlobalBuffer, inputBuffers->singleInputGlobalBytes * batchSize, cudaMemcpyHostToDevice));
+
+  gpuHandle->transformerModel->apply(
+    gpuHandle->cudaHandles.get(),
+    scratch,
+    batchSize,
+    buffers->inputBuf,
+    buffers->inputGlobalBuf,
+    buffers->policyPassBuf,
+    buffers->policyBuf,
+    buffers->valueBuf,
+    buffers->scoreValueBuf,
+    buffers->ownershipBuf,
+    buffers->workspaceBuf,
+    buffers->workspaceBytes
+  );
+
+  outputs.batchSize = batchSize;
+  outputs.nnXLen = nnXLen;
+  outputs.nnYLen = nnYLen;
+  outputs.numPolicyChannels = numPolicyChannels;
+  outputs.numFullPolicyChannels = 0;
+  outputs.numMiscChannels = 0;
+  outputs.numMoreMiscChannels = 0;
+  outputs.numScoringChannels = 0;
+  outputs.numFuturePosChannels = 0;
+  outputs.numSekiChannels = 0;
+  outputs.scoreBeliefLen = 0;
+  outputs.policyPass.resize((size_t)batchSize * numPolicyChannels);
+  outputs.policy.resize((size_t)batchSize * numPolicyChannels * nnXLen * nnYLen);
+  outputs.value.resize((size_t)batchSize * 3);
+  outputs.scoreValue.resize((size_t)batchSize * 6);
+  outputs.ownership.resize((size_t)batchSize * nnXLen * nnYLen);
+  outputs.fullPolicyPass.clear();
+  outputs.fullPolicy.clear();
+  outputs.misc.clear();
+  outputs.moreMisc.clear();
+  outputs.scoring.clear();
+  outputs.futurePos.clear();
+  outputs.seki.clear();
+  outputs.scoreBelief.clear();
+
+  CUDA_ERR("getTransformerRawOutputs", cudaMemcpy(outputs.policyPass.data(), buffers->policyPassBuf, sizeof(float) * outputs.policyPass.size(), cudaMemcpyDeviceToHost));
+  CUDA_ERR("getTransformerRawOutputs", cudaMemcpy(outputs.policy.data(), buffers->policyBuf, sizeof(float) * outputs.policy.size(), cudaMemcpyDeviceToHost));
+  CUDA_ERR("getTransformerRawOutputs", cudaMemcpy(outputs.value.data(), buffers->valueBuf, sizeof(float) * outputs.value.size(), cudaMemcpyDeviceToHost));
+  CUDA_ERR("getTransformerRawOutputs", cudaMemcpy(outputs.scoreValue.data(), buffers->scoreValueBuf, sizeof(float) * outputs.scoreValue.size(), cudaMemcpyDeviceToHost));
+  CUDA_ERR("getTransformerRawOutputs", cudaMemcpy(outputs.ownership.data(), buffers->ownershipBuf, sizeof(float) * outputs.ownership.size(), cudaMemcpyDeviceToHost));
+
+  if(gpuHandle->transformerModel->supportsFullRawOutputs()) {
+    const TransformerModel& model = *gpuHandle->transformerModel;
+    outputs.numFullPolicyChannels = model.numFullPolicyChannels;
+    outputs.numMiscChannels = model.numMiscChannels;
+    outputs.numMoreMiscChannels = model.numMoreMiscChannels;
+    outputs.numScoringChannels = model.numScoringChannels;
+    outputs.numFuturePosChannels = model.numFuturePosChannels;
+    outputs.numSekiChannels = model.numSekiChannels;
+    outputs.scoreBeliefLen = model.scoreBeliefLen;
+    outputs.fullPolicyPass.resize((size_t)batchSize * outputs.numFullPolicyChannels);
+    outputs.fullPolicy.resize((size_t)batchSize * outputs.numFullPolicyChannels * nnXLen * nnYLen);
+    outputs.misc.resize((size_t)batchSize * outputs.numMiscChannels);
+    outputs.moreMisc.resize((size_t)batchSize * outputs.numMoreMiscChannels);
+    outputs.scoring.resize((size_t)batchSize * nnXLen * nnYLen * outputs.numScoringChannels);
+    outputs.futurePos.resize((size_t)batchSize * nnXLen * nnYLen * outputs.numFuturePosChannels);
+    outputs.seki.resize((size_t)batchSize * nnXLen * nnYLen * outputs.numSekiChannels);
+    outputs.scoreBelief.resize((size_t)batchSize * outputs.scoreBeliefLen);
+
+    float* fullPolicyPassBuf = nullptr;
+    float* fullPolicyBuf = nullptr;
+    float* miscBuf = nullptr;
+    float* moreMiscBuf = nullptr;
+    float* scoringBuf = nullptr;
+    float* futurePosBuf = nullptr;
+    float* sekiBuf = nullptr;
+    float* scoreBeliefProjectBuf = nullptr;
+    vector<float> scoreBeliefProject;
+
+    auto freeTemp = [&]() {
+      if(fullPolicyPassBuf != nullptr) cudaFree(fullPolicyPassBuf);
+      if(fullPolicyBuf != nullptr) cudaFree(fullPolicyBuf);
+      if(miscBuf != nullptr) cudaFree(miscBuf);
+      if(moreMiscBuf != nullptr) cudaFree(moreMiscBuf);
+      if(scoringBuf != nullptr) cudaFree(scoringBuf);
+      if(futurePosBuf != nullptr) cudaFree(futurePosBuf);
+      if(sekiBuf != nullptr) cudaFree(sekiBuf);
+      if(scoreBeliefProjectBuf != nullptr) cudaFree(scoreBeliefProjectBuf);
+    };
+
+    try {
+      CUDA_ERR("getTransformerRawOutputs", cudaMalloc(reinterpret_cast<void**>(&fullPolicyPassBuf), sizeof(float) * outputs.fullPolicyPass.size()));
+      CUDA_ERR("getTransformerRawOutputs", cudaMalloc(reinterpret_cast<void**>(&fullPolicyBuf), sizeof(float) * outputs.fullPolicy.size()));
+      CUDA_ERR("getTransformerRawOutputs", cudaMalloc(reinterpret_cast<void**>(&miscBuf), sizeof(float) * outputs.misc.size()));
+      CUDA_ERR("getTransformerRawOutputs", cudaMalloc(reinterpret_cast<void**>(&moreMiscBuf), sizeof(float) * outputs.moreMisc.size()));
+      CUDA_ERR("getTransformerRawOutputs", cudaMalloc(reinterpret_cast<void**>(&scoringBuf), sizeof(float) * outputs.scoring.size()));
+      CUDA_ERR("getTransformerRawOutputs", cudaMalloc(reinterpret_cast<void**>(&futurePosBuf), sizeof(float) * outputs.futurePos.size()));
+      CUDA_ERR("getTransformerRawOutputs", cudaMalloc(reinterpret_cast<void**>(&sekiBuf), sizeof(float) * outputs.seki.size()));
+      CUDA_ERR(
+        "getTransformerRawOutputs",
+        cudaMalloc(reinterpret_cast<void**>(&scoreBeliefProjectBuf), sizeof(float) * (size_t)batchSize * model.scoreBeliefProjectSize)
+      );
+
+      model.applyFull(
+        gpuHandle->cudaHandles.get(),
+        scratch,
+        batchSize,
+        buffers->inputBuf,
+        buffers->inputGlobalBuf,
+        fullPolicyPassBuf,
+        fullPolicyBuf,
+        buffers->valueBuf,
+        miscBuf,
+        moreMiscBuf,
+        buffers->ownershipBuf,
+        scoringBuf,
+        futurePosBuf,
+        sekiBuf,
+        scoreBeliefProjectBuf,
+        buffers->workspaceBuf,
+        buffers->workspaceBytes
+      );
+
+      CUDA_ERR("getTransformerRawOutputs", cudaMemcpy(outputs.fullPolicyPass.data(), fullPolicyPassBuf, sizeof(float) * outputs.fullPolicyPass.size(), cudaMemcpyDeviceToHost));
+      CUDA_ERR("getTransformerRawOutputs", cudaMemcpy(outputs.fullPolicy.data(), fullPolicyBuf, sizeof(float) * outputs.fullPolicy.size(), cudaMemcpyDeviceToHost));
+      CUDA_ERR("getTransformerRawOutputs", cudaMemcpy(outputs.value.data(), buffers->valueBuf, sizeof(float) * outputs.value.size(), cudaMemcpyDeviceToHost));
+      CUDA_ERR("getTransformerRawOutputs", cudaMemcpy(outputs.misc.data(), miscBuf, sizeof(float) * outputs.misc.size(), cudaMemcpyDeviceToHost));
+      CUDA_ERR("getTransformerRawOutputs", cudaMemcpy(outputs.moreMisc.data(), moreMiscBuf, sizeof(float) * outputs.moreMisc.size(), cudaMemcpyDeviceToHost));
+      CUDA_ERR("getTransformerRawOutputs", cudaMemcpy(outputs.ownership.data(), buffers->ownershipBuf, sizeof(float) * outputs.ownership.size(), cudaMemcpyDeviceToHost));
+      CUDA_ERR("getTransformerRawOutputs", cudaMemcpy(outputs.scoring.data(), scoringBuf, sizeof(float) * outputs.scoring.size(), cudaMemcpyDeviceToHost));
+      CUDA_ERR("getTransformerRawOutputs", cudaMemcpy(outputs.futurePos.data(), futurePosBuf, sizeof(float) * outputs.futurePos.size(), cudaMemcpyDeviceToHost));
+      CUDA_ERR("getTransformerRawOutputs", cudaMemcpy(outputs.seki.data(), sekiBuf, sizeof(float) * outputs.seki.size(), cudaMemcpyDeviceToHost));
+
+      scoreBeliefProject.resize((size_t)batchSize * model.scoreBeliefProjectSize);
+      CUDA_ERR("getTransformerRawOutputs", cudaMemcpy(scoreBeliefProject.data(), scoreBeliefProjectBuf, sizeof(float) * scoreBeliefProject.size(), cudaMemcpyDeviceToHost));
+      for(int row = 0; row < batchSize; row++) {
+        finalizeTransformerScoreBelief(
+          model,
+          inputBuffers->userInputGlobalBuffer + (size_t)row * numGlobalFeatures,
+          vector<float>(
+            scoreBeliefProject.begin() + (size_t)row * model.scoreBeliefProjectSize,
+            scoreBeliefProject.begin() + (size_t)(row + 1) * model.scoreBeliefProjectSize
+          ),
+          outputs.scoreBelief.data() + (size_t)row * outputs.scoreBeliefLen
+        );
+      }
+      freeTemp();
+    }
+    catch(...) {
+      freeTemp();
+      throw;
+    }
+  }
+  return true;
 }
 
 //TESTING ----------------------------------------------------------------------------------

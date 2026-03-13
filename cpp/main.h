@@ -18,6 +18,7 @@ namespace MainCmds {
   int runnnlayertests(const std::vector<std::string>& args);
   int runnnontinyboardtest(const std::vector<std::string>& args);
   int runnnsymmetriestest(const std::vector<std::string>& args);
+  int runtransformerdump(const std::vector<std::string>& args);
   int runoutputtests(const std::vector<std::string>& args);
   int runsearchtests(const std::vector<std::string>& args);
   int runsearchtestsv3(const std::vector<std::string>& args);

@@ -15,8 +15,12 @@ include_directories(SYSTEM external/filesystem-1.5.8/include) #SYSTEM suppresses
 
 if(APPLE)
   # Fix linking on 10.14+. See https://stackoverflow.com/questions/54068035
-  include_directories(/usr/local/include)
-  link_directories(/usr/local/lib)
+  if(EXISTS "/usr/local/include")
+    include_directories(/usr/local/include)
+  endif()
+  if(EXISTS "/usr/local/lib")
+    link_directories(/usr/local/lib)
+  endif()
 endif()
 
 if(NOT WIN32)
@@ -55,6 +59,7 @@ if(USE_BACKEND STREQUAL "CUDA")
     neuralnet/cudabackend.cpp
     neuralnet/cudautils.cpp
     neuralnet/cudahelpers.cu
+    neuralnet/transformerdesc.cpp
   )
 # https://en.wikipedia.org/wiki/CUDA#GPUs_supported
   if(CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 13.0)
@@ -118,6 +123,8 @@ elseif(USE_BACKEND STREQUAL "METAL")
   set(CMAKE_OSX_DEPLOYMENT_TARGET 13.0)
   set(NEURALNET_BACKEND_SOURCES
     neuralnet/metalbackend.cpp
+    neuralnet/transformerdesc.cpp
+    neuralnet/transformerinference.cpp
     )
   add_library(KataGoSwift STATIC
     neuralnet/metalbackend.swift)
@@ -144,6 +151,8 @@ elseif(USE_BACKEND STREQUAL "EIGEN")
   endif()
   set(NEURALNET_BACKEND_SOURCES
     neuralnet/eigenbackend.cpp
+    neuralnet/transformerdesc.cpp
+    neuralnet/transformerinference.cpp
     )
 elseif(USE_BACKEND STREQUAL "")
   message(WARNING "${ColorBoldRed}WARNING: Using dummy neural net backend, intended for non-neural-net testing only, will fail on any code path requiring a neural net. To use neural net, specify -DUSE_BACKEND=CUDA or -DUSE_BACKEND=TENSORRT or -DUSE_BACKEND=OPENCL or -DUSE_BACKEND=EIGEN to compile with the respective backend.${ColorReset}")
@@ -292,6 +301,7 @@ add_executable(katago
   tests/testscore.cpp
   tests/testsgf.cpp
   tests/testsymmetries.cpp
+  tests/testtransformer.cpp
   tests/testnninputs.cpp
   tests/testownership.cpp
   tests/testsearchcommon.cpp
@@ -432,8 +442,16 @@ elseif(USE_BACKEND STREQUAL "EIGEN")
   target_compile_definitions(katago PRIVATE USE_EIGEN_BACKEND)
   if(NOT (MSVC))
     find_package(Eigen3 REQUIRED)
-    include_directories(SYSTEM ${EIGEN3_INCLUDE_DIRS})
-    message(STATUS "Found Eigen3 at ${EIGEN3_INCLUDE_DIRS}")
+    if(TARGET Eigen3::Eigen)
+      target_link_libraries(katago Eigen3::Eigen)
+      get_target_property(EIGEN3_INCLUDE_DIRS Eigen3::Eigen INTERFACE_INCLUDE_DIRECTORIES)
+    endif()
+    if(EIGEN3_INCLUDE_DIRS)
+      include_directories(SYSTEM ${EIGEN3_INCLUDE_DIRS})
+      message(STATUS "Found Eigen3 at ${EIGEN3_INCLUDE_DIRS}")
+    else()
+      message(FATAL_ERROR "*** KataGo: Eigen3 was found but did not provide include directories. If you installed Eigen manually, set EIGEN3_INCLUDE_DIRS to the directory containing the 'Eigen' and 'unsupported' subdirs.")
+    endif()
   else()
     if(EIGEN3_INCLUDE_DIRS)
       message(STATUS "EIGEN3_INCLUDE_DIRS is set to ${EIGEN3_INCLUDE_DIRS}, assuming that Eigen3 header files are here.")
@@ -597,4 +615,3 @@ elseif(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" OR CMAKE_CXX_COMPILER_ID STREQUAL "C
 endif()
 
 target_include_directories(katago PUBLIC ${CMAKE_CURRENT_BINARY_DIR})
-

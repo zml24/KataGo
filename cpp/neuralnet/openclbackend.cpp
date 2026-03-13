@@ -3276,6 +3276,21 @@ void NeuralNet::getOutput(
 
 }
 
+bool NeuralNet::getTransformerRawOutputs(
+  ComputeHandle* gpuHandle,
+  InputBuffers* inputBuffers,
+  int numBatchEltsFilled,
+  NNResultBuf** inputBufs,
+  TransformerRawOutputs& outputs
+) {
+  (void)gpuHandle;
+  (void)inputBuffers;
+  (void)numBatchEltsFilled;
+  (void)inputBufs;
+  (void)outputs;
+  return false;
+}
+
 
 
 bool NeuralNet::testEvaluateConv(

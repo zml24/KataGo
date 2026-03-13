@@ -1,5 +1,6 @@
 #pragma once
 
+#include <memory>
 #include <string>
 #include "desc.h"
 #include "../core/commontypes.h"
@@ -7,6 +8,8 @@
 #include "../neuralnet/nneval.h"
 #include "../neuralnet/nninputs.h"
 #include "../neuralnet/nninterface.h"
+#include "../neuralnet/transformerdesc.h"
+#include "../neuralnet/transformerinference.h"
 #include <KataGoSwift/KataGoSwift-swift.h>
 
 using namespace std;
@@ -18,6 +21,10 @@ SWBatchNormLayerDesc batchNormLayerDescToSwift(const BatchNormLayerDesc * desc);
 ActivationKind activationLayerDescToSwift(const ActivationLayerDesc * desc);
 SWResidualBlockDesc residualBlockDescToSwift(const ResidualBlockDesc * desc);
 SWMatMulLayerDesc matMulLayerDescToSwift(const MatMulLayerDesc * desc);
+SWTransformerRMSNormDesc transformerRMSNormDescToSwift(const std::vector<float>& weights);
+SWTransformerBlockDesc transformerBlockDescToSwift(const TransformerBlockDesc* desc, int hiddenSize, int ffnDim);
+swift::Array<SWTransformerBlockDesc> transformerBlocksToSwift(const std::vector<TransformerBlockDesc>& blocks, int hiddenSize, int ffnDim);
+SWTransformerModelDesc transformerModelDescToSwift(const TransformerModelDesc* desc);
 SWGlobalPoolingResidualBlockDesc globalPoolingResidualBlockDescToSwift(const GlobalPoolingResidualBlockDesc* desc);
 swift::Array<BlockDescriptor> residualBlocksToSwift(const vector<pair<int, unique_ptr_void>>& blocks);
 SWNestedBottleneckResidualBlockDesc nestedBottleneckResidualBlockDescToSwift(const NestedBottleneckResidualBlockDesc* desc);
@@ -64,6 +71,7 @@ void convertNCHW(float* rowSpatialInput, int C, int H, int W, bool inputsUseNHWC
 void processRowData(size_t row, ComputeHandle* gpuHandle, InputBuffers* inputBuffers, NNResultBuf** inputBufs);
 float policyOptimismCalc(const double policyOptimism, const float p, const float pOpt);
 void processOptimism(InputBuffers* inputBuffers, NNOutput* currentOutput, const double policyOptimism, size_t row);
+void processTransformerOptimism(InputBuffers* inputBuffers, NNOutput* currentOutput, const double policyOptimism, size_t row);
 
 void processPolicy(InputBuffers* inputBuffers,
                    NNOutput* currentOutput,
@@ -107,6 +115,8 @@ struct LoadedModel {
    * The modelDesc field is a ModelDesc object that describes the characteristics of the loaded model.
    */
   ModelDesc modelDesc;
+  bool isTransformer;
+  std::unique_ptr<TransformerModelDesc> transformerDesc;
 
   /**
    * @brief Construct a new Loaded Model object
@@ -116,9 +126,7 @@ struct LoadedModel {
    * @param expectedSha256 The expected SHA-256 hash of the model file.
    */
   LoadedModel(const string& fileName, const string& expectedSha256)
-  {
-    ModelDesc::loadFromFileMaybeGZipped(fileName, modelDesc, expectedSha256);
-  }
+  ;
 
   /**
    * @brief Delete the default constructor
@@ -229,6 +237,9 @@ struct ComputeHandle {
    * @brief The version of the metadata encoder.
    */
   int metaEncoderVersion;
+  bool isTransformer;
+  bool transformerSupportsFullRawOutputs;
+  int transformerScoreBeliefLen;
 
   /**
    * @brief Whether the input data uses NHWC format.
@@ -244,6 +255,7 @@ struct ComputeHandle {
    * @brief The Metal handle instance.
    */
   swift::Optional<MetalComputeHandle> metalhandle;
+  swift::Optional<MetalTransformerComputeHandle> metalTransformerHandle;
 
   /**
    * @brief Construct a new ComputeHandle object.
@@ -285,6 +297,7 @@ struct ComputeHandle {
 
 struct InputBuffers {
   int maxBatchSize;
+  bool isTransformer;
   size_t policyResultChannels;
 
   size_t singleSpatialElts;

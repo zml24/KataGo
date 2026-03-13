@@ -120,6 +120,21 @@ void NeuralNet::getOutput(
   throw StringError("Dummy neural net backend: NeuralNet::getOutput unimplemented");
 }
 
+bool NeuralNet::getTransformerRawOutputs(
+  ComputeHandle* gpuHandle,
+  InputBuffers* inputBuffers,
+  int numBatchEltsFilled,
+  NNResultBuf** inputBufs,
+  TransformerRawOutputs& outputs
+) {
+  (void)gpuHandle;
+  (void)inputBuffers;
+  (void)numBatchEltsFilled;
+  (void)inputBufs;
+  (void)outputs;
+  return false;
+}
+
 
 
 bool NeuralNet::testEvaluateConv(

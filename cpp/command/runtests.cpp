@@ -278,6 +278,61 @@ int MainCmds::runnnsymmetriestest(const vector<string>& args) {
   return 0;
 }
 
+int MainCmds::runtransformerdump(const vector<string>& args) {
+  if(args.size() < 3 || args.size() > 6) {
+    cerr << "Must supply two to five arguments: MODEL_FILE OUTPUT_JSON [SYMMETRY] [SAMPLE_NAME] [PRECISION]" << endl;
+    return 1;
+  }
+  Board::initHash();
+  ScoreValue::initTables();
+
+  int symmetry = 0;
+  string sampleFilter;
+  enabled_t precisionMode = enabled_t::False;
+  string precisionLabel = "fp32";
+  size_t idx = 3;
+  auto isPrecision = [](const string& arg) {
+    return arg == "fp32" || arg == "fp16" || arg == "bf16" || arg == "auto";
+  };
+
+  if(idx < args.size() && !isPrecision(args[idx])) {
+    symmetry = Global::stringToInt(args[idx]);
+    idx += 1;
+  }
+  if(idx < args.size() && !isPrecision(args[idx])) {
+    sampleFilter = args[idx];
+    idx += 1;
+  }
+  if(idx < args.size()) {
+    if(args[idx] == "fp32") {
+      precisionMode = enabled_t::False;
+      precisionLabel = "fp32";
+    }
+    else if(args[idx] == "fp16") {
+      precisionMode = enabled_t::True;
+      precisionLabel = "fp16";
+    }
+    else if(args[idx] == "bf16" || args[idx] == "auto") {
+      precisionMode = enabled_t::Auto;
+      precisionLabel = args[idx];
+    }
+    else {
+      cerr << "Transformer dump precision must be fp32 / fp16 / bf16 / auto" << endl;
+      return 1;
+    }
+    idx += 1;
+  }
+  if(idx != args.size()) {
+    cerr << "Unrecognized extra arguments for runtransformerdump" << endl;
+    return 1;
+  }
+
+  Tests::runTransformerDump(args[1], args[2], symmetry, sampleFilter, precisionMode, precisionLabel);
+
+  ScoreValue::freeTables();
+  return 0;
+}
+
 int MainCmds::runnnonmanyposestest(const vector<string>& args) {
   if(args.size() != 6 && args.size() != 7) {
     cerr << "Must supply five or six arguments: MODEL_FILE INPUTSNHWC CUDANHWC SYMMETRY FP16 [COMPARISONFILE]" << endl;
@@ -755,4 +810,3 @@ int MainCmds::runconfigtests(const vector<string>& args) {
   Tests::runParseAllConfigsTest();
   return 0;
 }
-

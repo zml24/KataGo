@@ -55,5 +55,16 @@ void customCudaApplyCScaleBiasNCHW(const half* in, half* out, const half* scale,
 void customCudaApplyCScaleBiasNHWC(const float* in, float* out, const float* scale, const float* biases, const float* mask, int n, int xy, int c, int activation);
 void customCudaApplyCScaleBiasNHWC(const half* in, half* out, const half* scale, const half* biases, const half* mask, int n, int xy, int c, int activation);
 
+// Transformer helpers operating on float32 buffers only.
+void customCudaNCHWToNLCAddBiasPos(const float* spatial, const float* global, const float* pos, float* out, int n, int c, int xSize, int ySize);
+void customCudaAddResidual(float* dst, const float* src, int n);
+void customCudaRMSNorm(const float* in, float* out, const float* weight, int rows, int cSize, float eps);
+void customCudaApplyRotaryInplace(float* q, float* k, const float* cos, const float* sin, int batchSize, int seqLen, int numHeads, int headDim);
+void customCudaAttentionLogits(const float* q, const float* k, float* out, int batchSize, int seqLen, int numHeads, int headDim, float scale);
+void customCudaAttentionSoftmaxInplace(float* logits, int batchSize, int seqLen, int numHeads);
+void customCudaAttentionValues(const float* attn, const float* v, float* out, int batchSize, int seqLen, int numHeads, int headDim);
+void customCudaSiluMultiply(const float* a, const float* b, float* out, int n);
+void customCudaMeanPoolNLC(const float* in, float* out, int batchSize, int seqLen, int cSize);
+
 
 #endif  // NEURALNET_CUDAHELPERS_H_

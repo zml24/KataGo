@@ -26,6 +26,33 @@ struct InputBuffers;
 // A handle to the loaded neural network model.
 struct LoadedModel;
 
+struct TransformerRawOutputs {
+  int batchSize;
+  int nnXLen;
+  int nnYLen;
+  int numPolicyChannels;
+  int numFullPolicyChannels;
+  int numMiscChannels;
+  int numMoreMiscChannels;
+  int numScoringChannels;
+  int numFuturePosChannels;
+  int numSekiChannels;
+  int scoreBeliefLen;
+  std::vector<float> policyPass;
+  std::vector<float> policy;
+  std::vector<float> value;
+  std::vector<float> scoreValue;
+  std::vector<float> ownership;
+  std::vector<float> fullPolicyPass;
+  std::vector<float> fullPolicy;
+  std::vector<float> misc;
+  std::vector<float> moreMisc;
+  std::vector<float> scoring;
+  std::vector<float> futurePos;
+  std::vector<float> seki;
+  std::vector<float> scoreBelief;
+};
+
 // Generic interface to neural net inference.
 // There is a single CUDA backend.
 namespace NeuralNet {
@@ -113,6 +140,14 @@ namespace NeuralNet {
     int numBatchEltsFilled,
     NNResultBuf** inputBufs,
     std::vector<NNOutput*>& outputs
+  );
+
+  bool getTransformerRawOutputs(
+    ComputeHandle* computeHandle,
+    InputBuffers* buffers,
+    int numBatchEltsFilled,
+    NNResultBuf** inputBufs,
+    TransformerRawOutputs& outputs
   );
 
 

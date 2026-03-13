@@ -3,6 +3,7 @@
 
 #include <sstream>
 
+#include "../core/commontypes.h"
 #include "../core/global.h"
 #include "../core/logger.h"
 #include "../core/rand.h"
@@ -80,6 +81,14 @@ namespace Tests {
 
   //testnnevalcanary.cpp
   void runCanaryTests(NNEvaluator* nnEval, int symmetry, bool print);
+  void runTransformerDump(
+    const std::string& modelFile,
+    const std::string& outputFile,
+    int symmetry,
+    const std::string& sampleFilter,
+    enabled_t precisionMode,
+    const std::string& precisionLabel
+  );
   bool runBackendErrorTest(
     NNEvaluator* nnEval,
     NNEvaluator* nnEval32,

@@ -18,6 +18,8 @@
 #include "../neuralnet/nninputs.h"
 #include "../neuralnet/nneval.h"
 #include "../neuralnet/activations.h"
+#include "../neuralnet/transformerdesc.h"
+#include "../neuralnet/transformerinference.h"
 
 #include "../core/simpleallocator.h"
 #include "../core/test.h"
@@ -73,9 +75,37 @@ void printTensorShape(const string& name, const T* t) {
 
 struct LoadedModel {
   ModelDesc modelDesc;
+  bool isTransformer;
+  std::unique_ptr<TransformerModelDesc> transformerDesc;
 
   LoadedModel(const string& fileName, const string& expectedSha256) {
-    ModelDesc::loadFromFileMaybeGZipped(fileName,modelDesc,expectedSha256);
+    transformerDesc = std::make_unique<TransformerModelDesc>();
+    if(TransformerModelDesc::tryLoadFromFileMaybeGZipped(fileName, expectedSha256, *transformerDesc)) {
+      isTransformer = true;
+      modelDesc.name = transformerDesc->name;
+      modelDesc.sha256 = transformerDesc->sha256;
+      modelDesc.modelVersion = transformerDesc->modelVersion;
+      modelDesc.numInputChannels = transformerDesc->numInputChannels;
+      modelDesc.numInputGlobalChannels = transformerDesc->numInputGlobalChannels;
+      modelDesc.numInputMetaChannels = 0;
+      modelDesc.metaEncoderVersion = 0;
+      modelDesc.numPolicyChannels = 2;
+      modelDesc.numValueChannels = 3;
+      modelDesc.numScoreValueChannels = 6;
+      modelDesc.numOwnershipChannels = 1;
+      modelDesc.postProcessParams = transformerDesc->postProcessParams;
+      modelDesc.trunk.trunkNumChannels = transformerDesc->hiddenSize;
+      modelDesc.trunk.numBlocks = transformerDesc->numLayers;
+      modelDesc.trunk.initialConv.convXSize = transformerDesc->stemKernelSize;
+      modelDesc.trunk.initialConv.convYSize = transformerDesc->stemKernelSize;
+      modelDesc.trunk.initialConv.inChannels = transformerDesc->numInputChannels;
+      modelDesc.trunk.initialConv.outChannels = transformerDesc->hiddenSize;
+    }
+    else {
+      isTransformer = false;
+      transformerDesc.reset();
+      ModelDesc::loadFromFileMaybeGZipped(fileName,modelDesc,expectedSha256);
+    }
   }
 
   LoadedModel() = delete;
@@ -1726,12 +1756,19 @@ void NeuralNet::freeComputeContext(ComputeContext* computeContext) {
 
 struct ComputeHandle {
   ComputeContext* context;
+  bool isTransformer;
   bool inputsUseNHWC;
   ComputeHandleInternal handleInternal;
   const std::string modelCacheKey;
   std::shared_ptr<const Model> model;
+  std::unique_ptr<TransformerInferenceEngine> transformerModel;
   std::unique_ptr<ScratchBuffers> scratch;
   std::unique_ptr<Buffers> buffers;
+  std::vector<float> transformerPolicyPass;
+  std::vector<float> transformerPolicy;
+  std::vector<float> transformerValue;
+  std::vector<float> transformerScoreValue;
+  std::vector<float> transformerOwnership;
 
   ComputeHandle() = delete;
   ComputeHandle(const ComputeHandle&) = delete;
@@ -1739,25 +1776,39 @@ struct ComputeHandle {
 
   ComputeHandle(ComputeContext* ctx, const LoadedModel& loadedModel, int maxBatchSize, bool iNHWC)
     : context(ctx),
+      isTransformer(loadedModel.isTransformer),
       inputsUseNHWC(iNHWC),
       handleInternal(ctx),
       modelCacheKey(loadedModel.modelDesc.name + "-" + loadedModel.modelDesc.sha256),
       model(nullptr)
   {
-    {
-      std::lock_guard<std::mutex> lock(context->cachedModelsMutex);
-      if(context->cachedModels.find(modelCacheKey) == context->cachedModels.end()) {
-        context->cachedModels[modelCacheKey] = std::make_shared<const Model>(loadedModel.modelDesc,context->nnXLen,context->nnYLen);
-      }
-      model = context->cachedModels[modelCacheKey];
-      context->cachedModelsRefCount[modelCacheKey] += 1;
+    if(isTransformer) {
+      transformerModel = std::make_unique<TransformerInferenceEngine>(loadedModel.transformerDesc.get());
+      const size_t seqLen = (size_t)context->nnXLen * context->nnYLen;
+      transformerPolicyPass.resize((size_t)maxBatchSize * 2);
+      transformerPolicy.resize((size_t)maxBatchSize * seqLen * 2);
+      transformerValue.resize((size_t)maxBatchSize * 3);
+      transformerScoreValue.resize((size_t)maxBatchSize * 6);
+      transformerOwnership.resize((size_t)maxBatchSize * seqLen);
     }
+    else {
+      {
+        std::lock_guard<std::mutex> lock(context->cachedModelsMutex);
+        if(context->cachedModels.find(modelCacheKey) == context->cachedModels.end()) {
+          context->cachedModels[modelCacheKey] = std::make_shared<const Model>(loadedModel.modelDesc,context->nnXLen,context->nnYLen);
+        }
+        model = context->cachedModels[modelCacheKey];
+        context->cachedModelsRefCount[modelCacheKey] += 1;
+      }
 
-    scratch = std::make_unique<ScratchBuffers>(maxBatchSize,context->nnXLen,context->nnYLen);
-    buffers = std::make_unique<Buffers>(loadedModel.modelDesc,*model,maxBatchSize,context->nnXLen,context->nnYLen);
+      scratch = std::make_unique<ScratchBuffers>(maxBatchSize,context->nnXLen,context->nnYLen);
+      buffers = std::make_unique<Buffers>(loadedModel.modelDesc,*model,maxBatchSize,context->nnXLen,context->nnYLen);
+    }
   }
 
   ~ComputeHandle() {
+    if(isTransformer)
+      return;
     std::lock_guard<std::mutex> lock(context->cachedModelsMutex);
     context->cachedModelsRefCount[modelCacheKey] -= 1;
     assert(context->cachedModelsRefCount[modelCacheKey] >= 0);
@@ -1781,13 +1832,22 @@ ComputeHandle* NeuralNet::createComputeHandle(
   if(logger != NULL) {
     logger->write("Eigen (CPU) backend thread " + Global::intToString(serverThreadIdx) + ": Model version " + Global::intToString(loadedModel->modelDesc.modelVersion));
     logger->write("Eigen (CPU) backend thread " + Global::intToString(serverThreadIdx) + ": Model name: " + loadedModel->modelDesc.name);
+    logger->write(
+      "Eigen (CPU) backend thread " + Global::intToString(serverThreadIdx) +
+      ": modelType = " + string(loadedModel->isTransformer ? "transformer" : "cnn")
+    );
   }
 
-  (void)requireExactNNLen; //We don't bother with mask optimizations if we know exact sizes right now.
   (void)gpuIdxForThisThread; //Doesn't matter
 
   if(!inputsUseNHWC)
     throw StringError("Eigen backend: inputsUseNHWC = false unsupported");
+  if(loadedModel->isTransformer) {
+    if(!requireExactNNLen)
+      throw StringError("Eigen backend Transformer 路径仅支持 requireExactNNLen=true，且棋盘尺寸必须固定等于模型 pos_len");
+    if(context->nnXLen != loadedModel->transformerDesc->posLen || context->nnYLen != loadedModel->transformerDesc->posLen)
+      throw StringError("Eigen backend Transformer 路径仅支持与模型 pos_len 完全一致的棋盘尺寸");
+  }
   return new ComputeHandle(context, *loadedModel, maxBatchSize, inputsUseNHWC);
 }
 
@@ -1812,6 +1872,86 @@ void NeuralNet::getOutput(
   const int batchSize = numBatchEltsFilled;
   const int nnXLen = computeHandle->context->nnXLen;
   const int nnYLen = computeHandle->context->nnYLen;
+  if(computeHandle->isTransformer) {
+    const int modelVersion = computeHandle->transformerModel->getModelVersion();
+    const int numSpatialFeatures = NNModelVersion::getNumSpatialFeatures(modelVersion);
+    const int numGlobalFeatures = NNModelVersion::getNumGlobalFeatures(modelVersion);
+    const int numPolicyChannels = computeHandle->transformerModel->getNumPolicyChannels();
+    assert(numSpatialFeatures == computeHandle->transformerModel->getNumInputChannels());
+    assert(numGlobalFeatures == computeHandle->transformerModel->getNumInputGlobalChannels());
+    assert(inputBuffers->singleInputElts == (size_t)numSpatialFeatures * nnXLen * nnYLen);
+    assert(inputBuffers->singleInputGlobalElts == (size_t)numGlobalFeatures);
+    assert(inputBuffers->singleInputMetaElts == 0);
+    assert(inputBuffers->singlePolicyPassResultElts == (size_t)numPolicyChannels);
+    assert(inputBuffers->singlePolicyResultElts == (size_t)numPolicyChannels * nnXLen * nnYLen);
+    assert(inputBuffers->singleValueResultElts == 3);
+    assert(inputBuffers->singleScoreValueResultElts == 6);
+    assert(inputBuffers->singleOwnershipResultElts == (size_t)nnXLen * nnYLen);
+
+    for(int nIdx = 0; nIdx < batchSize; nIdx++) {
+      if(
+        inputBufs[nIdx]->boardXSizeForServer != nnXLen ||
+        inputBufs[nIdx]->boardYSizeForServer != nnYLen
+      ) {
+        throw StringError("Eigen backend Transformer 路径仅支持与模型 pos_len 完全一致的棋盘尺寸");
+      }
+
+      float* rowSpatialInput = inputBuffers->spatialInput.data() + (inputBuffers->singleInputElts * nIdx);
+      float* rowGlobalInput = inputBuffers->globalInput.data() + (inputBuffers->singleInputGlobalElts * nIdx);
+      const float* rowGlobal = inputBufs[nIdx]->rowGlobalBuf.data();
+      const float* rowSpatial = inputBufs[nIdx]->rowSpatialBuf.data();
+      std::copy(rowGlobal,rowGlobal+numGlobalFeatures,rowGlobalInput);
+      SymmetryHelpers::copyInputsWithSymmetry(rowSpatial, rowSpatialInput, 1, nnYLen, nnXLen, numSpatialFeatures, computeHandle->inputsUseNHWC, inputBufs[nIdx]->symmetry);
+    }
+
+    computeHandle->transformerModel->apply(
+      batchSize,
+      inputBuffers->spatialInput.data(),
+      inputBuffers->globalInput.data(),
+      computeHandle->transformerPolicyPass.data(),
+      computeHandle->transformerPolicy.data(),
+      computeHandle->transformerValue.data(),
+      computeHandle->transformerScoreValue.data(),
+      computeHandle->transformerOwnership.data()
+    );
+
+    assert(outputs.size() == batchSize);
+    float policyProbsTmp[NNPos::MAX_NN_POLICY_SIZE];
+    for(int row = 0; row < batchSize; row++) {
+      NNOutput* output = outputs[row];
+      assert(output->nnXLen == nnXLen);
+      assert(output->nnYLen == nnYLen);
+      float policyOptimism = (float)inputBufs[row]->policyOptimism;
+
+      const float* policyPassSrcBuf = computeHandle->transformerPolicyPass.data() + row * numPolicyChannels;
+      const float* policySrcBuf = computeHandle->transformerPolicy.data() + row * numPolicyChannels * nnXLen * nnYLen;
+      float* policyProbs = output->policyProbs;
+      for(int i = 0; i < nnXLen * nnYLen; i++) {
+        float p = policySrcBuf[i * numPolicyChannels];
+        float pOpt = policySrcBuf[i * numPolicyChannels + 1];
+        policyProbsTmp[i] = p + (pOpt - p) * policyOptimism;
+      }
+      SymmetryHelpers::copyOutputsWithSymmetry(policyProbsTmp, policyProbs, 1, nnYLen, nnXLen, inputBufs[row]->symmetry);
+      policyProbs[nnXLen * nnYLen] = policyPassSrcBuf[0] + (policyPassSrcBuf[1] - policyPassSrcBuf[0]) * policyOptimism;
+
+      output->whiteWinProb = computeHandle->transformerValue[row * 3];
+      output->whiteLossProb = computeHandle->transformerValue[row * 3 + 1];
+      output->whiteNoResultProb = computeHandle->transformerValue[row * 3 + 2];
+
+      if(output->whiteOwnerMap != NULL) {
+        const float* ownershipSrcBuf = computeHandle->transformerOwnership.data() + row * nnXLen * nnYLen;
+        SymmetryHelpers::copyOutputsWithSymmetry(ownershipSrcBuf, output->whiteOwnerMap, 1, nnYLen, nnXLen, inputBufs[row]->symmetry);
+      }
+
+      output->whiteScoreMean = computeHandle->transformerScoreValue[row * 6];
+      output->whiteScoreMeanSq = computeHandle->transformerScoreValue[row * 6 + 1];
+      output->whiteLead = computeHandle->transformerScoreValue[row * 6 + 2];
+      output->varTimeLeft = computeHandle->transformerScoreValue[row * 6 + 3];
+      output->shorttermWinlossError = computeHandle->transformerScoreValue[row * 6 + 4];
+      output->shorttermScoreError = computeHandle->transformerScoreValue[row * 6 + 5];
+    }
+    return;
+  }
   const int modelVersion = computeHandle->model->modelVersion;
 
   const int numSpatialFeatures = NNModelVersion::getNumSpatialFeatures(modelVersion);
@@ -1983,6 +2123,114 @@ void NeuralNet::getOutput(
       ASSERT_UNREACHABLE;
     }
   }
+}
+
+bool NeuralNet::getTransformerRawOutputs(
+  ComputeHandle* computeHandle,
+  InputBuffers* inputBuffers,
+  int numBatchEltsFilled,
+  NNResultBuf** inputBufs,
+  TransformerRawOutputs& outputs
+) {
+  if(!computeHandle->isTransformer)
+    return false;
+
+  assert(numBatchEltsFilled <= inputBuffers->maxBatchSize);
+  assert(numBatchEltsFilled > 0);
+  const int batchSize = numBatchEltsFilled;
+  const int nnXLen = computeHandle->context->nnXLen;
+  const int nnYLen = computeHandle->context->nnYLen;
+  const int modelVersion = computeHandle->transformerModel->getModelVersion();
+  const int numSpatialFeatures = NNModelVersion::getNumSpatialFeatures(modelVersion);
+  const int numGlobalFeatures = NNModelVersion::getNumGlobalFeatures(modelVersion);
+  const int numPolicyChannels = computeHandle->transformerModel->getNumPolicyChannels();
+
+  for(int nIdx = 0; nIdx < batchSize; nIdx++) {
+    if(
+      inputBufs[nIdx]->boardXSizeForServer != nnXLen ||
+      inputBufs[nIdx]->boardYSizeForServer != nnYLen
+    ) {
+      throw StringError("Eigen backend Transformer 路径仅支持与模型 pos_len 完全一致的棋盘尺寸");
+    }
+
+    float* rowSpatialInput = inputBuffers->spatialInput.data() + (inputBuffers->singleInputElts * nIdx);
+    float* rowGlobalInput = inputBuffers->globalInput.data() + (inputBuffers->singleInputGlobalElts * nIdx);
+    const float* rowGlobal = inputBufs[nIdx]->rowGlobalBuf.data();
+    const float* rowSpatial = inputBufs[nIdx]->rowSpatialBuf.data();
+    std::copy(rowGlobal,rowGlobal+numGlobalFeatures,rowGlobalInput);
+    SymmetryHelpers::copyInputsWithSymmetry(rowSpatial, rowSpatialInput, 1, nnYLen, nnXLen, numSpatialFeatures, computeHandle->inputsUseNHWC, inputBufs[nIdx]->symmetry);
+  }
+
+  outputs.batchSize = batchSize;
+  outputs.nnXLen = nnXLen;
+  outputs.nnYLen = nnYLen;
+  outputs.numPolicyChannels = numPolicyChannels;
+  outputs.numFullPolicyChannels = 0;
+  outputs.numMiscChannels = 0;
+  outputs.numMoreMiscChannels = 0;
+  outputs.numScoringChannels = 0;
+  outputs.numFuturePosChannels = 0;
+  outputs.numSekiChannels = 0;
+  outputs.scoreBeliefLen = 0;
+  outputs.policyPass.resize((size_t)batchSize * numPolicyChannels);
+  outputs.policy.resize((size_t)batchSize * numPolicyChannels * nnXLen * nnYLen);
+  outputs.value.resize((size_t)batchSize * 3);
+  outputs.scoreValue.resize((size_t)batchSize * 6);
+  outputs.ownership.resize((size_t)batchSize * nnXLen * nnYLen);
+  outputs.fullPolicyPass.clear();
+  outputs.fullPolicy.clear();
+  outputs.misc.clear();
+  outputs.moreMisc.clear();
+  outputs.scoring.clear();
+  outputs.futurePos.clear();
+  outputs.seki.clear();
+  outputs.scoreBelief.clear();
+
+  computeHandle->transformerModel->apply(
+    batchSize,
+    inputBuffers->spatialInput.data(),
+    inputBuffers->globalInput.data(),
+    outputs.policyPass.data(),
+    outputs.policy.data(),
+    outputs.value.data(),
+    outputs.scoreValue.data(),
+    outputs.ownership.data()
+  );
+
+  if(computeHandle->transformerModel->supportsFullRawOutputs()) {
+    outputs.numFullPolicyChannels = computeHandle->transformerModel->getNumFullPolicyChannels();
+    outputs.numMiscChannels = 10;
+    outputs.numMoreMiscChannels = 8;
+    outputs.numScoringChannels = 1;
+    outputs.numFuturePosChannels = 2;
+    outputs.numSekiChannels = 4;
+    outputs.scoreBeliefLen = computeHandle->transformerModel->getScoreBeliefLen();
+    outputs.fullPolicyPass.resize((size_t)batchSize * outputs.numFullPolicyChannels);
+    outputs.fullPolicy.resize((size_t)batchSize * outputs.numFullPolicyChannels * nnXLen * nnYLen);
+    outputs.misc.resize((size_t)batchSize * outputs.numMiscChannels);
+    outputs.moreMisc.resize((size_t)batchSize * outputs.numMoreMiscChannels);
+    outputs.scoring.resize((size_t)batchSize * nnXLen * nnYLen);
+    outputs.futurePos.resize((size_t)batchSize * nnXLen * nnYLen * outputs.numFuturePosChannels);
+    outputs.seki.resize((size_t)batchSize * nnXLen * nnYLen * outputs.numSekiChannels);
+    outputs.scoreBelief.resize((size_t)batchSize * outputs.scoreBeliefLen);
+
+    computeHandle->transformerModel->applyFull(
+      batchSize,
+      inputBuffers->spatialInput.data(),
+      inputBuffers->globalInput.data(),
+      outputs.fullPolicyPass.data(),
+      outputs.fullPolicy.data(),
+      outputs.value.data(),
+      outputs.misc.data(),
+      outputs.moreMisc.data(),
+      outputs.ownership.data(),
+      outputs.scoring.data(),
+      outputs.futurePos.data(),
+      outputs.seki.data(),
+      outputs.scoreBelief.data()
+    );
+  }
+  return true;
 }
 
 

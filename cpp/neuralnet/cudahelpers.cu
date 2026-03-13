@@ -1902,3 +1902,272 @@ void customCudaApplyCScaleBiasNHWC(const float* in, float* out, const float* sca
 void customCudaApplyCScaleBiasNHWC(const half* in, half* out, const half* scale, const half* biases, const half* mask, int nSize, int xySize, int cSize, int activation) {
   sharedApplyCScaleBiasNHWC(in,out,scale,biases,mask,nSize,xySize,cSize,true,activation);
 }
+
+//--------------------------------------------------------------------------------------------------------------
+// Transformer helpers
+
+__global__
+void nchwToNlcAddBiasPosKernel(
+  const float* spatial,
+  const float* global,
+  const float* pos,
+  float* out,
+  int nSize,
+  int lSize,
+  int cSize
+) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  int total = nSize * lSize * cSize;
+  if(idx >= total)
+    return;
+  int c = idx % cSize;
+  int tmp = idx / cSize;
+  int l = tmp % lSize;
+  int n = tmp / lSize;
+
+  float value = spatial[(n * cSize + c) * lSize + l] + global[n * cSize + c];
+  if(pos != nullptr)
+    value += pos[l * cSize + c];
+  out[idx] = value;
+}
+
+void customCudaNCHWToNLCAddBiasPos(const float* spatial, const float* global, const float* pos, float* out, int n, int c, int xSize, int ySize) {
+  int lSize = xSize * ySize;
+  int total = n * lSize * c;
+  int blockSize = 256;
+  int numBlocks = (total + blockSize - 1) / blockSize;
+  dim3 grid(numBlocks, 1, 1);
+  nchwToNlcAddBiasPosKernel<<<grid, blockSize>>>(spatial, global, pos, out, n, lSize, c);
+}
+
+__global__
+void addResidualKernel(float* dst, const float* src, int n) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if(idx < n)
+    dst[idx] += src[idx];
+}
+
+void customCudaAddResidual(float* dst, const float* src, int n) {
+  int blockSize = 256;
+  int numBlocks = (n + blockSize - 1) / blockSize;
+  addResidualKernel<<<numBlocks, blockSize>>>(dst, src, n);
+}
+
+__global__
+void rmsNormKernel(const float* in, float* out, const float* weight, int cSize, float eps) {
+  extern __shared__ float shared[];
+  int row = blockIdx.x;
+  int tid = threadIdx.x;
+  const float* rowIn = in + (size_t)row * cSize;
+  float* rowOut = out + (size_t)row * cSize;
+
+  float sumSq = 0.0f;
+  for(int c = tid; c < cSize; c += blockDim.x) {
+    float v = rowIn[c];
+    sumSq += v * v;
+  }
+  shared[tid] = sumSq;
+  __syncthreads();
+
+  for(int stride = blockDim.x / 2; stride > 0; stride /= 2) {
+    if(tid < stride)
+      shared[tid] += shared[tid + stride];
+    __syncthreads();
+  }
+
+  float invRms = rsqrtf(shared[0] / cSize + eps);
+  for(int c = tid; c < cSize; c += blockDim.x) {
+    rowOut[c] = rowIn[c] * invRms * weight[c];
+  }
+}
+
+void customCudaRMSNorm(const float* in, float* out, const float* weight, int rows, int cSize, float eps) {
+  int threads = 256;
+  while(threads / 2 >= cSize && threads > 32)
+    threads /= 2;
+  rmsNormKernel<<<rows, threads, threads * sizeof(float)>>>(in, out, weight, cSize, eps);
+}
+
+__global__
+void rotaryKernel(float* q, float* k, const float* cos, const float* sin, int batchSize, int seqLen, int numHeads, int headDim) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  int halfDim = headDim / 2;
+  int total = batchSize * seqLen * numHeads * halfDim;
+  if(idx >= total)
+    return;
+  int d = idx % halfDim;
+  int tmp = idx / halfDim;
+  int h = tmp % numHeads;
+  tmp /= numHeads;
+  int l = tmp % seqLen;
+  int b = tmp / seqLen;
+  float cosLo = cos[l * headDim + d];
+  float sinLo = sin[l * headDim + d];
+  float cosHi = cos[l * headDim + d + halfDim];
+  float sinHi = sin[l * headDim + d + halfDim];
+  size_t base = (((size_t)b * seqLen + l) * numHeads + h) * headDim;
+  float qSelf = q[base + d];
+  float qMate = q[base + d + halfDim];
+  float kSelf = k[base + d];
+  float kMate = k[base + d + halfDim];
+  q[base + d] = qSelf * cosLo - qMate * sinLo;
+  q[base + d + halfDim] = qMate * cosHi + qSelf * sinHi;
+  k[base + d] = kSelf * cosLo - kMate * sinLo;
+  k[base + d + halfDim] = kMate * cosHi + kSelf * sinHi;
+}
+
+void customCudaApplyRotaryInplace(float* q, float* k, const float* cos, const float* sin, int batchSize, int seqLen, int numHeads, int headDim) {
+  int total = batchSize * seqLen * numHeads * (headDim / 2);
+  int blockSize = 256;
+  int numBlocks = (total + blockSize - 1) / blockSize;
+  rotaryKernel<<<numBlocks, blockSize>>>(q, k, cos, sin, batchSize, seqLen, numHeads, headDim);
+}
+
+__global__
+void attentionLogitsKernel(const float* q, const float* k, float* out, int batchSize, int seqLen, int numHeads, int headDim, float scale) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  int total = batchSize * numHeads * seqLen * seqLen;
+  if(idx >= total)
+    return;
+  int j = idx % seqLen;
+  int tmp = idx / seqLen;
+  int i = tmp % seqLen;
+  tmp /= seqLen;
+  int h = tmp % numHeads;
+  int b = tmp / numHeads;
+
+  size_t qBase = (((size_t)b * seqLen + i) * numHeads + h) * headDim;
+  size_t kBase = (((size_t)b * seqLen + j) * numHeads + h) * headDim;
+  float sum = 0.0f;
+  for(int d = 0; d < headDim; d++)
+    sum += q[qBase + d] * k[kBase + d];
+  out[idx] = sum * scale;
+}
+
+void customCudaAttentionLogits(const float* q, const float* k, float* out, int batchSize, int seqLen, int numHeads, int headDim, float scale) {
+  int total = batchSize * numHeads * seqLen * seqLen;
+  int blockSize = 128;
+  int numBlocks = (total + blockSize - 1) / blockSize;
+  attentionLogitsKernel<<<numBlocks, blockSize>>>(q, k, out, batchSize, seqLen, numHeads, headDim, scale);
+}
+
+__global__
+void attentionSoftmaxKernel(float* logits, int seqLen) {
+  extern __shared__ float shared[];
+  int row = blockIdx.x;
+  int tid = threadIdx.x;
+  float* rowPtr = logits + (size_t)row * seqLen;
+
+  float maxVal = -1e30f;
+  for(int j = tid; j < seqLen; j += blockDim.x) {
+    if(rowPtr[j] > maxVal)
+      maxVal = rowPtr[j];
+  }
+  shared[tid] = maxVal;
+  __syncthreads();
+  for(int stride = blockDim.x / 2; stride > 0; stride /= 2) {
+    if(tid < stride)
+      shared[tid] = fmaxf(shared[tid], shared[tid + stride]);
+    __syncthreads();
+  }
+  maxVal = shared[0];
+
+  float sum = 0.0f;
+  for(int j = tid; j < seqLen; j += blockDim.x) {
+    float v = expf(rowPtr[j] - maxVal);
+    rowPtr[j] = v;
+    sum += v;
+  }
+  shared[tid] = sum;
+  __syncthreads();
+  for(int stride = blockDim.x / 2; stride > 0; stride /= 2) {
+    if(tid < stride)
+      shared[tid] += shared[tid + stride];
+    __syncthreads();
+  }
+  float invSum = 1.0f / shared[0];
+  for(int j = tid; j < seqLen; j += blockDim.x) {
+    rowPtr[j] *= invSum;
+  }
+}
+
+void customCudaAttentionSoftmaxInplace(float* logits, int batchSize, int seqLen, int numHeads) {
+  int rows = batchSize * numHeads * seqLen;
+  int threads = 512;
+  attentionSoftmaxKernel<<<rows, threads, threads * sizeof(float)>>>(logits, seqLen);
+}
+
+__global__
+void attentionValuesKernel(const float* attn, const float* v, float* out, int batchSize, int seqLen, int numHeads, int headDim) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  int total = batchSize * seqLen * numHeads * headDim;
+  if(idx >= total)
+    return;
+  int d = idx % headDim;
+  int tmp = idx / headDim;
+  int h = tmp % numHeads;
+  tmp /= numHeads;
+  int i = tmp % seqLen;
+  int b = tmp / seqLen;
+
+  const float* attnRow = attn + (((size_t)b * numHeads + h) * seqLen + i) * seqLen;
+  float sum = 0.0f;
+  for(int j = 0; j < seqLen; j++) {
+    size_t vBase = (((size_t)b * seqLen + j) * numHeads + h) * headDim;
+    sum += attnRow[j] * v[vBase + d];
+  }
+  size_t outBase = (((size_t)b * seqLen + i) * numHeads + h) * headDim;
+  out[outBase + d] = sum;
+}
+
+void customCudaAttentionValues(const float* attn, const float* v, float* out, int batchSize, int seqLen, int numHeads, int headDim) {
+  int total = batchSize * seqLen * numHeads * headDim;
+  int blockSize = 128;
+  int numBlocks = (total + blockSize - 1) / blockSize;
+  attentionValuesKernel<<<numBlocks, blockSize>>>(attn, v, out, batchSize, seqLen, numHeads, headDim);
+}
+
+__device__ __forceinline__
+float siluf(float x) {
+  return x / (1.0f + expf(-x));
+}
+
+__global__
+void siluMultiplyKernel(const float* a, const float* b, float* out, int n) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if(idx < n)
+    out[idx] = siluf(a[idx]) * b[idx];
+}
+
+void customCudaSiluMultiply(const float* a, const float* b, float* out, int n) {
+  int blockSize = 256;
+  int numBlocks = (n + blockSize - 1) / blockSize;
+  siluMultiplyKernel<<<numBlocks, blockSize>>>(a, b, out, n);
+}
+
+__global__
+void meanPoolNlCKernel(const float* in, float* out, int seqLen, int cSize) {
+  extern __shared__ float shared[];
+  int c = blockIdx.x;
+  int b = blockIdx.y;
+  int tid = threadIdx.x;
+  float sum = 0.0f;
+  for(int l = tid; l < seqLen; l += blockDim.x) {
+    sum += in[((size_t)b * seqLen + l) * cSize + c];
+  }
+  shared[tid] = sum;
+  __syncthreads();
+  for(int stride = blockDim.x / 2; stride > 0; stride /= 2) {
+    if(tid < stride)
+      shared[tid] += shared[tid + stride];
+    __syncthreads();
+  }
+  if(tid == 0)
+    out[b * cSize + c] = shared[0] / seqLen;
+}
+
+void customCudaMeanPoolNLC(const float* in, float* out, int batchSize, int seqLen, int cSize) {
+  dim3 grid(cSize, batchSize, 1);
+  int threads = 512;
+  meanPoolNlCKernel<<<grid, threads, threads * sizeof(float)>>>(in, out, seqLen, cSize);
+}
