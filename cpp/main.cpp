@@ -55,7 +55,7 @@ runnnlayertests : Test a few subcomponents of the current neural net backend
 runnnontinyboardtest : Run neural net on a tiny board and dump result to stdout
 runnnsymmetriestest : Run neural net on a hardcoded rectangle board and dump symmetries result
 runtransformerdump : Dump fixed Transformer sample inputs plus raw/backend outputs to JSON
-                     Usage: MODEL_FILE OUTPUT_JSON [SYMMETRY] [SAMPLE_NAME] [PRECISION=fp32|fp16|bf16|auto]
+                     Usage: MODEL_FILE OUTPUT_JSON [SYMMETRY] [SAMPLE_NAME] [PRECISION=fp32|fp16|bf16]
 runownershiptests : Run neural net search on some hardcoded positions and print avg ownership
 
 runoutputtests : Run a bunch of things and dump details to stdout

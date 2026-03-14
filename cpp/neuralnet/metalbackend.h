@@ -160,6 +160,7 @@ struct ComputeContext {
    * @brief Whether to use FP16 mode for computations.
    */
   enabled_t useFP16Mode;
+  compute_precision_t precisionMode;
 
   /**
    * @brief ComputeContext ID
@@ -180,7 +181,7 @@ struct ComputeContext {
    * @param useFP16Mode Whether to use half-precision floating-point (FP16) mode for computations.
    * @param useNHWCMode Whether to use the NHWC format for input tensors.
    */
-  ComputeContext(int nnX, int nnY, enabled_t useFP16Mode, enabled_t useNHWCMode);
+  ComputeContext(int nnX, int nnY, enabled_t useFP16Mode, compute_precision_t precisionMode, enabled_t useNHWCMode);
 
   /**
    * @brief Destroys the ComputeContext object.

@@ -86,7 +86,7 @@ namespace Tests {
     const std::string& outputFile,
     int symmetry,
     const std::string& sampleFilter,
-    enabled_t precisionMode,
+    compute_precision_t precisionMode,
     const std::string& precisionLabel
   );
   bool runBackendErrorTest(

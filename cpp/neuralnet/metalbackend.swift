@@ -3410,16 +3410,36 @@ private func deviceSupportsTransformerBFloat16(_ device: MTLDevice) -> Bool {
         device.supportsFamily(.mac2)
 }
 
+public func metalDeviceSupportsTransformerBFloat16() -> Bool {
+    guard let device = MTLCreateSystemDefaultDevice() else {
+        return false
+    }
+    return deviceSupportsTransformerBFloat16(device)
+}
+
 private func chooseTransformerPrecision(
     device: MTLDevice,
-    requestedMode: SWEnable
+    requestedModeRaw: Int32,
+    fallbackFP16Mode: SWEnable
 ) -> TransformerComputePrecision {
-    switch requestedMode {
-    case .False:
+    switch requestedModeRaw {
+    case 0:
         return .float32
-    case .True:
+    case 1:
         return .float16
-    case .Auto:
+    case 2:
+        precondition(deviceSupportsTransformerBFloat16(device), "Metal backend: 当前设备不支持 Transformer bf16 推理")
+        return .bfloat16
+    case 3:
+        switch fallbackFP16Mode {
+        case .False:
+            return .float32
+        case .True:
+            return .float16
+        case .Auto:
+            return deviceSupportsTransformerBFloat16(device) ? .bfloat16 : .float16
+        }
+    default:
         return deviceSupportsTransformerBFloat16(device) ? .bfloat16 : .float16
     }
 }
@@ -4118,7 +4138,10 @@ public func maybeCreateMetalTransformerComputeHandle(
     guard condition else { return nil }
 
     let device = MTLCreateSystemDefaultDevice()!
-    let precision = chooseTransformerPrecision(device: device, requestedMode: context.useFP16Mode)
+    let precision = chooseTransformerPrecision(
+        device: device,
+        requestedModeRaw: context.transformerPrecisionModeRaw,
+        fallbackFP16Mode: context.useFP16Mode)
     let model = TransformerModel(
         device: device,
         graph: MPSGraph(),
@@ -4150,6 +4173,7 @@ public class MetalComputeContext {
     public let nnXLen: Int32
     public let nnYLen: Int32
     let useFP16Mode: SWEnable
+    let transformerPrecisionModeRaw: Int32
     let useNHWCMode: SWEnable
 
     /// Initialize a context.
@@ -4160,11 +4184,13 @@ public class MetalComputeContext {
         nnXLen: Int32,
         nnYLen: Int32,
         useFP16Mode: SWEnable,
+        transformerPrecisionModeRaw: Int32,
         useNHWCMode: SWEnable
     ) {
         self.nnXLen = nnXLen
         self.nnYLen = nnYLen
         self.useFP16Mode = useFP16Mode
+        self.transformerPrecisionModeRaw = transformerPrecisionModeRaw
         self.useNHWCMode = useNHWCMode
     }
 }
@@ -4173,12 +4199,14 @@ public func createMetalComputeContext(
     nnXLen: Int32,
     nnYLen: Int32,
     useFP16Mode: SWEnable,
+    transformerPrecisionModeRaw: Int32,
     useNHWCMode: SWEnable
 ) -> MetalComputeContext {
     return MetalComputeContext(
         nnXLen: nnXLen,
         nnYLen: nnYLen,
         useFP16Mode: useFP16Mode,
+        transformerPrecisionModeRaw: transformerPrecisionModeRaw,
         useNHWCMode: useNHWCMode)
 }
 

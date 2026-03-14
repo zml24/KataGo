@@ -54,6 +54,7 @@ ComputeContext* NeuralNet::createComputeContext(
   const string& homeDataDirOverride,
   bool openCLReTunePerBoardSize,
   enabled_t useFP16Mode,
+  compute_precision_t precisionMode,
   enabled_t useNHWCMode,
   const LoadedModel* loadedModel) {
   (void)gpuIdxs;
@@ -61,6 +62,13 @@ ComputeContext* NeuralNet::createComputeContext(
   (void)openCLTunerFile;
   (void)openCLReTunePerBoardSize;
   (void)loadedModel;
+  if(precisionMode == compute_precision_t::BF16) {
+    throw StringError("TensorRT backend: bf16 precision unsupported");
+  }
+  if(precisionMode == compute_precision_t::FP16)
+    useFP16Mode = enabled_t::True;
+  else if(precisionMode == compute_precision_t::FP32)
+    useFP16Mode = enabled_t::False;
 
   if(useNHWCMode == enabled_t::True) {
     throw StringError("TensorRT backend: useNHWC = false required, other configurations not supported");
@@ -102,6 +110,10 @@ void NeuralNet::freeLoadedModel(LoadedModel* loadedModel) {
 
 const ModelDesc& NeuralNet::getModelDesc(const LoadedModel* loadedModel) {
   return loadedModel->modelDesc;
+}
+
+bool NeuralNet::isTransformerModel(const LoadedModel* loadedModel) {
+  return false;
 }
 
 struct TRTModel {

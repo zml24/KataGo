@@ -134,6 +134,10 @@ const ModelDesc& NeuralNet::getModelDesc(const LoadedModel* loadedModel) {
   return loadedModel->modelDesc;
 }
 
+bool NeuralNet::isTransformerModel(const LoadedModel* loadedModel) {
+  return false;
+}
+
 //---------------------------------------------------------------------------------------------------------
 
 // Wraps cl_program with a destructor that calls clReleaseProgram
@@ -460,9 +464,16 @@ ComputeContext* NeuralNet::createComputeContext(
   const string& homeDataDirOverride,
   bool openCLReTunePerBoardSize,
   enabled_t useFP16Mode,
+  compute_precision_t precisionMode,
   enabled_t useNHWCMode,
   const LoadedModel* loadedModel
 ) {
+  if(precisionMode == compute_precision_t::BF16)
+    throw StringError("OpenCL backend: bf16 precision unsupported");
+  if(precisionMode == compute_precision_t::FP16)
+    useFP16Mode = enabled_t::True;
+  else if(precisionMode == compute_precision_t::FP32)
+    useFP16Mode = enabled_t::False;
   if(gpuIdxs.size() <= 0)
     throw StringError("NeuralNet::createComputeContext - specified no gpus to use");
 

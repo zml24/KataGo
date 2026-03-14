@@ -1006,6 +1006,36 @@ void customCudaCopyFromHalf(const half* in, float* out, int n) {
   copyFromHalfKernel<<<numBlocks, blockSize>>>(in,out,n);
 }
 
+#ifdef KATAGO_CUDA_BFLOAT16_AVAILABLE
+__global__
+void copyToBFloat16Kernel(const float* in, __nv_bfloat16* out, int n)
+{
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if(idx < n) {
+    out[idx] = __float2bfloat16(in[idx]);
+  }
+}
+__global__
+void copyFromBFloat16Kernel(const __nv_bfloat16* in, float* out, int n)
+{
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if(idx < n) {
+    out[idx] = __bfloat162float(in[idx]);
+  }
+}
+
+void customCudaCopyToBFloat16(const float* in, __nv_bfloat16* out, int n) {
+  int blockSize = targetNumThreads;
+  int numBlocks = (n+blockSize-1)/blockSize;
+  copyToBFloat16Kernel<<<numBlocks, blockSize>>>(in,out,n);
+}
+void customCudaCopyFromBFloat16(const __nv_bfloat16* in, float* out, int n) {
+  int blockSize = targetNumThreads;
+  int numBlocks = (n+blockSize-1)/blockSize;
+  copyFromBFloat16Kernel<<<numBlocks, blockSize>>>(in,out,n);
+}
+#endif
+
 //--------------------------------------------------------------------------------------------------------------
 
 
@@ -1907,11 +1937,47 @@ void customCudaApplyCScaleBiasNHWC(const half* in, half* out, const half* scale,
 // Transformer helpers
 
 __global__
+template<typename T>
+__device__ __forceinline__ float transformerToFloat(T value);
+template<>
+__device__ __forceinline__ float transformerToFloat<float>(float value) {
+  return value;
+}
+template<>
+__device__ __forceinline__ float transformerToFloat<half>(half value) {
+  return __half2float(value);
+}
+#ifdef KATAGO_CUDA_BFLOAT16_AVAILABLE
+template<>
+__device__ __forceinline__ float transformerToFloat<__nv_bfloat16>(__nv_bfloat16 value) {
+  return __bfloat162float(value);
+}
+#endif
+
+template<typename T>
+__device__ __forceinline__ T transformerFromFloat(float value);
+template<>
+__device__ __forceinline__ float transformerFromFloat<float>(float value) {
+  return value;
+}
+template<>
+__device__ __forceinline__ half transformerFromFloat<half>(float value) {
+  return __float2half(value);
+}
+#ifdef KATAGO_CUDA_BFLOAT16_AVAILABLE
+template<>
+__device__ __forceinline__ __nv_bfloat16 transformerFromFloat<__nv_bfloat16>(float value) {
+  return __float2bfloat16(value);
+}
+#endif
+
+template<typename TOut>
+__global__
 void nchwToNlcAddBiasPosKernel(
   const float* spatial,
   const float* global,
   const float* pos,
-  float* out,
+  TOut* out,
   int nSize,
   int lSize,
   int cSize
@@ -1928,10 +1994,11 @@ void nchwToNlcAddBiasPosKernel(
   float value = spatial[(n * cSize + c) * lSize + l] + global[n * cSize + c];
   if(pos != nullptr)
     value += pos[l * cSize + c];
-  out[idx] = value;
+  out[idx] = transformerFromFloat<TOut>(value);
 }
 
-void customCudaNCHWToNLCAddBiasPos(const float* spatial, const float* global, const float* pos, float* out, int n, int c, int xSize, int ySize) {
+template<typename TOut>
+static void launchNCHWToNLCAddBiasPos(const float* spatial, const float* global, const float* pos, TOut* out, int n, int c, int xSize, int ySize) {
   int lSize = xSize * ySize;
   int total = n * lSize * c;
   int blockSize = 256;
@@ -1940,30 +2007,59 @@ void customCudaNCHWToNLCAddBiasPos(const float* spatial, const float* global, co
   nchwToNlcAddBiasPosKernel<<<grid, blockSize>>>(spatial, global, pos, out, n, lSize, c);
 }
 
+void customCudaNCHWToNLCAddBiasPos(const float* spatial, const float* global, const float* pos, float* out, int n, int c, int xSize, int ySize) {
+  launchNCHWToNLCAddBiasPos<float>(spatial, global, pos, out, n, c, xSize, ySize);
+}
+void customCudaNCHWToNLCAddBiasPos(const float* spatial, const float* global, const float* pos, half* out, int n, int c, int xSize, int ySize) {
+  launchNCHWToNLCAddBiasPos<half>(spatial, global, pos, out, n, c, xSize, ySize);
+}
+#ifdef KATAGO_CUDA_BFLOAT16_AVAILABLE
+void customCudaNCHWToNLCAddBiasPos(const float* spatial, const float* global, const float* pos, __nv_bfloat16* out, int n, int c, int xSize, int ySize) {
+  launchNCHWToNLCAddBiasPos<__nv_bfloat16>(spatial, global, pos, out, n, c, xSize, ySize);
+}
+#endif
+
+template<typename T>
 __global__
-void addResidualKernel(float* dst, const float* src, int n) {
+void addResidualKernel(T* dst, const T* src, int n) {
   int idx = blockIdx.x * blockDim.x + threadIdx.x;
-  if(idx < n)
-    dst[idx] += src[idx];
+  if(idx < n) {
+    float value = transformerToFloat(dst[idx]) + transformerToFloat(src[idx]);
+    dst[idx] = transformerFromFloat<T>(value);
+  }
 }
 
-void customCudaAddResidual(float* dst, const float* src, int n) {
+template<typename T>
+static void launchAddResidual(T* dst, const T* src, int n) {
   int blockSize = 256;
   int numBlocks = (n + blockSize - 1) / blockSize;
   addResidualKernel<<<numBlocks, blockSize>>>(dst, src, n);
 }
 
+void customCudaAddResidual(float* dst, const float* src, int n) {
+  launchAddResidual<float>(dst, src, n);
+}
+void customCudaAddResidual(half* dst, const half* src, int n) {
+  launchAddResidual<half>(dst, src, n);
+}
+#ifdef KATAGO_CUDA_BFLOAT16_AVAILABLE
+void customCudaAddResidual(__nv_bfloat16* dst, const __nv_bfloat16* src, int n) {
+  launchAddResidual<__nv_bfloat16>(dst, src, n);
+}
+#endif
+
+template<typename T>
 __global__
-void rmsNormKernel(const float* in, float* out, const float* weight, int cSize, float eps) {
+void rmsNormKernel(const T* in, T* out, const float* weight, int cSize, float eps) {
   extern __shared__ float shared[];
   int row = blockIdx.x;
   int tid = threadIdx.x;
-  const float* rowIn = in + (size_t)row * cSize;
-  float* rowOut = out + (size_t)row * cSize;
+  const T* rowIn = in + (size_t)row * cSize;
+  T* rowOut = out + (size_t)row * cSize;
 
   float sumSq = 0.0f;
   for(int c = tid; c < cSize; c += blockDim.x) {
-    float v = rowIn[c];
+    float v = transformerToFloat(rowIn[c]);
     sumSq += v * v;
   }
   shared[tid] = sumSq;
@@ -1977,19 +2073,34 @@ void rmsNormKernel(const float* in, float* out, const float* weight, int cSize, 
 
   float invRms = rsqrtf(shared[0] / cSize + eps);
   for(int c = tid; c < cSize; c += blockDim.x) {
-    rowOut[c] = rowIn[c] * invRms * weight[c];
+    float value = transformerToFloat(rowIn[c]) * invRms * weight[c];
+    rowOut[c] = transformerFromFloat<T>(value);
   }
 }
 
-void customCudaRMSNorm(const float* in, float* out, const float* weight, int rows, int cSize, float eps) {
+template<typename T>
+static void launchRMSNorm(const T* in, T* out, const float* weight, int rows, int cSize, float eps) {
   int threads = 256;
   while(threads / 2 >= cSize && threads > 32)
     threads /= 2;
   rmsNormKernel<<<rows, threads, threads * sizeof(float)>>>(in, out, weight, cSize, eps);
 }
 
+void customCudaRMSNorm(const float* in, float* out, const float* weight, int rows, int cSize, float eps) {
+  launchRMSNorm<float>(in, out, weight, rows, cSize, eps);
+}
+void customCudaRMSNorm(const half* in, half* out, const float* weight, int rows, int cSize, float eps) {
+  launchRMSNorm<half>(in, out, weight, rows, cSize, eps);
+}
+#ifdef KATAGO_CUDA_BFLOAT16_AVAILABLE
+void customCudaRMSNorm(const __nv_bfloat16* in, __nv_bfloat16* out, const float* weight, int rows, int cSize, float eps) {
+  launchRMSNorm<__nv_bfloat16>(in, out, weight, rows, cSize, eps);
+}
+#endif
+
+template<typename T>
 __global__
-void rotaryKernel(float* q, float* k, const float* cos, const float* sin, int batchSize, int seqLen, int numHeads, int headDim) {
+void rotaryKernel(T* q, T* k, const float* cos, const float* sin, int batchSize, int seqLen, int numHeads, int headDim) {
   int idx = blockIdx.x * blockDim.x + threadIdx.x;
   int halfDim = headDim / 2;
   int total = batchSize * seqLen * numHeads * halfDim;
@@ -2006,154 +2117,151 @@ void rotaryKernel(float* q, float* k, const float* cos, const float* sin, int ba
   float cosHi = cos[l * headDim + d + halfDim];
   float sinHi = sin[l * headDim + d + halfDim];
   size_t base = (((size_t)b * seqLen + l) * numHeads + h) * headDim;
-  float qSelf = q[base + d];
-  float qMate = q[base + d + halfDim];
-  float kSelf = k[base + d];
-  float kMate = k[base + d + halfDim];
-  q[base + d] = qSelf * cosLo - qMate * sinLo;
-  q[base + d + halfDim] = qMate * cosHi + qSelf * sinHi;
-  k[base + d] = kSelf * cosLo - kMate * sinLo;
-  k[base + d + halfDim] = kMate * cosHi + kSelf * sinHi;
+  float qSelf = transformerToFloat(q[base + d]);
+  float qMate = transformerToFloat(q[base + d + halfDim]);
+  float kSelf = transformerToFloat(k[base + d]);
+  float kMate = transformerToFloat(k[base + d + halfDim]);
+  q[base + d] = transformerFromFloat<T>(qSelf * cosLo - qMate * sinLo);
+  q[base + d + halfDim] = transformerFromFloat<T>(qMate * cosHi + qSelf * sinHi);
+  k[base + d] = transformerFromFloat<T>(kSelf * cosLo - kMate * sinLo);
+  k[base + d + halfDim] = transformerFromFloat<T>(kMate * cosHi + kSelf * sinHi);
 }
 
-void customCudaApplyRotaryInplace(float* q, float* k, const float* cos, const float* sin, int batchSize, int seqLen, int numHeads, int headDim) {
+template<typename T>
+static void launchApplyRotaryInplace(T* q, T* k, const float* cos, const float* sin, int batchSize, int seqLen, int numHeads, int headDim) {
   int total = batchSize * seqLen * numHeads * (headDim / 2);
   int blockSize = 256;
   int numBlocks = (total + blockSize - 1) / blockSize;
   rotaryKernel<<<numBlocks, blockSize>>>(q, k, cos, sin, batchSize, seqLen, numHeads, headDim);
 }
 
+void customCudaApplyRotaryInplace(float* q, float* k, const float* cos, const float* sin, int batchSize, int seqLen, int numHeads, int headDim) {
+  launchApplyRotaryInplace<float>(q, k, cos, sin, batchSize, seqLen, numHeads, headDim);
+}
+void customCudaApplyRotaryInplace(half* q, half* k, const float* cos, const float* sin, int batchSize, int seqLen, int numHeads, int headDim) {
+  launchApplyRotaryInplace<half>(q, k, cos, sin, batchSize, seqLen, numHeads, headDim);
+}
+#ifdef KATAGO_CUDA_BFLOAT16_AVAILABLE
+void customCudaApplyRotaryInplace(__nv_bfloat16* q, __nv_bfloat16* k, const float* cos, const float* sin, int batchSize, int seqLen, int numHeads, int headDim) {
+  launchApplyRotaryInplace<__nv_bfloat16>(q, k, cos, sin, batchSize, seqLen, numHeads, headDim);
+}
+#endif
+
+// Transpose [B,S,H,D] -> [B,H,S,D]
+template<typename T>
 __global__
-void attentionLogitsKernel(const float* q, const float* k, float* out, int batchSize, int seqLen, int numHeads, int headDim, float scale) {
+void transposeBSHDtoBHSDKernel(const T* in, T* out, int S, int H, int D) {
   int idx = blockIdx.x * blockDim.x + threadIdx.x;
-  int total = batchSize * numHeads * seqLen * seqLen;
-  if(idx >= total)
-    return;
-  int j = idx % seqLen;
-  int tmp = idx / seqLen;
-  int i = tmp % seqLen;
-  tmp /= seqLen;
-  int h = tmp % numHeads;
-  int b = tmp / numHeads;
-
-  size_t qBase = (((size_t)b * seqLen + i) * numHeads + h) * headDim;
-  size_t kBase = (((size_t)b * seqLen + j) * numHeads + h) * headDim;
-  float sum = 0.0f;
-  for(int d = 0; d < headDim; d++)
-    sum += q[qBase + d] * k[kBase + d];
-  out[idx] = sum * scale;
+  int SHD = S * H * D;
+  int b = blockIdx.y;
+  if(idx >= SHD) return;
+  int d = idx % D;
+  int h = (idx / D) % H;
+  int s = idx / (D * H);
+  out[((size_t)b * H + h) * S * D + (size_t)s * D + d] = in[(size_t)b * SHD + idx];
 }
 
-void customCudaAttentionLogits(const float* q, const float* k, float* out, int batchSize, int seqLen, int numHeads, int headDim, float scale) {
-  int total = batchSize * numHeads * seqLen * seqLen;
-  int blockSize = 128;
+template<typename T>
+static void launchTransposeBSHDtoBHSD(const T* in, T* out, int batchSize, int seqLen, int numHeads, int headDim) {
+  int total = seqLen * numHeads * headDim;
+  int blockSize = 256;
   int numBlocks = (total + blockSize - 1) / blockSize;
-  attentionLogitsKernel<<<numBlocks, blockSize>>>(q, k, out, batchSize, seqLen, numHeads, headDim, scale);
+  dim3 grid(numBlocks, batchSize);
+  transposeBSHDtoBHSDKernel<<<grid, blockSize>>>(in, out, seqLen, numHeads, headDim);
 }
 
+void customCudaTransposeBSHDtoBHSD(const float* in, float* out, int batchSize, int seqLen, int numHeads, int headDim) {
+  launchTransposeBSHDtoBHSD<float>(in, out, batchSize, seqLen, numHeads, headDim);
+}
+void customCudaTransposeBSHDtoBHSD(const half* in, half* out, int batchSize, int seqLen, int numHeads, int headDim) {
+  launchTransposeBSHDtoBHSD<half>(in, out, batchSize, seqLen, numHeads, headDim);
+}
+#ifdef KATAGO_CUDA_BFLOAT16_AVAILABLE
+void customCudaTransposeBSHDtoBHSD(const __nv_bfloat16* in, __nv_bfloat16* out, int batchSize, int seqLen, int numHeads, int headDim) {
+  launchTransposeBSHDtoBHSD<__nv_bfloat16>(in, out, batchSize, seqLen, numHeads, headDim);
+}
+#endif
+
+// Transpose [B,H,S,D] -> [B,S,H,D]
+template<typename T>
 __global__
-void attentionSoftmaxKernel(float* logits, int seqLen) {
-  extern __shared__ float shared[];
-  int row = blockIdx.x;
-  int tid = threadIdx.x;
-  float* rowPtr = logits + (size_t)row * seqLen;
-
-  float maxVal = -1e30f;
-  for(int j = tid; j < seqLen; j += blockDim.x) {
-    if(rowPtr[j] > maxVal)
-      maxVal = rowPtr[j];
-  }
-  shared[tid] = maxVal;
-  __syncthreads();
-  for(int stride = blockDim.x / 2; stride > 0; stride /= 2) {
-    if(tid < stride)
-      shared[tid] = fmaxf(shared[tid], shared[tid + stride]);
-    __syncthreads();
-  }
-  maxVal = shared[0];
-
-  float sum = 0.0f;
-  for(int j = tid; j < seqLen; j += blockDim.x) {
-    float v = expf(rowPtr[j] - maxVal);
-    rowPtr[j] = v;
-    sum += v;
-  }
-  shared[tid] = sum;
-  __syncthreads();
-  for(int stride = blockDim.x / 2; stride > 0; stride /= 2) {
-    if(tid < stride)
-      shared[tid] += shared[tid + stride];
-    __syncthreads();
-  }
-  float invSum = 1.0f / shared[0];
-  for(int j = tid; j < seqLen; j += blockDim.x) {
-    rowPtr[j] *= invSum;
-  }
-}
-
-void customCudaAttentionSoftmaxInplace(float* logits, int batchSize, int seqLen, int numHeads) {
-  int rows = batchSize * numHeads * seqLen;
-  int threads = 512;
-  attentionSoftmaxKernel<<<rows, threads, threads * sizeof(float)>>>(logits, seqLen);
-}
-
-__global__
-void attentionValuesKernel(const float* attn, const float* v, float* out, int batchSize, int seqLen, int numHeads, int headDim) {
+void transposeBHSDtoBSHDKernel(const T* in, T* out, int S, int H, int D) {
   int idx = blockIdx.x * blockDim.x + threadIdx.x;
-  int total = batchSize * seqLen * numHeads * headDim;
-  if(idx >= total)
-    return;
-  int d = idx % headDim;
-  int tmp = idx / headDim;
-  int h = tmp % numHeads;
-  tmp /= numHeads;
-  int i = tmp % seqLen;
-  int b = tmp / seqLen;
-
-  const float* attnRow = attn + (((size_t)b * numHeads + h) * seqLen + i) * seqLen;
-  float sum = 0.0f;
-  for(int j = 0; j < seqLen; j++) {
-    size_t vBase = (((size_t)b * seqLen + j) * numHeads + h) * headDim;
-    sum += attnRow[j] * v[vBase + d];
-  }
-  size_t outBase = (((size_t)b * seqLen + i) * numHeads + h) * headDim;
-  out[outBase + d] = sum;
+  int HSD = H * S * D;
+  int b = blockIdx.y;
+  if(idx >= HSD) return;
+  int d = idx % D;
+  int s = (idx / D) % S;
+  int h = idx / (D * S);
+  out[((size_t)b * S + s) * H * D + (size_t)h * D + d] = in[(size_t)b * HSD + idx];
 }
 
-void customCudaAttentionValues(const float* attn, const float* v, float* out, int batchSize, int seqLen, int numHeads, int headDim) {
-  int total = batchSize * seqLen * numHeads * headDim;
-  int blockSize = 128;
+template<typename T>
+static void launchTransposeBHSDtoBSHD(const T* in, T* out, int batchSize, int seqLen, int numHeads, int headDim) {
+  int total = numHeads * seqLen * headDim;
+  int blockSize = 256;
   int numBlocks = (total + blockSize - 1) / blockSize;
-  attentionValuesKernel<<<numBlocks, blockSize>>>(attn, v, out, batchSize, seqLen, numHeads, headDim);
+  dim3 grid(numBlocks, batchSize);
+  transposeBHSDtoBSHDKernel<<<grid, blockSize>>>(in, out, seqLen, numHeads, headDim);
 }
+
+void customCudaTransposeBHSDtoBSHD(const float* in, float* out, int batchSize, int seqLen, int numHeads, int headDim) {
+  launchTransposeBHSDtoBSHD<float>(in, out, batchSize, seqLen, numHeads, headDim);
+}
+void customCudaTransposeBHSDtoBSHD(const half* in, half* out, int batchSize, int seqLen, int numHeads, int headDim) {
+  launchTransposeBHSDtoBSHD<half>(in, out, batchSize, seqLen, numHeads, headDim);
+}
+#ifdef KATAGO_CUDA_BFLOAT16_AVAILABLE
+void customCudaTransposeBHSDtoBSHD(const __nv_bfloat16* in, __nv_bfloat16* out, int batchSize, int seqLen, int numHeads, int headDim) {
+  launchTransposeBHSDtoBSHD<__nv_bfloat16>(in, out, batchSize, seqLen, numHeads, headDim);
+}
+#endif
 
 __device__ __forceinline__
 float siluf(float x) {
   return x / (1.0f + expf(-x));
 }
 
+template<typename T>
 __global__
-void siluMultiplyKernel(const float* a, const float* b, float* out, int n) {
+void siluMultiplyKernel(const T* a, const T* b, T* out, int n) {
   int idx = blockIdx.x * blockDim.x + threadIdx.x;
-  if(idx < n)
-    out[idx] = siluf(a[idx]) * b[idx];
+  if(idx < n) {
+    float lhs = transformerToFloat(a[idx]);
+    float rhs = transformerToFloat(b[idx]);
+    out[idx] = transformerFromFloat<T>(siluf(lhs) * rhs);
+  }
 }
 
-void customCudaSiluMultiply(const float* a, const float* b, float* out, int n) {
+template<typename T>
+static void launchSiluMultiply(const T* a, const T* b, T* out, int n) {
   int blockSize = 256;
   int numBlocks = (n + blockSize - 1) / blockSize;
   siluMultiplyKernel<<<numBlocks, blockSize>>>(a, b, out, n);
 }
 
+void customCudaSiluMultiply(const float* a, const float* b, float* out, int n) {
+  launchSiluMultiply<float>(a, b, out, n);
+}
+void customCudaSiluMultiply(const half* a, const half* b, half* out, int n) {
+  launchSiluMultiply<half>(a, b, out, n);
+}
+#ifdef KATAGO_CUDA_BFLOAT16_AVAILABLE
+void customCudaSiluMultiply(const __nv_bfloat16* a, const __nv_bfloat16* b, __nv_bfloat16* out, int n) {
+  launchSiluMultiply<__nv_bfloat16>(a, b, out, n);
+}
+#endif
+
+template<typename T>
 __global__
-void meanPoolNlCKernel(const float* in, float* out, int seqLen, int cSize) {
+void meanPoolNlCKernel(const T* in, T* out, int seqLen, int cSize) {
   extern __shared__ float shared[];
   int c = blockIdx.x;
   int b = blockIdx.y;
   int tid = threadIdx.x;
   float sum = 0.0f;
   for(int l = tid; l < seqLen; l += blockDim.x) {
-    sum += in[((size_t)b * seqLen + l) * cSize + c];
+    sum += transformerToFloat(in[((size_t)b * seqLen + l) * cSize + c]);
   }
   shared[tid] = sum;
   __syncthreads();
@@ -2163,11 +2271,24 @@ void meanPoolNlCKernel(const float* in, float* out, int seqLen, int cSize) {
     __syncthreads();
   }
   if(tid == 0)
-    out[b * cSize + c] = shared[0] / seqLen;
+    out[b * cSize + c] = transformerFromFloat<T>(shared[0] / seqLen);
 }
 
-void customCudaMeanPoolNLC(const float* in, float* out, int batchSize, int seqLen, int cSize) {
+template<typename T>
+static void launchMeanPoolNLC(const T* in, T* out, int batchSize, int seqLen, int cSize) {
   dim3 grid(cSize, batchSize, 1);
   int threads = 512;
   meanPoolNlCKernel<<<grid, threads, threads * sizeof(float)>>>(in, out, seqLen, cSize);
 }
+
+void customCudaMeanPoolNLC(const float* in, float* out, int batchSize, int seqLen, int cSize) {
+  launchMeanPoolNLC<float>(in, out, batchSize, seqLen, cSize);
+}
+void customCudaMeanPoolNLC(const half* in, half* out, int batchSize, int seqLen, int cSize) {
+  launchMeanPoolNLC<half>(in, out, batchSize, seqLen, cSize);
+}
+#ifdef KATAGO_CUDA_BFLOAT16_AVAILABLE
+void customCudaMeanPoolNLC(const __nv_bfloat16* in, __nv_bfloat16* out, int batchSize, int seqLen, int cSize) {
+  launchMeanPoolNLC<__nv_bfloat16>(in, out, batchSize, seqLen, cSize);
+}
+#endif

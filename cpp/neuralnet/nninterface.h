@@ -70,6 +70,7 @@ namespace NeuralNet {
   void freeLoadedModel(LoadedModel* loadedModel);
 
   const ModelDesc& getModelDesc(const LoadedModel* loadedModel);
+  bool isTransformerModel(const LoadedModel* loadedModel);
 
   // Context -------------------------------------------------------------------
 
@@ -84,6 +85,7 @@ namespace NeuralNet {
     const std::string& homeDataDirOverride,
     bool openCLReTunePerBoardSize,
     enabled_t useFP16Mode,
+    compute_precision_t precisionMode,
     enabled_t useNHWCMode,
     const LoadedModel* loadedModel
   );

@@ -126,6 +126,10 @@ const ModelDesc& NeuralNet::getModelDesc(const LoadedModel* loadedModel) {
   return loadedModel->modelDesc;
 }
 
+bool NeuralNet::isTransformerModel(const LoadedModel* loadedModel) {
+  return loadedModel->isTransformer;
+}
+
 
 // Helpers --------------------------------------------------------------------------------------------------------------
 
@@ -1726,6 +1730,7 @@ ComputeContext* NeuralNet::createComputeContext(
   const string& homeDataDirOverride,
   bool openCLReTunePerBoardSize,
   enabled_t useFP16Mode,
+  compute_precision_t precisionMode,
   enabled_t useNHWCMode,
   const LoadedModel* loadedModel
 ) {
@@ -1737,6 +1742,12 @@ ComputeContext* NeuralNet::createComputeContext(
   (void)loadedModel;
 
   bool useFP16 = useFP16Mode == enabled_t::True ? true : false;
+  if(precisionMode == compute_precision_t::FP16)
+    useFP16 = true;
+  else if(precisionMode == compute_precision_t::FP32)
+    useFP16 = false;
+  else if(precisionMode == compute_precision_t::BF16)
+    throw StringError("Eigen backend: bf16 precision unsupported");
   bool useNHWC = useNHWCMode == enabled_t::False ? false : true;
 
   if(useFP16)

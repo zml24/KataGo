@@ -22,6 +22,7 @@ ComputeContext* NeuralNet::createComputeContext(
   const string& homeDataDirOverride,
   bool openCLReTunePerBoardSize,
   enabled_t useFP16Mode,
+  compute_precision_t precisionMode,
   enabled_t useNHWCMode,
   const LoadedModel* loadedModel
 ) {
@@ -33,6 +34,7 @@ ComputeContext* NeuralNet::createComputeContext(
   (void)homeDataDirOverride;
   (void)openCLReTunePerBoardSize;
   (void)useFP16Mode;
+  (void)precisionMode;
   (void)useNHWCMode;
   (void)loadedModel;
   throw StringError("Dummy neural net backend: NeuralNet::createComputeContext unimplemented");
@@ -56,6 +58,11 @@ void NeuralNet::freeLoadedModel(LoadedModel* loadedModel) {
 const ModelDesc& NeuralNet::getModelDesc(const LoadedModel* loadedModel) {
   (void)loadedModel;
   throw StringError("Dummy neural net backend: NeuralNet::getModelDesc unimplemented");
+}
+
+bool NeuralNet::isTransformerModel(const LoadedModel* loadedModel) {
+  (void)loadedModel;
+  throw StringError("Dummy neural net backend: NeuralNet::isTransformerModel unimplemented");
 }
 
 ComputeHandle* NeuralNet::createComputeHandle(

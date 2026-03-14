@@ -288,11 +288,12 @@ int MainCmds::runtransformerdump(const vector<string>& args) {
 
   int symmetry = 0;
   string sampleFilter;
-  enabled_t precisionMode = enabled_t::False;
+  compute_precision_t precisionMode = compute_precision_t::FP32;
   string precisionLabel = "fp32";
   size_t idx = 3;
   auto isPrecision = [](const string& arg) {
-    return arg == "fp32" || arg == "fp16" || arg == "bf16" || arg == "auto";
+    string value = Global::toLower(arg);
+    return value == "fp32" || value == "fp16" || value == "bf16";
   };
 
   if(idx < args.size() && !isPrecision(args[idx])) {
@@ -304,22 +305,16 @@ int MainCmds::runtransformerdump(const vector<string>& args) {
     idx += 1;
   }
   if(idx < args.size()) {
-    if(args[idx] == "fp32") {
-      precisionMode = enabled_t::False;
-      precisionLabel = "fp32";
-    }
-    else if(args[idx] == "fp16") {
-      precisionMode = enabled_t::True;
-      precisionLabel = "fp16";
-    }
-    else if(args[idx] == "bf16" || args[idx] == "auto") {
-      precisionMode = enabled_t::Auto;
-      precisionLabel = args[idx];
-    }
-    else {
-      cerr << "Transformer dump precision must be fp32 / fp16 / bf16 / auto" << endl;
+    string value = Global::toLower(args[idx]);
+    if(!compute_precision_t::tryParse(value, precisionMode)) {
+      cerr << "Transformer dump precision must be fp32 / fp16 / bf16" << endl;
       return 1;
     }
+    if(precisionMode == compute_precision_t::Auto) {
+      cerr << "Transformer dump precision must be fp32 / fp16 / bf16" << endl;
+      return 1;
+    }
+    precisionLabel = precisionMode.toString();
     idx += 1;
   }
   if(idx != args.size()) {
@@ -327,7 +322,14 @@ int MainCmds::runtransformerdump(const vector<string>& args) {
     return 1;
   }
 
-  Tests::runTransformerDump(args[1], args[2], symmetry, sampleFilter, precisionMode, precisionLabel);
+  try {
+    Tests::runTransformerDump(args[1], args[2], symmetry, sampleFilter, precisionMode, precisionLabel);
+  }
+  catch(const std::exception& e) {
+    ScoreValue::freeTables();
+    cerr << e.what() << endl;
+    return 1;
+  }
 
   ScoreValue::freeTables();
   return 0;

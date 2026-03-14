@@ -8,6 +8,38 @@
 
 using namespace std;
 
+static bool tryParsePrecisionConfig(
+  ConfigParser& cfg,
+  const vector<string>& keys,
+  compute_precision_t& precisionMode
+) {
+  for(const string& key : keys) {
+    if(!cfg.contains(key))
+      continue;
+    const string value = Global::toLower(cfg.getString(key));
+    if(!compute_precision_t::tryParse(value, precisionMode))
+      throw StringError("Could not parse precision mode for key " + key + ": " + value);
+    return true;
+  }
+  return false;
+}
+
+static bool tryParseModelTypeConfig(
+  ConfigParser& cfg,
+  const vector<string>& keys,
+  nn_model_type_t& modelType
+) {
+  for(const string& key : keys) {
+    if(!cfg.contains(key))
+      continue;
+    const string value = Global::toLower(cfg.getString(key));
+    if(!nn_model_type_t::tryParse(value, modelType))
+      throw StringError("Could not parse model type for key " + key + ": " + value);
+    return true;
+  }
+  return false;
+}
+
 void Setup::initializeSession(ConfigParser& cfg) {
   (void)cfg;
   NeuralNet::globalInitialize();
@@ -237,6 +269,51 @@ vector<NNEvaluator*> Setup::initializeNNEvaluators(
     else if(cfg.contains("useFP16"))
       useFP16Mode = cfg.getEnabled("useFP16");
 
+    nn_model_type_t modelType = nn_model_type_t::CNN;
+    tryParseModelTypeConfig(
+      cfg,
+      {
+        backendPrefix+"ModelType-"+idxStr,
+        backendPrefix+"ModelType"+idxStr,
+        "nnModelType-"+idxStr,
+        "nnModelType"+idxStr,
+        backendPrefix+"ModelType",
+        "nnModelType"
+      },
+      modelType
+    );
+
+    compute_precision_t precisionMode = compute_precision_t::Auto;
+    const bool hasExplicitPrecision = tryParsePrecisionConfig(
+      cfg,
+      {
+        backendPrefix+"Precision-"+idxStr,
+        backendPrefix+"Precision"+idxStr,
+        "nnPrecision-"+idxStr,
+        "nnPrecision"+idxStr,
+        backendPrefix+"Precision",
+        "nnPrecision"
+      },
+      precisionMode
+    );
+    if(modelType == nn_model_type_t::CNN) {
+      if(hasExplicitPrecision && precisionMode != compute_precision_t::Auto)
+        throw StringError("nnModelType=cnn 时不使用 nnPrecision，请继续使用 useFP16=false|true|auto");
+      precisionMode = compute_precision_t::Auto;
+    }
+    else if(modelType == nn_model_type_t::TF) {
+      if(!hasExplicitPrecision)
+        precisionMode = compute_precision_t::FP32;
+      else if(precisionMode == compute_precision_t::Auto)
+        throw StringError("nnModelType=tf 时，nnPrecision 只能是 fp32 / fp16 / bf16，不能是 auto");
+    }
+    if(modelType == nn_model_type_t::TF) {
+      if(backendPrefix != "cuda" && backendPrefix != "metal" && backendPrefix != "eigen")
+        throw StringError("nnModelType=tf 仅支持 cuda / metal / eigen backend，当前 backend 为: " + backendPrefix);
+      if(backendPrefix == "eigen" && precisionMode != compute_precision_t::FP32)
+        throw StringError("Eigen backend 的 nnModelType=tf 仅支持 nnPrecision=fp32");
+    }
+
     enabled_t useNHWCMode = enabled_t::Auto;
     if(cfg.contains(backendPrefix+"UseNHWC"+idxStr))
       useNHWCMode = cfg.getEnabled(backendPrefix+"UseNHWC"+idxStr);
@@ -253,7 +330,9 @@ vector<NNEvaluator*> Setup::initializeNNEvaluators(
 
     logger.write(
       "After dedups: nnModelFile" + idxStr + " = " + nnModelFile
+      + " modelType " + modelType.toString()
       + " useFP16 " + useFP16Mode.toString()
+      + " precision " + precisionMode.toString()
       + " useNHWC " + useNHWCMode.toString()
     );
 
@@ -299,8 +378,10 @@ vector<NNEvaluator*> Setup::initializeNNEvaluators(
 #endif
 
     int defaultSymmetry = forcedSymmetry >= 0 ? forcedSymmetry : 0;
-    if(disableFP16)
+    if(disableFP16) {
       useFP16Mode = enabled_t::False;
+      precisionMode = compute_precision_t::FP32;
+    }
 
     NNEvaluator* nnEval = new NNEvaluator(
       nnModelName,
@@ -318,7 +399,9 @@ vector<NNEvaluator*> Setup::initializeNNEvaluators(
       openCLTunerFile,
       homeDataDirOverride,
       openCLReTunePerBoardSize,
+      modelType,
       useFP16Mode,
+      precisionMode,
       useNHWCMode,
       numNNServerThreadsPerModel,
       gpuIdxByServerThread,

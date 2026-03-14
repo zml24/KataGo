@@ -26,6 +26,175 @@ static void signalHandler(int signal)
   }
 }
 
+static string getBackendPrefixForMatch() {
+#if defined(USE_CUDA_BACKEND)
+  return "cuda";
+#elif defined(USE_TENSORRT_BACKEND)
+  return "trt";
+#elif defined(USE_METAL_BACKEND)
+  return "metal";
+#elif defined(USE_OPENCL_BACKEND)
+  return "opencl";
+#elif defined(USE_EIGEN_BACKEND)
+  return "eigen";
+#else
+  return "dummybackend";
+#endif
+}
+
+static enabled_t getEnabledWithFallback(
+  ConfigParser& cfg,
+  const vector<string>& keys,
+  enabled_t defaultValue
+) {
+  for(const string& key: keys) {
+    if(cfg.contains(key))
+      return cfg.getEnabled(key);
+  }
+  return defaultValue;
+}
+
+static bool getBoolWithFallback(
+  ConfigParser& cfg,
+  const vector<string>& keys,
+  bool defaultValue
+) {
+  for(const string& key: keys) {
+    if(cfg.contains(key))
+      return cfg.getBool(key);
+  }
+  return defaultValue;
+}
+
+static bool getPrecisionWithFallback(
+  ConfigParser& cfg,
+  const vector<string>& keys,
+  compute_precision_t& precisionMode
+) {
+  for(const string& key: keys) {
+    if(cfg.contains(key)) {
+      const string value = Global::toLower(cfg.getString(key));
+      if(!compute_precision_t::tryParse(value, precisionMode))
+        throw StringError("Could not parse precision in config key " + key + ": " + value);
+      return true;
+    }
+  }
+  return false;
+}
+
+static bool getModelTypeWithFallback(
+  ConfigParser& cfg,
+  const vector<string>& keys,
+  nn_model_type_t& modelType
+) {
+  for(const string& key: keys) {
+    if(cfg.contains(key)) {
+      const string value = Global::toLower(cfg.getString(key));
+      if(!nn_model_type_t::tryParse(value, modelType))
+        throw StringError("Could not parse model type in config key " + key + ": " + value);
+      return true;
+    }
+  }
+  return false;
+}
+
+struct MatchNNConfig {
+  string modelFile;
+  nn_model_type_t modelType;
+  bool inputsUseNHWC;
+  enabled_t useFP16Mode;
+  compute_precision_t precisionMode;
+  enabled_t useNHWCMode;
+  string dedupKey;
+};
+
+static MatchNNConfig getMatchNNConfigForBot(
+  ConfigParser& cfg,
+  const string& backendPrefix,
+  int botIdx,
+  const string& modelFile
+) {
+  const string idxStr = Global::intToString(botIdx);
+
+  MatchNNConfig config;
+  config.modelFile = modelFile;
+  config.modelType = nn_model_type_t::CNN;
+  getModelTypeWithFallback(
+    cfg,
+    {
+      backendPrefix + "ModelType-" + idxStr,
+      backendPrefix + "ModelType" + idxStr,
+      "nnModelType-" + idxStr,
+      "nnModelType" + idxStr,
+      backendPrefix + "ModelType",
+      "nnModelType"
+    },
+    config.modelType
+  );
+  config.inputsUseNHWC = getBoolWithFallback(
+    cfg,
+    {
+      backendPrefix + "InputsUseNHWC" + idxStr,
+      "inputsUseNHWC" + idxStr,
+      backendPrefix + "InputsUseNHWC",
+      "inputsUseNHWC"
+    },
+    backendPrefix == "opencl" || backendPrefix == "trt" || backendPrefix == "metal" ? false : true
+  );
+  config.useFP16Mode = getEnabledWithFallback(
+    cfg,
+    {
+      backendPrefix + "UseFP16-" + idxStr,
+      "useFP16-" + idxStr,
+      backendPrefix + "UseFP16",
+      "useFP16"
+    },
+    enabled_t::Auto
+  );
+  config.precisionMode = compute_precision_t::Auto;
+  const bool hasExplicitPrecision = getPrecisionWithFallback(
+    cfg,
+    {
+      backendPrefix + "Precision-" + idxStr,
+      backendPrefix + "Precision" + idxStr,
+      "nnPrecision-" + idxStr,
+      "nnPrecision" + idxStr,
+      backendPrefix + "Precision",
+      "nnPrecision"
+    },
+    config.precisionMode
+  );
+  if(config.modelType == nn_model_type_t::CNN) {
+    if(hasExplicitPrecision && config.precisionMode != compute_precision_t::Auto)
+      throw StringError("nnModelType=cnn 时不使用 nnPrecision，请继续使用 useFP16=false|true|auto");
+    config.precisionMode = compute_precision_t::Auto;
+  }
+  else if(config.modelType == nn_model_type_t::TF) {
+    if(!hasExplicitPrecision)
+      config.precisionMode = compute_precision_t::FP32;
+    else if(config.precisionMode == compute_precision_t::Auto)
+      throw StringError("nnModelType=tf 时，nnPrecision 只能是 fp32 / fp16 / bf16，不能是 auto");
+  }
+  config.useNHWCMode = getEnabledWithFallback(
+    cfg,
+    {
+      backendPrefix + "UseNHWC" + idxStr,
+      "useNHWC" + idxStr,
+      backendPrefix + "UseNHWC",
+      "useNHWC"
+    },
+    enabled_t::Auto
+  );
+  config.dedupKey =
+    modelFile + "\n" +
+    config.modelType.toString() + "\n" +
+    (config.inputsUseNHWC ? "1" : "0") + "\n" +
+    (config.modelType == nn_model_type_t::TF ? "-" : config.useFP16Mode.toString()) + "\n" +
+    (config.modelType == nn_model_type_t::CNN ? "-" : config.precisionMode.toString()) + "\n" +
+    config.useNHWCMode.toString();
+  return config;
+}
+
 int MainCmds::match(const vector<string>& args) {
   Board::initHash();
   ScoreValue::initTables();
@@ -149,16 +318,18 @@ int MainCmds::match(const vector<string>& args) {
   }
 
   //Dedup and load each necessary model exactly once
+  const string backendPrefix = getBackendPrefixForMatch();
+  vector<MatchNNConfig> nnConfigs;
   vector<string> nnModelFiles;
   vector<int> whichNNModel(numBots);
   for(int i = 0; i<numBots; i++) {
     if(!botIsUsed[i])
       continue;
 
-    const string& desiredFile = nnModelFilesByBot[i];
+    MatchNNConfig desiredConfig = getMatchNNConfigForBot(cfg, backendPrefix, i, nnModelFilesByBot[i]);
     int alreadyFoundIdx = -1;
-    for(int j = 0; j<nnModelFiles.size(); j++) {
-      if(nnModelFiles[j] == desiredFile) {
+    for(int j = 0; j<(int)nnConfigs.size(); j++) {
+      if(nnConfigs[j].dedupKey == desiredConfig.dedupKey) {
         alreadyFoundIdx = j;
         break;
       }
@@ -167,8 +338,18 @@ int MainCmds::match(const vector<string>& args) {
       whichNNModel[i] = alreadyFoundIdx;
     else {
       whichNNModel[i] = (int)nnModelFiles.size();
-      nnModelFiles.push_back(desiredFile);
+      nnModelFiles.push_back(desiredConfig.modelFile);
+      nnConfigs.push_back(desiredConfig);
     }
+  }
+
+  for(int i = 0; i<(int)nnConfigs.size(); i++) {
+    const string idxStr = Global::intToString(i);
+    cfg.overrideKey(backendPrefix + "ModelType-" + idxStr, nnConfigs[i].modelType.toString());
+    cfg.overrideKey(backendPrefix + "InputsUseNHWC" + idxStr, Global::boolToString(nnConfigs[i].inputsUseNHWC));
+    cfg.overrideKey(backendPrefix + "UseFP16-" + idxStr, nnConfigs[i].useFP16Mode.toString());
+    cfg.overrideKey(backendPrefix + "Precision-" + idxStr, nnConfigs[i].precisionMode.toString());
+    cfg.overrideKey(backendPrefix + "UseNHWC" + idxStr, nnConfigs[i].useNHWCMode.toString());
   }
 
   //Load match runner settings

@@ -96,7 +96,7 @@ void Tests::runTransformerDump(
   const string& outputFile,
   int symmetry,
   const string& sampleFilter,
-  enabled_t precisionMode,
+  compute_precision_t precisionMode,
   const string& precisionLabel
 ) {
   TransformerModelDesc transformerDesc;
@@ -125,6 +125,12 @@ void Tests::runTransformerDump(
   }
   const int sampleCount = (int)sampleSpecs.size();
 
+  enabled_t compatUseFP16Mode = enabled_t::False;
+  if(precisionMode == compute_precision_t::FP16)
+    compatUseFP16Mode = enabled_t::True;
+  else if(precisionMode == compute_precision_t::BF16)
+    compatUseFP16Mode = enabled_t::Auto;
+
   ComputeContext* context = NeuralNet::createComputeContext(
     {},
     nullptr,
@@ -133,6 +139,7 @@ void Tests::runTransformerDump(
     "",
     "",
     false,
+    compatUseFP16Mode,
     precisionMode,
     enabled_t::True,
     loadedModel

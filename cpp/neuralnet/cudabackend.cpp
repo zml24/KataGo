@@ -17,11 +17,19 @@
 
 #include "../external/half-2.2.0/include/half.hpp"
 
+#include <unordered_map>
+
 //------------------------
 #include "../core/using.h"
 //------------------------
 
 using half_t = half_float::half;
+#ifdef KATAGO_CUDA_BFLOAT16_AVAILABLE
+using bfloat16_t = __nv_bfloat16;
+#endif
+#ifdef KATAGO_CUDNN_SDPA_AVAILABLE
+namespace fe = cudnn_frontend;
+#endif
 
 //Define this to print out some of the intermediate values of the neural net
 //#define DEBUG_INTERMEDIATE_VALUES
@@ -36,6 +44,9 @@ void NeuralNet::globalCleanup() {
 
 struct CudaHandles {
   cublasHandle_t cublas;
+#ifdef KATAGO_CUBLASLT_AVAILABLE
+  cublasLtHandle_t cublasLt;
+#endif
   cudnnHandle_t cudnn;
   const int majorComputeCapability;
   const int minorComputeCapability;
@@ -45,11 +56,17 @@ struct CudaHandles {
       minorComputeCapability(minor)
   {
     CUBLAS_ERR("CudaHandles",cublasCreate(&cublas));
+#ifdef KATAGO_CUBLASLT_AVAILABLE
+    CUBLAS_ERR("CudaHandles",cublasLtCreate(&cublasLt));
+#endif
     CUDNN_ERR("CudaHandles",cudnnCreate(&cudnn));
   }
 
   ~CudaHandles() {
     cublasDestroy(cublas);
+#ifdef KATAGO_CUBLASLT_AVAILABLE
+    cublasLtDestroy(cublasLt);
+#endif
     cudnnDestroy(cudnn);
   }
 
@@ -2121,46 +2138,409 @@ struct Model {
 
 //------------------------------------------------------------------------------
 
-static MatMulLayerDesc makeTransformerMatMulDesc(
-  const string& name,
-  int inChannels,
-  int outChannels,
-  const vector<float>& weights
-) {
-  MatMulLayerDesc desc;
-  desc.name = name;
-  desc.inChannels = inChannels;
-  desc.outChannels = outChannels;
-  desc.weights = weights;
-  return desc;
+enum class TransformerPrecision {
+  Float32,
+  Float16,
+  BFloat16,
+};
+
+static const char* transformerPrecisionName(TransformerPrecision precision) {
+  switch(precision) {
+  case TransformerPrecision::Float32:
+    return "fp32";
+  case TransformerPrecision::Float16:
+    return "fp16";
+  case TransformerPrecision::BFloat16:
+    return "bf16";
+  default:
+    break;
+  }
+  ASSERT_UNREACHABLE;
+  return "unknown";
 }
 
-static ConvLayerDesc makeTransformerConvDesc(
-  const string& name,
-  int inChannels,
-  int outChannels,
-  int kernelSize,
-  const vector<float>& weights
-) {
-  ConvLayerDesc desc;
-  desc.name = name;
-  desc.convYSize = kernelSize;
-  desc.convXSize = kernelSize;
-  desc.inChannels = inChannels;
-  desc.outChannels = outChannels;
-  desc.dilationY = 1;
-  desc.dilationX = 1;
-  desc.weights = weights;
-  return desc;
+static size_t transformerPrecisionElemSize(TransformerPrecision precision) {
+  switch(precision) {
+  case TransformerPrecision::Float32:
+    return sizeof(float);
+  case TransformerPrecision::Float16:
+    return sizeof(half);
+#ifdef KATAGO_CUDA_BFLOAT16_AVAILABLE
+  case TransformerPrecision::BFloat16:
+    return sizeof(bfloat16_t);
+#endif
+  default:
+    break;
+  }
+  ASSERT_UNREACHABLE;
+  return sizeof(float);
 }
+
+static bool transformerPrecisionUsesLowpStorage(TransformerPrecision precision) {
+  return precision != TransformerPrecision::Float32;
+}
+
+static cudaDataType_t transformerPrecisionToCudaType(TransformerPrecision precision) {
+  switch(precision) {
+  case TransformerPrecision::Float32:
+    return CUDA_R_32F;
+  case TransformerPrecision::Float16:
+    return CUDA_R_16F;
+#ifdef KATAGO_CUDA_BFLOAT16_AVAILABLE
+  case TransformerPrecision::BFloat16:
+    return CUDA_R_16BF;
+#endif
+  default:
+    break;
+  }
+  ASSERT_UNREACHABLE;
+  return CUDA_R_32F;
+}
+
+static cudnnDataType_t transformerPrecisionToCudnnType(TransformerPrecision precision) {
+  switch(precision) {
+  case TransformerPrecision::Float32:
+    return CUDNN_DATA_FLOAT;
+  case TransformerPrecision::Float16:
+    return CUDNN_DATA_HALF;
+#ifdef KATAGO_CUDA_TRANSFORMER_BFLOAT16_AVAILABLE
+  case TransformerPrecision::BFloat16:
+    return CUDNN_DATA_BFLOAT16;
+#endif
+  default:
+    break;
+  }
+  ASSERT_UNREACHABLE;
+  return CUDNN_DATA_FLOAT;
+}
+
+enum class TransformerAttentionPath {
+  Legacy,
+  CudnnSdpa,
+};
+
+static const char* transformerAttentionPathName(TransformerAttentionPath path) {
+  switch(path) {
+  case TransformerAttentionPath::Legacy:
+    return "legacy";
+  case TransformerAttentionPath::CudnnSdpa:
+    return "cudnn_sdpa";
+  default:
+    break;
+  }
+  ASSERT_UNREACHABLE;
+  return "legacy";
+}
+
+#ifdef KATAGO_CUDNN_SDPA_AVAILABLE
+static fe::DataType_t transformerPrecisionToFrontendType(TransformerPrecision precision) {
+  switch(precision) {
+  case TransformerPrecision::Float16:
+    return fe::DataType_t::HALF;
+  case TransformerPrecision::BFloat16:
+    return fe::DataType_t::BFLOAT16;
+  default:
+    break;
+  }
+  ASSERT_UNREACHABLE;
+  return fe::DataType_t::HALF;
+}
+#endif
+
+static bool cudaDeviceSupportsTransformerFloat16(int majorComputeCapability, int minorComputeCapability) {
+  return majorComputeCapability > 5 || (majorComputeCapability == 5 && minorComputeCapability >= 3);
+}
+
+static bool cudaDeviceSupportsTransformerBFloat16(int majorComputeCapability, int minorComputeCapability) {
+  (void)minorComputeCapability;
+#ifdef KATAGO_CUDA_TRANSFORMER_BFLOAT16_AVAILABLE
+  return majorComputeCapability >= 8;
+#else
+  return false;
+#endif
+}
+
+static bool cudaDeviceSupportsOfficialTransformerAttention(
+  const CudaHandles* cudaHandles,
+  TransformerPrecision precision,
+  int headDim
+) {
+#ifdef KATAGO_CUDNN_SDPA_AVAILABLE
+  if(!transformerPrecisionUsesLowpStorage(precision))
+    return false;
+  if(cudaHandles->majorComputeCapability < 8)
+    return false;
+  if(headDim <= 0 || headDim > 256 || headDim % 8 != 0)
+    return false;
+  if(cudnnGetVersion() < 8903)
+    return false;
+  return true;
+#else
+  (void)cudaHandles;
+  (void)precision;
+  (void)headDim;
+  return false;
+#endif
+}
+
+static TransformerPrecision chooseTransformerPrecision(
+  compute_precision_t requestedMode,
+  int majorComputeCapability,
+  int minorComputeCapability
+) {
+  if(requestedMode == compute_precision_t::FP32) {
+    return TransformerPrecision::Float32;
+  }
+  if(requestedMode == compute_precision_t::FP16) {
+    if(!cudaDeviceSupportsTransformerFloat16(majorComputeCapability, minorComputeCapability))
+      throw StringError("Transformer CUDA backend fp16 需要 CUDA compute capability >= 5.3");
+    return TransformerPrecision::Float16;
+  }
+  if(requestedMode == compute_precision_t::BF16) {
+    if(!cudaDeviceSupportsTransformerBFloat16(majorComputeCapability, minorComputeCapability))
+      throw StringError("Transformer CUDA backend bf16 需要 CUDA compute capability >= 8.0");
+    return TransformerPrecision::BFloat16;
+  }
+  if(requestedMode == compute_precision_t::Auto) {
+    if(cudaDeviceSupportsTransformerBFloat16(majorComputeCapability, minorComputeCapability))
+      return TransformerPrecision::BFloat16;
+    if(cudaDeviceSupportsTransformerFloat16(majorComputeCapability, minorComputeCapability))
+      return TransformerPrecision::Float16;
+    return TransformerPrecision::Float32;
+  }
+  ASSERT_UNREACHABLE;
+  return TransformerPrecision::Float32;
+}
+
+static void transformerCopyFloatToPrecision(
+  const float* src,
+  void* dst,
+  int numElts,
+  TransformerPrecision precision
+) {
+  switch(precision) {
+  case TransformerPrecision::Float32:
+    CUDA_ERR("transformerCopyFloatToPrecision", cudaMemcpy(dst, src, (size_t)numElts * sizeof(float), cudaMemcpyDeviceToDevice));
+    return;
+  case TransformerPrecision::Float16:
+    customCudaCopyToHalf(src, reinterpret_cast<half*>(dst), numElts);
+    return;
+#ifdef KATAGO_CUDA_BFLOAT16_AVAILABLE
+  case TransformerPrecision::BFloat16:
+    customCudaCopyToBFloat16(src, reinterpret_cast<bfloat16_t*>(dst), numElts);
+    return;
+#endif
+  default:
+    break;
+  }
+  ASSERT_UNREACHABLE;
+}
+
+static void transformerCopyPrecisionToFloat(
+  const void* src,
+  float* dst,
+  int numElts,
+  TransformerPrecision precision
+) {
+  switch(precision) {
+  case TransformerPrecision::Float32:
+    CUDA_ERR("transformerCopyPrecisionToFloat", cudaMemcpy(dst, src, (size_t)numElts * sizeof(float), cudaMemcpyDeviceToDevice));
+    return;
+  case TransformerPrecision::Float16:
+    customCudaCopyFromHalf(reinterpret_cast<const half*>(src), dst, numElts);
+    return;
+#ifdef KATAGO_CUDA_BFLOAT16_AVAILABLE
+  case TransformerPrecision::BFloat16:
+    customCudaCopyFromBFloat16(reinterpret_cast<const bfloat16_t*>(src), dst, numElts);
+    return;
+#endif
+  default:
+    break;
+  }
+  ASSERT_UNREACHABLE;
+}
+
+static void transformerMallocAndCopyWeights(
+  const string& name,
+  const vector<float>& weights,
+  void*& deviceBuf,
+  TransformerPrecision precision
+) {
+  if(precision == TransformerPrecision::Float32) {
+    CudaUtils::mallocAndCopyToDevice(name, weights, deviceBuf, false);
+    return;
+  }
+  if(precision == TransformerPrecision::Float16) {
+    CudaUtils::mallocAndCopyToDevice(name, weights, deviceBuf, true);
+    return;
+  }
+#ifdef KATAGO_CUDA_BFLOAT16_AVAILABLE
+  vector<bfloat16_t> weightsBFloat(weights.size());
+  for(size_t i = 0; i < weights.size(); i++)
+    weightsBFloat[i] = __float2bfloat16(weights[i]);
+  CUDA_ERR(name.c_str(), cudaMalloc(&deviceBuf, weightsBFloat.size() * sizeof(bfloat16_t)));
+  CUDA_ERR(name.c_str(), cudaMemcpy(deviceBuf, weightsBFloat.data(), weightsBFloat.size() * sizeof(bfloat16_t), cudaMemcpyHostToDevice));
+  return;
+#else
+  (void)name;
+  (void)weights;
+  (void)deviceBuf;
+  throw StringError("当前 CUDA 编译环境不支持 Transformer bf16 权重");
+#endif
+}
+
+static vector<float> transformerConcatLinearWeightsByOutput(
+  const vector<const vector<float>*>& weightSets,
+  int inChannels,
+  const vector<int>& outChannelsPerSet
+) {
+  ASSERT(weightSets.size() == outChannelsPerSet.size());
+  int totalOutChannels = 0;
+  for(size_t i = 0; i < weightSets.size(); i++) {
+    ASSERT(weightSets[i] != nullptr);
+    ASSERT((int)weightSets[i]->size() == inChannels * outChannelsPerSet[i]);
+    totalOutChannels += outChannelsPerSet[i];
+  }
+
+  vector<float> combined((size_t)inChannels * totalOutChannels);
+  for(int in = 0; in < inChannels; in++) {
+    int outOffset = 0;
+    for(size_t i = 0; i < weightSets.size(); i++) {
+      int outChannels = outChannelsPerSet[i];
+      const float* src = weightSets[i]->data() + (size_t)in * outChannels;
+      float* dst = combined.data() + (size_t)in * totalOutChannels + outOffset;
+      std::copy(src, src + outChannels, dst);
+      outOffset += outChannels;
+    }
+  }
+  return combined;
+}
+
+static void transformerSplitCombinedLinearOutput(
+  const string& name,
+  const void* srcBuf,
+  int rows,
+  int channelsPerSplit,
+  int numSplits,
+  TransformerPrecision precision,
+  void* const* dstBufs
+) {
+  size_t elemSize = transformerPrecisionElemSize(precision);
+  size_t splitBytes = (size_t)channelsPerSplit * elemSize;
+  size_t srcPitch = splitBytes * numSplits;
+  size_t dstPitch = splitBytes;
+  const char* src = reinterpret_cast<const char*>(srcBuf);
+  for(int i = 0; i < numSplits; i++) {
+    CUDA_ERR(name.c_str(), cudaMemcpy2DAsync(
+      dstBufs[i],
+      dstPitch,
+      src + (size_t)i * splitBytes,
+      srcPitch,
+      splitBytes,
+      rows,
+      cudaMemcpyDeviceToDevice,
+      0
+    ));
+  }
+}
+
+#ifdef KATAGO_CUBLASLT_AVAILABLE
+static constexpr size_t TRANSFORMER_CUBLASLT_WORKSPACE_BYTES = 1 << 22;
+#endif
+
+#ifdef KATAGO_CUDNN_SDPA_AVAILABLE
+struct TransformerSdpaPlan {
+  std::shared_ptr<fe::graph::Graph> graph;
+  int64_t workspaceBytes;
+
+  TransformerSdpaPlan()
+    : graph(), workspaceBytes(0)
+  {}
+};
+
+static TransformerSdpaPlan buildTransformerSdpaPlan(
+  CudaHandles* cudaHandles,
+  TransformerPrecision precision,
+  int batchSize,
+  int seqLen,
+  int numHeads,
+  int headDim
+) {
+  const int64_t b = batchSize;
+  const int64_t h = numHeads;
+  const int64_t s = seqLen;
+  const int64_t d = headDim;
+  const float scale = 1.0f / sqrtf((float)headDim);
+  fe::DataType_t ioType = transformerPrecisionToFrontendType(precision);
+
+  auto graph = std::make_shared<fe::graph::Graph>();
+  graph->set_io_data_type(ioType).set_intermediate_data_type(fe::DataType_t::FLOAT).set_compute_data_type(fe::DataType_t::FLOAT);
+
+  auto tensorDims = std::vector<int64_t>{b, h, s, d};
+  auto tensorStrides = std::vector<int64_t>{h * s * d, s * d, d, 1};
+
+  auto q = graph->tensor(
+    fe::graph::Tensor_attributes()
+      .set_name("Q")
+      .set_dim(tensorDims)
+      .set_stride(tensorStrides)
+      .set_uid(1)
+  );
+  auto k = graph->tensor(
+    fe::graph::Tensor_attributes()
+      .set_name("K")
+      .set_dim(tensorDims)
+      .set_stride(tensorStrides)
+      .set_uid(2)
+  );
+  auto v = graph->tensor(
+    fe::graph::Tensor_attributes()
+      .set_name("V")
+      .set_dim(tensorDims)
+      .set_stride(tensorStrides)
+      .set_uid(3)
+  );
+
+  auto o = graph->sdpa(
+    q,
+    k,
+    v,
+    fe::graph::SDPA_attributes()
+      .set_name("TransformerSDPA")
+      .set_generate_stats(false)
+      .set_attn_scale(scale)
+  );
+
+  o->set_output(true)
+    .set_name("O")
+    .set_uid(4)
+    .set_dim(tensorDims)
+    .set_stride(tensorStrides);
+
+  auto status = graph->build(cudaHandles->cudnn, {fe::HeurMode_t::A});
+  if(!status.is_good())
+    throw StringError("构建 cuDNN frontend SDPA plan 失败");
+
+  int64_t workspaceBytes = 0;
+  auto workspaceStatus = graph->get_workspace_size(workspaceBytes);
+  if(!workspaceStatus.is_good())
+    throw StringError("获取 cuDNN frontend SDPA workspace 失败");
+
+  TransformerSdpaPlan plan;
+  plan.graph = graph;
+  plan.workspaceBytes = workspaceBytes;
+  return plan;
+}
+#endif
 
 struct TransformerRMSNorm {
   const string name;
   const int channels;
+  const TransformerPrecision precision;
   float* weightBuf;
 
-  TransformerRMSNorm(const string& name_, const vector<float>& weights)
-    : name(name_), channels((int)weights.size()), weightBuf(nullptr)
+  TransformerRMSNorm(const string& name_, const vector<float>& weights, TransformerPrecision precision_)
+    : name(name_), channels((int)weights.size()), precision(precision_), weightBuf(nullptr)
   {
     void* buf = nullptr;
     CudaUtils::mallocAndCopyToDevice(name, weights, buf, false);
@@ -2175,39 +2555,604 @@ struct TransformerRMSNorm {
   TransformerRMSNorm(const TransformerRMSNorm&) = delete;
   TransformerRMSNorm& operator=(const TransformerRMSNorm&) = delete;
 
-  void apply(int rows, const float* inputBuf, float* outputBuf) const {
-    customCudaRMSNorm(inputBuf, outputBuf, weightBuf, rows, channels, 1e-6f);
+  void apply(int rows, const void* inputBuf, void* outputBuf) const {
+    if(precision == TransformerPrecision::Float32)
+      customCudaRMSNorm(reinterpret_cast<const float*>(inputBuf), reinterpret_cast<float*>(outputBuf), weightBuf, rows, channels, 1e-6f);
+    else if(precision == TransformerPrecision::Float16)
+      customCudaRMSNorm(reinterpret_cast<const half*>(inputBuf), reinterpret_cast<half*>(outputBuf), weightBuf, rows, channels, 1e-6f);
+#ifdef KATAGO_CUDA_BFLOAT16_AVAILABLE
+    else if(precision == TransformerPrecision::BFloat16)
+      customCudaRMSNorm(reinterpret_cast<const bfloat16_t*>(inputBuf), reinterpret_cast<bfloat16_t*>(outputBuf), weightBuf, rows, channels, 1e-6f);
+#endif
+    else
+      ASSERT_UNREACHABLE;
     CUDA_ERR(name.c_str(), cudaPeekAtLastError());
   }
 };
 
-struct TransformerLinear {
-  MatMulLayerDesc desc;
-  MatMulLayer layer;
+struct TransformerStemConv {
+  const string name;
+  const int inChannels;
+  const int outChannels;
+  const int kernelSize;
+  const int nnXLen;
+  const int nnYLen;
+  const bool inputUsingNHWC;
+  const TransformerPrecision precision;
 
-  TransformerLinear(
+  ByBatchSize<cudnnTensorDescriptor_t>* inputDescriptors;
+  ByBatchSize<cudnnTensorDescriptor_t>* outputDescriptors;
+#if CUDNN_MAJOR >= 8
+  ByBatchSize<cudnnConvolutionFwdAlgoPerf_t>* convolutionAlgorithms;
+#else
+  ByBatchSize<cudnnConvolutionFwdAlgo_t>* convolutionAlgorithms;
+#endif
+  cudnnFilterDescriptor_t filterDescriptor;
+  cudnnConvolutionDescriptor_t convolutionDescriptor;
+  void* filterBuf;
+
+  TransformerStemConv() = delete;
+  TransformerStemConv(const TransformerStemConv&) = delete;
+  TransformerStemConv& operator=(const TransformerStemConv&) = delete;
+
+  TransformerStemConv(
     CudaHandles* cudaHandles,
-    const string& name,
-    int inChannels,
-    int outChannels,
-    const vector<float>& weights
+    const string& name_,
+    int maxBatchSize,
+    int nnXLen_,
+    int nnYLen_,
+    bool inputUsingNHWC_,
+    int inChannels_,
+    int outChannels_,
+    int kernelSize_,
+    const vector<float>& weights,
+    TransformerPrecision precision_
   ) :
-    desc(makeTransformerMatMulDesc(name, inChannels, outChannels, weights)),
-    layer(cudaHandles, &desc, false)
-  {}
+    name(name_),
+    inChannels(inChannels_),
+    outChannels(outChannels_),
+    kernelSize(kernelSize_),
+    nnXLen(nnXLen_),
+    nnYLen(nnYLen_),
+    inputUsingNHWC(inputUsingNHWC_),
+    precision(precision_),
+    inputDescriptors(new ByBatchSize<cudnnTensorDescriptor_t>(maxBatchSize)),
+    outputDescriptors(new ByBatchSize<cudnnTensorDescriptor_t>(maxBatchSize)),
+#if CUDNN_MAJOR >= 8
+    convolutionAlgorithms(new ByBatchSize<cudnnConvolutionFwdAlgoPerf_t>(maxBatchSize)),
+#else
+    convolutionAlgorithms(new ByBatchSize<cudnnConvolutionFwdAlgo_t>(maxBatchSize)),
+#endif
+    filterBuf(nullptr)
+  {
+    cudnnDataType_t tensorType = transformerPrecisionToCudnnType(precision);
+    bool tensorCoresSupported = cudaHandles->majorComputeCapability >= 7;
 
-  TransformerLinear() = delete;
-  TransformerLinear(const TransformerLinear&) = delete;
-  TransformerLinear& operator=(const TransformerLinear&) = delete;
+    inputDescriptors->destroyFunc = cudnnDestroyTensorDescriptor;
+    outputDescriptors->destroyFunc = cudnnDestroyTensorDescriptor;
+    for(int batchSize = 1; batchSize <= maxBatchSize; batchSize++) {
+      cudnnTensorDescriptor_t& inputDesc = (*inputDescriptors)[batchSize];
+      cudnnTensorDescriptor_t& outputDesc = (*outputDescriptors)[batchSize];
+      CUDNN_ERR(name.c_str(), cudnnCreateTensorDescriptor(&inputDesc));
+      CUDNN_ERR(name.c_str(), cudnnSetTensor4dDescriptor(
+        inputDesc,
+        inputUsingNHWC ? CUDNN_TENSOR_NHWC : CUDNN_TENSOR_NCHW,
+        tensorType,
+        batchSize,
+        inChannels,
+        nnYLen,
+        nnXLen
+      ));
+      CUDNN_ERR(name.c_str(), cudnnCreateTensorDescriptor(&outputDesc));
+      CUDNN_ERR(name.c_str(), cudnnSetTensor4dDescriptor(
+        outputDesc,
+        CUDNN_TENSOR_NCHW,
+        tensorType,
+        batchSize,
+        outChannels,
+        nnYLen,
+        nnXLen
+      ));
+    }
+
+    CUDNN_ERR(name.c_str(), cudnnCreateFilterDescriptor(&filterDescriptor));
+    CUDNN_ERR(name.c_str(), cudnnSetFilter4dDescriptor(
+      filterDescriptor,
+      tensorType,
+      CUDNN_TENSOR_NCHW,
+      outChannels,
+      inChannels,
+      kernelSize,
+      kernelSize
+    ));
+
+    CUDNN_ERR(name.c_str(), cudnnCreateConvolutionDescriptor(&convolutionDescriptor));
+    CUDNN_ERR(name.c_str(), cudnnSetConvolution2dDescriptor(
+      convolutionDescriptor,
+      kernelSize / 2,
+      kernelSize / 2,
+      1,
+      1,
+      1,
+      1,
+      CUDNN_CROSS_CORRELATION,
+      CUDNN_DATA_FLOAT
+    ));
+    if(transformerPrecisionUsesLowpStorage(precision) && tensorCoresSupported)
+      CUDNN_ERR(name.c_str(), cudnnSetConvolutionMathType(convolutionDescriptor, CUDNN_TENSOR_OP_MATH));
+
+    for(int batchSize = 1; batchSize <= maxBatchSize; batchSize++) {
+      if(transformerPrecisionUsesLowpStorage(precision)) {
+#if CUDNN_MAJOR >= 8
+        (*convolutionAlgorithms)[batchSize].algo = CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_PRECOMP_GEMM;
+#else
+        (*convolutionAlgorithms)[batchSize] = CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_PRECOMP_GEMM;
+#endif
+      }
+      else {
+#if CUDNN_MAJOR >= 8
+        int requestedAlgoCount = CUDNN_CONVOLUTION_FWD_ALGO_COUNT;
+        int returnedAlgoCount = -1;
+        cudnnConvolutionFwdAlgoPerf_t results[2 * CUDNN_CONVOLUTION_FWD_ALGO_COUNT];
+        CUDNN_ERR(name.c_str(), cudnnGetConvolutionForwardAlgorithm_v7(
+          cudaHandles->cudnn,
+          (*inputDescriptors)[batchSize],
+          filterDescriptor,
+          convolutionDescriptor,
+          (*outputDescriptors)[batchSize],
+          requestedAlgoCount,
+          &returnedAlgoCount,
+          results
+        ));
+        if(returnedAlgoCount <= 0)
+          throw StringError("Transformer stem cudnnGetConvolutionForwardAlgorithm_v7 returned no algorithms");
+        (*convolutionAlgorithms)[batchSize] = results[0];
+#else
+        size_t bytesMemoryLimit = 0;
+        CUDNN_ERR(name.c_str(), cudnnGetConvolutionForwardAlgorithm(
+          cudaHandles->cudnn,
+          (*inputDescriptors)[batchSize],
+          filterDescriptor,
+          convolutionDescriptor,
+          (*outputDescriptors)[batchSize],
+          CUDNN_CONVOLUTION_FWD_PREFER_FASTEST,
+          bytesMemoryLimit,
+          &((*convolutionAlgorithms)[batchSize])
+        ));
+#endif
+      }
+    }
+
+    assert(weights.size() == (size_t)outChannels * inChannels * kernelSize * kernelSize);
+    transformerMallocAndCopyWeights(name, weights, filterBuf, precision);
+  }
+
+  ~TransformerStemConv() {
+    delete inputDescriptors;
+    delete outputDescriptors;
+    delete convolutionAlgorithms;
+    cudaFree(filterBuf);
+    cudnnDestroyFilterDescriptor(filterDescriptor);
+    cudnnDestroyConvolutionDescriptor(convolutionDescriptor);
+  }
+
+  size_t requiredWorkspaceBytes(CudaHandles* cudaHandles, int batchSize) const {
+    size_t workspaceBytes = 0;
+#if CUDNN_MAJOR >= 8
+    CUDNN_ERR(name.c_str(), cudnnGetConvolutionForwardWorkspaceSize(
+      cudaHandles->cudnn,
+      (*inputDescriptors)[batchSize],
+      filterDescriptor,
+      convolutionDescriptor,
+      (*outputDescriptors)[batchSize],
+      (*convolutionAlgorithms)[batchSize].algo,
+      &workspaceBytes
+    ));
+#else
+    CUDNN_ERR(name.c_str(), cudnnGetConvolutionForwardWorkspaceSize(
+      cudaHandles->cudnn,
+      (*inputDescriptors)[batchSize],
+      filterDescriptor,
+      convolutionDescriptor,
+      (*outputDescriptors)[batchSize],
+      (*convolutionAlgorithms)[batchSize],
+      &workspaceBytes
+    ));
+#endif
+    return workspaceBytes;
+  }
 
   void apply(
     CudaHandles* cudaHandles,
     ScratchBuffers* scratch,
     int batchSize,
-    void* inputBuf,
+    const float* inputBuf,
+    float* outputBuf,
+    void* workspaceBuf,
+    size_t workspaceBytes
+  ) const {
+    if(precision == TransformerPrecision::Float32) {
+      const float alpha = 1.0f;
+      const float beta = 0.0f;
+#if CUDNN_MAJOR >= 8
+      CUDNN_ERR(name.c_str(), cudnnConvolutionForward(
+        cudaHandles->cudnn,
+        &alpha,
+        (*inputDescriptors)[batchSize],
+        inputBuf,
+        filterDescriptor,
+        filterBuf,
+        convolutionDescriptor,
+        (*convolutionAlgorithms)[batchSize].algo,
+        workspaceBuf,
+        workspaceBytes,
+        &beta,
+        (*outputDescriptors)[batchSize],
+        outputBuf
+      ));
+#else
+      CUDNN_ERR(name.c_str(), cudnnConvolutionForward(
+        cudaHandles->cudnn,
+        &alpha,
+        (*inputDescriptors)[batchSize],
+        inputBuf,
+        filterDescriptor,
+        filterBuf,
+        convolutionDescriptor,
+        (*convolutionAlgorithms)[batchSize],
+        workspaceBuf,
+        workspaceBytes,
+        &beta,
+        (*outputDescriptors)[batchSize],
+        outputBuf
+      ));
+#endif
+      return;
+    }
+
+    int numInputElts = batchSize * inChannels * nnXLen * nnYLen;
+    int numOutputElts = batchSize * outChannels * nnXLen * nnYLen;
+    SizedBuf<void*> lowInputBuf(scratch->allocator, (size_t)numInputElts * transformerPrecisionElemSize(precision));
+    SizedBuf<void*> lowOutputBuf(scratch->allocator, (size_t)numOutputElts * transformerPrecisionElemSize(precision));
+    transformerCopyFloatToPrecision(inputBuf, lowInputBuf.buf, numInputElts, precision);
+    CUDA_ERR(name.c_str(), cudaPeekAtLastError());
+
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+#if CUDNN_MAJOR >= 8
+    CUDNN_ERR(name.c_str(), cudnnConvolutionForward(
+      cudaHandles->cudnn,
+      &alpha,
+      (*inputDescriptors)[batchSize],
+      lowInputBuf.buf,
+      filterDescriptor,
+      filterBuf,
+      convolutionDescriptor,
+      (*convolutionAlgorithms)[batchSize].algo,
+      workspaceBuf,
+      workspaceBytes,
+      &beta,
+      (*outputDescriptors)[batchSize],
+      lowOutputBuf.buf
+    ));
+#else
+    CUDNN_ERR(name.c_str(), cudnnConvolutionForward(
+      cudaHandles->cudnn,
+      &alpha,
+      (*inputDescriptors)[batchSize],
+      lowInputBuf.buf,
+      filterDescriptor,
+      filterBuf,
+      convolutionDescriptor,
+      (*convolutionAlgorithms)[batchSize],
+      workspaceBuf,
+      workspaceBytes,
+      &beta,
+      (*outputDescriptors)[batchSize],
+      lowOutputBuf.buf
+    ));
+#endif
+
+    transformerCopyPrecisionToFloat(lowOutputBuf.buf, outputBuf, numOutputElts, precision);
+    CUDA_ERR(name.c_str(), cudaPeekAtLastError());
+  }
+};
+
+struct TransformerLinear {
+  const string name;
+  const int inChannels;
+  const int outChannels;
+  const TransformerPrecision precision;
+  void* weightBuf;
+
+  TransformerLinear(
+    CudaHandles* cudaHandles,
+    const string& name_,
+    int inChannels_,
+    int outChannels_,
+    const vector<float>& weights,
+    TransformerPrecision precision_
+  ) :
+    name(name_),
+    inChannels(inChannels_),
+    outChannels(outChannels_),
+    precision(precision_),
+    weightBuf(nullptr)
+  {
+    (void)cudaHandles;
+    transformerMallocAndCopyWeights(name_, weights, weightBuf, precision);
+  }
+
+  ~TransformerLinear() {
+    cudaFree(weightBuf);
+  }
+
+  TransformerLinear() = delete;
+  TransformerLinear(const TransformerLinear&) = delete;
+  TransformerLinear& operator=(const TransformerLinear&) = delete;
+
+  void runFloatMatmul(
+    CudaHandles* cudaHandles,
+    int batchSize,
+    const float* inputBuf,
+    float* outputBuf
+  ) const {
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+    CUBLAS_ERR(name.c_str(), cublasSgemm(
+      cudaHandles->cublas,
+      CUBLAS_OP_N,
+      CUBLAS_OP_N,
+      outChannels,
+      batchSize,
+      inChannels,
+      &alpha,
+      reinterpret_cast<const float*>(weightBuf), outChannels,
+      inputBuf, inChannels,
+      &beta,
+      outputBuf, outChannels
+    ));
+  }
+
+#ifdef KATAGO_CUBLASLT_AVAILABLE
+  bool tryRunLowpMatmulWithCublasLt(
+    CudaHandles* cudaHandles,
+    ScratchBuffers* scratch,
+    int batchSize,
+    const void* lowpInputBuf,
+    void* lowpOutputBuf
+  ) const {
+    ASSERT(transformerPrecisionUsesLowpStorage(precision));
+    cudaDataType_t dtype = transformerPrecisionToCudaType(precision);
+
+    cublasLtMatmulDesc_t operationDesc = nullptr;
+    cublasLtMatrixLayout_t weightLayout = nullptr;
+    cublasLtMatrixLayout_t inputLayout = nullptr;
+    cublasLtMatrixLayout_t outputLayout = nullptr;
+    cublasLtMatmulPreference_t preference = nullptr;
+
+    cublasOperation_t transA = CUBLAS_OP_N;
+    cublasOperation_t transB = CUBLAS_OP_N;
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+    size_t maxWorkspaceBytes = TRANSFORMER_CUBLASLT_WORKSPACE_BYTES;
+    cublasLtMatmulHeuristicResult_t heuristicResult;
+    int returnedResults = 0;
+    bool success = false;
+
+    CUBLAS_ERR(name.c_str(), cublasLtMatmulDescCreate(&operationDesc, CUBLAS_COMPUTE_32F, CUDA_R_32F));
+    CUBLAS_ERR(name.c_str(), cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_TRANSA, &transA, sizeof(transA)));
+    CUBLAS_ERR(name.c_str(), cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_TRANSB, &transB, sizeof(transB)));
+    CUBLAS_ERR(name.c_str(), cublasLtMatrixLayoutCreate(&weightLayout, dtype, outChannels, inChannels, outChannels));
+    CUBLAS_ERR(name.c_str(), cublasLtMatrixLayoutCreate(&inputLayout, dtype, inChannels, batchSize, inChannels));
+    CUBLAS_ERR(name.c_str(), cublasLtMatrixLayoutCreate(&outputLayout, dtype, outChannels, batchSize, outChannels));
+    CUBLAS_ERR(name.c_str(), cublasLtMatmulPreferenceCreate(&preference));
+    CUBLAS_ERR(name.c_str(), cublasLtMatmulPreferenceSetAttribute(
+      preference,
+      CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+      &maxWorkspaceBytes,
+      sizeof(maxWorkspaceBytes)
+    ));
+
+    cublasStatus_t heuristicStatus = cublasLtMatmulAlgoGetHeuristic(
+      cudaHandles->cublasLt,
+      operationDesc,
+      weightLayout,
+      inputLayout,
+      outputLayout,
+      outputLayout,
+      preference,
+      1,
+      &heuristicResult,
+      &returnedResults
+    );
+    if(heuristicStatus == CUBLAS_STATUS_SUCCESS && returnedResults > 0) {
+      void* workspacePtr = nullptr;
+      if(heuristicResult.workspaceSize > 0) {
+        SizedBuf<void*> workspaceBuf(scratch->allocator, heuristicResult.workspaceSize);
+        workspacePtr = workspaceBuf.buf;
+        CUBLAS_ERR(name.c_str(), cublasLtMatmul(
+          cudaHandles->cublasLt,
+          operationDesc,
+          &alpha,
+          weightBuf,
+          weightLayout,
+          lowpInputBuf,
+          inputLayout,
+          &beta,
+          lowpOutputBuf,
+          outputLayout,
+          lowpOutputBuf,
+          outputLayout,
+          &heuristicResult.algo,
+          workspacePtr,
+          heuristicResult.workspaceSize,
+          0
+        ));
+      }
+      else {
+        CUBLAS_ERR(name.c_str(), cublasLtMatmul(
+          cudaHandles->cublasLt,
+          operationDesc,
+          &alpha,
+          weightBuf,
+          weightLayout,
+          lowpInputBuf,
+          inputLayout,
+          &beta,
+          lowpOutputBuf,
+          outputLayout,
+          lowpOutputBuf,
+          outputLayout,
+          &heuristicResult.algo,
+          nullptr,
+          0,
+          0
+        ));
+      }
+      success = true;
+    }
+
+    if(preference != nullptr)
+      cublasLtMatmulPreferenceDestroy(preference);
+    if(outputLayout != nullptr)
+      cublasLtMatrixLayoutDestroy(outputLayout);
+    if(inputLayout != nullptr)
+      cublasLtMatrixLayoutDestroy(inputLayout);
+    if(weightLayout != nullptr)
+      cublasLtMatrixLayoutDestroy(weightLayout);
+    if(operationDesc != nullptr)
+      cublasLtMatmulDescDestroy(operationDesc);
+
+    return success;
+  }
+#endif
+
+  void runLowpMatmul(
+    CudaHandles* cudaHandles,
+    ScratchBuffers* scratch,
+    int batchSize,
+    const void* lowpInputBuf,
+    void* lowpOutputBuf
+  ) const {
+    ASSERT(transformerPrecisionUsesLowpStorage(precision));
+#ifdef KATAGO_CUBLASLT_AVAILABLE
+    if(tryRunLowpMatmulWithCublasLt(cudaHandles, scratch, batchSize, lowpInputBuf, lowpOutputBuf))
+      return;
+#else
+    (void)scratch;
+#endif
+
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+    cudaDataType_t dtype = transformerPrecisionToCudaType(precision);
+    CUBLAS_ERR(name.c_str(), cublasGemmEx(
+      cudaHandles->cublas,
+      CUBLAS_OP_N,
+      CUBLAS_OP_N,
+      outChannels,
+      batchSize,
+      inChannels,
+      &alpha,
+      weightBuf,
+      dtype,
+      outChannels,
+      lowpInputBuf,
+      dtype,
+      inChannels,
+      &beta,
+      lowpOutputBuf,
+      dtype,
+      outChannels,
+      CUDA_R_32F,
+      CUBLAS_GEMM_DEFAULT
+    ));
+  }
+
+  void apply(
+    CudaHandles* cudaHandles,
+    ScratchBuffers* scratch,
+    int batchSize,
+    const void* inputBuf,
     void* outputBuf
   ) const {
-    layer.apply(cudaHandles, scratch, batchSize, inputBuf, outputBuf, nullptr, 0);
+    const float* inputFloatBuf = reinterpret_cast<const float*>(inputBuf);
+    float* outputFloatBuf = reinterpret_cast<float*>(outputBuf);
+    if(precision == TransformerPrecision::Float32) {
+      runFloatMatmul(cudaHandles, batchSize, inputFloatBuf, outputFloatBuf);
+      return;
+    }
+
+    int numInputElts = batchSize * inChannels;
+    int numOutputElts = batchSize * outChannels;
+    SizedBuf<void*> lowInputBuf(scratch->allocator, (size_t)numInputElts * transformerPrecisionElemSize(precision));
+    SizedBuf<void*> lowOutputBuf(scratch->allocator, (size_t)numOutputElts * transformerPrecisionElemSize(precision));
+
+    transformerCopyFloatToPrecision(inputFloatBuf, lowInputBuf.buf, numInputElts, precision);
+    CUDA_ERR(name.c_str(), cudaPeekAtLastError());
+
+    runLowpMatmul(cudaHandles, scratch, batchSize, lowInputBuf.buf, lowOutputBuf.buf);
+    transformerCopyPrecisionToFloat(lowOutputBuf.buf, outputFloatBuf, numOutputElts, precision);
+    CUDA_ERR(name.c_str(), cudaPeekAtLastError());
+  }
+
+  // inputBuf is already in lowp format (or FP32 if precision==Float32).
+  // outputBuf is always FP32.
+  void applyWithLowpInput(
+    CudaHandles* cudaHandles,
+    ScratchBuffers* scratch,
+    int batchSize,
+    const void* lowpInputBuf,
+    void* outputBuf
+  ) const {
+    float* outputFloatBuf = reinterpret_cast<float*>(outputBuf);
+    if(precision == TransformerPrecision::Float32) {
+      runFloatMatmul(cudaHandles, batchSize, reinterpret_cast<const float*>(lowpInputBuf), outputFloatBuf);
+      return;
+    }
+
+    int numOutputElts = batchSize * outChannels;
+    SizedBuf<void*> lowOutputBuf(scratch->allocator, (size_t)numOutputElts * transformerPrecisionElemSize(precision));
+
+    runLowpMatmul(cudaHandles, scratch, batchSize, lowpInputBuf, lowOutputBuf.buf);
+    transformerCopyPrecisionToFloat(lowOutputBuf.buf, outputFloatBuf, numOutputElts, precision);
+    CUDA_ERR(name.c_str(), cudaPeekAtLastError());
+  }
+
+  // inputBuf is float, outputBuf is lowp (or FP32 if precision==Float32).
+  void applyToLowp(
+    CudaHandles* cudaHandles,
+    ScratchBuffers* scratch,
+    int batchSize,
+    const void* inputBuf,
+    void* lowpOutputBuf
+  ) const {
+    if(precision == TransformerPrecision::Float32) {
+      runFloatMatmul(cudaHandles, batchSize, reinterpret_cast<const float*>(inputBuf), reinterpret_cast<float*>(lowpOutputBuf));
+      return;
+    }
+
+    int numInputElts = batchSize * inChannels;
+    SizedBuf<void*> lowInputBuf(scratch->allocator, (size_t)numInputElts * transformerPrecisionElemSize(precision));
+    transformerCopyFloatToPrecision(reinterpret_cast<const float*>(inputBuf), lowInputBuf.buf, numInputElts, precision);
+    CUDA_ERR(name.c_str(), cudaPeekAtLastError());
+    applyWithLowpInputToLowp(cudaHandles, scratch, batchSize, lowInputBuf.buf, lowpOutputBuf);
+  }
+
+  // inputBuf is already lowp format (or FP32 if precision==Float32), outputBuf matches precision.
+  void applyWithLowpInputToLowp(
+    CudaHandles* cudaHandles,
+    ScratchBuffers* scratch,
+    int batchSize,
+    const void* lowpInputBuf,
+    void* lowpOutputBuf
+  ) const {
+    if(precision == TransformerPrecision::Float32) {
+      runFloatMatmul(cudaHandles, batchSize, reinterpret_cast<const float*>(lowpInputBuf), reinterpret_cast<float*>(lowpOutputBuf));
+      return;
+    }
+
+    runLowpMatmul(cudaHandles, scratch, batchSize, lowpInputBuf, lowpOutputBuf);
   }
 };
 
@@ -2218,15 +3163,18 @@ struct TransformerBlock {
   const int headDim;
   const int ffnDim;
   const int seqLen;
+  const TransformerPrecision precision;
+  TransformerAttentionPath attentionPath;
+  ByBatchSize<cudnnTensorDescriptor_t>* softmaxDescriptors;
+#ifdef KATAGO_CUDNN_SDPA_AVAILABLE
+  vector<TransformerSdpaPlan> officialAttentionPlans;
+#endif
 
   TransformerRMSNorm norm1;
-  TransformerLinear qProj;
-  TransformerLinear kProj;
-  TransformerLinear vProj;
+  TransformerLinear qkvProj;
   TransformerLinear outProj;
   TransformerRMSNorm norm2;
-  TransformerLinear ffnW1;
-  TransformerLinear ffnWGate;
+  TransformerLinear ffnInProj;
   TransformerLinear ffnW2;
 
   TransformerBlock() = delete;
@@ -2241,7 +3189,9 @@ struct TransformerBlock {
     int headDim_,
     int ffnDim_,
     int seqLen_,
-    int blockIdx
+    int maxBatchSize,
+    int blockIdx,
+    TransformerPrecision precision_
   ) :
     name("transformer_block_" + Global::intToString(blockIdx)),
     hiddenSize(hiddenSize_),
@@ -2249,16 +3199,127 @@ struct TransformerBlock {
     headDim(headDim_),
     ffnDim(ffnDim_),
     seqLen(seqLen_),
-    norm1(name + "_norm1", desc.norm1Weight),
-    qProj(cudaHandles, name + "_q", hiddenSize, hiddenSize, desc.qWeight),
-    kProj(cudaHandles, name + "_k", hiddenSize, hiddenSize, desc.kWeight),
-    vProj(cudaHandles, name + "_v", hiddenSize, hiddenSize, desc.vWeight),
-    outProj(cudaHandles, name + "_out", hiddenSize, hiddenSize, desc.outWeight),
-    norm2(name + "_norm2", desc.norm2Weight),
-    ffnW1(cudaHandles, name + "_ff1", hiddenSize, ffnDim, desc.ffnW1Weight),
-    ffnWGate(cudaHandles, name + "_ffg", hiddenSize, ffnDim, desc.ffnWGateWeight),
-    ffnW2(cudaHandles, name + "_ff2", ffnDim, hiddenSize, desc.ffnW2Weight)
-  {}
+    precision(precision_),
+    attentionPath(TransformerAttentionPath::Legacy),
+    softmaxDescriptors(nullptr),
+#ifdef KATAGO_CUDNN_SDPA_AVAILABLE
+    officialAttentionPlans(),
+#endif
+    norm1(name + "_norm1", desc.norm1Weight, precision_),
+    qkvProj(
+      cudaHandles,
+      name + "_qkv",
+      hiddenSize,
+      hiddenSize * 3,
+      transformerConcatLinearWeightsByOutput(
+        vector<const vector<float>*>{&desc.qWeight, &desc.kWeight, &desc.vWeight},
+        hiddenSize,
+        vector<int>{hiddenSize, hiddenSize, hiddenSize}
+      ),
+      precision_
+    ),
+    outProj(cudaHandles, name + "_out", hiddenSize, hiddenSize, desc.outWeight, precision_),
+    norm2(name + "_norm2", desc.norm2Weight, precision_),
+    ffnInProj(
+      cudaHandles,
+      name + "_ff_in",
+      hiddenSize,
+      ffnDim * 2,
+      transformerConcatLinearWeightsByOutput(
+        vector<const vector<float>*>{&desc.ffnW1Weight, &desc.ffnWGateWeight},
+        hiddenSize,
+        vector<int>{ffnDim, ffnDim}
+      ),
+      precision_
+    ),
+    ffnW2(cudaHandles, name + "_ff2", ffnDim, hiddenSize, desc.ffnW2Weight, precision_)
+  {
+#ifdef KATAGO_CUDNN_SDPA_AVAILABLE
+    if(cudaDeviceSupportsOfficialTransformerAttention(cudaHandles, precision, headDim)) {
+      try {
+        officialAttentionPlans.reserve(maxBatchSize);
+        for(int batchSize = 1; batchSize <= maxBatchSize; batchSize++)
+          officialAttentionPlans.push_back(buildTransformerSdpaPlan(cudaHandles, precision, batchSize, seqLen, numHeads, headDim));
+        attentionPath = TransformerAttentionPath::CudnnSdpa;
+      }
+      catch(const std::exception&) {
+        officialAttentionPlans.clear();
+        attentionPath = TransformerAttentionPath::Legacy;
+      }
+    }
+#endif
+
+    if(attentionPath == TransformerAttentionPath::Legacy) {
+      softmaxDescriptors = new ByBatchSize<cudnnTensorDescriptor_t>(maxBatchSize);
+      softmaxDescriptors->destroyFunc = cudnnDestroyTensorDescriptor;
+      for(int batchSize = 1; batchSize <= maxBatchSize; batchSize++) {
+        cudnnTensorDescriptor_t& descForBatch = (*softmaxDescriptors)[batchSize];
+        CUDNN_ERR(name.c_str(), cudnnCreateTensorDescriptor(&descForBatch));
+        CUDNN_ERR(name.c_str(), cudnnSetTensor4dDescriptor(
+          descForBatch,
+          CUDNN_TENSOR_NCHW,
+          CUDNN_DATA_FLOAT,
+          batchSize * numHeads * seqLen,
+          seqLen,
+          1,
+          1
+        ));
+      }
+    }
+  }
+
+  ~TransformerBlock() {
+    delete softmaxDescriptors;
+  }
+
+  bool usesOfficialAttention() const {
+    return attentionPath == TransformerAttentionPath::CudnnSdpa;
+  }
+
+  const char* attentionPathName() const {
+    return transformerAttentionPathName(attentionPath);
+  }
+
+  size_t requiredWorkspaceBytes(int batchSize) const {
+#ifdef KATAGO_CUDNN_SDPA_AVAILABLE
+    if(attentionPath == TransformerAttentionPath::CudnnSdpa) {
+      ASSERT(batchSize >= 1 && batchSize <= (int)officialAttentionPlans.size());
+      return (size_t)officialAttentionPlans[batchSize-1].workspaceBytes;
+    }
+#endif
+    (void)batchSize;
+    return 0;
+  }
+
+#ifdef KATAGO_CUDNN_SDPA_AVAILABLE
+  void executeOfficialAttention(
+    CudaHandles* cudaHandles,
+    int batchSize,
+    const void* qBuf,
+    const void* kBuf,
+    const void* vBuf,
+    void* outBuf,
+    void* workspaceBuf,
+    size_t workspaceBytes
+  ) const {
+    ASSERT(attentionPath == TransformerAttentionPath::CudnnSdpa);
+    ASSERT(batchSize >= 1 && batchSize <= (int)officialAttentionPlans.size());
+    const TransformerSdpaPlan& plan = officialAttentionPlans[batchSize-1];
+    if((size_t)plan.workspaceBytes > workspaceBytes)
+      throw StringError("Transformer cuDNN SDPA workspace 不足");
+
+    std::unordered_map<int64_t, void*> variantPack = {
+      {1, const_cast<void*>(qBuf)},
+      {2, const_cast<void*>(kBuf)},
+      {3, const_cast<void*>(vBuf)},
+      {4, outBuf},
+    };
+    void* executeWorkspace = plan.workspaceBytes > 0 ? workspaceBuf : nullptr;
+    auto status = plan.graph->execute(cudaHandles->cudnn, variantPack, executeWorkspace);
+    if(!status.is_good())
+      throw StringError("执行 Transformer cuDNN SDPA 失败");
+  }
+#endif
 
   void apply(
     CudaHandles* cudaHandles,
@@ -2266,85 +3327,261 @@ struct TransformerBlock {
     int batchSize,
     const float* ropeCosBuf,
     const float* ropeSinBuf,
-    float* xBuf
+    void* xBuf,
+    void* workspaceBuf,
+    size_t workspaceBytes
   ) const {
     int tokenCount = batchSize * seqLen;
-    size_t hiddenBytes = (size_t)tokenCount * hiddenSize * sizeof(float);
-    size_t ffnBytes = (size_t)tokenCount * ffnDim * sizeof(float);
+    size_t residentEltSize = transformerPrecisionElemSize(precision);
+    size_t hiddenBytes = (size_t)tokenCount * hiddenSize * residentEltSize;
+    size_t ffnBytes = (size_t)tokenCount * ffnDim * residentEltSize;
     size_t logitsBytes = (size_t)batchSize * numHeads * seqLen * seqLen * sizeof(float);
+    size_t logitsLowpBytes = (size_t)batchSize * numHeads * seqLen * seqLen * residentEltSize;
+    size_t floatHiddenBytes = (size_t)tokenCount * hiddenSize * sizeof(float);
+    bool useOfficialAttention = attentionPath == TransformerAttentionPath::CudnnSdpa;
+    size_t attentionResidentBytes = useOfficialAttention ? hiddenBytes : floatHiddenBytes;
+    size_t qkvInterleavedBytes = hiddenBytes * 3;
+    size_t ffnInterleavedBytes = ffnBytes * 2;
 
     SizedBuf<void*> normBuf(scratch->allocator, hiddenBytes);
+    SizedBuf<void*> qkvInterleavedBuf(scratch->allocator, qkvInterleavedBytes);
     SizedBuf<void*> qBuf(scratch->allocator, hiddenBytes);
     SizedBuf<void*> kBuf(scratch->allocator, hiddenBytes);
     SizedBuf<void*> vBuf(scratch->allocator, hiddenBytes);
-    SizedBuf<void*> logitsBuf(scratch->allocator, logitsBytes);
-    SizedBuf<void*> attnBuf(scratch->allocator, hiddenBytes);
+    SizedBuf<void*> logitsBuf(scratch->allocator, useOfficialAttention ? 1 : logitsBytes);
+    SizedBuf<void*> attnLowpBuf(scratch->allocator, (!useOfficialAttention && transformerPrecisionUsesLowpStorage(precision)) ? logitsLowpBytes : 1);
+    SizedBuf<void*> attnBuf(scratch->allocator, attentionResidentBytes);
     SizedBuf<void*> projBuf(scratch->allocator, hiddenBytes);
     SizedBuf<void*> norm2Buf(scratch->allocator, hiddenBytes);
+    SizedBuf<void*> ffnInterleavedBuf(scratch->allocator, ffnInterleavedBytes);
     SizedBuf<void*> ffn1Buf(scratch->allocator, ffnBytes);
     SizedBuf<void*> ffnGateBuf(scratch->allocator, ffnBytes);
     SizedBuf<void*> ffnActBuf(scratch->allocator, ffnBytes);
     SizedBuf<void*> ffnOutBuf(scratch->allocator, hiddenBytes);
 
-    norm1.apply(tokenCount, xBuf, reinterpret_cast<float*>(normBuf.buf));
-    qProj.apply(cudaHandles, scratch, tokenCount, normBuf.buf, qBuf.buf);
-    kProj.apply(cudaHandles, scratch, tokenCount, normBuf.buf, kBuf.buf);
-    vProj.apply(cudaHandles, scratch, tokenCount, normBuf.buf, vBuf.buf);
+    // Temporary BHSD-format buffers for cuBLAS batched GEMM attention
+    SizedBuf<void*> qBHSD(scratch->allocator, hiddenBytes);
+    SizedBuf<void*> kBHSD(scratch->allocator, hiddenBytes);
+    SizedBuf<void*> vBHSD(scratch->allocator, hiddenBytes);
+    SizedBuf<void*> outBHSD(scratch->allocator, attentionResidentBytes);
 
-    customCudaApplyRotaryInplace(
-      reinterpret_cast<float*>(qBuf.buf),
-      reinterpret_cast<float*>(kBuf.buf),
-      ropeCosBuf,
-      ropeSinBuf,
-      batchSize,
-      seqLen,
-      numHeads,
-      headDim
-    );
+    norm1.apply(tokenCount, xBuf, normBuf.buf);
+    qkvProj.applyWithLowpInputToLowp(cudaHandles, scratch, tokenCount, normBuf.buf, qkvInterleavedBuf.buf);
+    {
+      void* qkvDstBufs[3] = {qBuf.buf, kBuf.buf, vBuf.buf};
+      transformerSplitCombinedLinearOutput(name, qkvInterleavedBuf.buf, tokenCount, hiddenSize, 3, precision, qkvDstBufs);
+      CUDA_ERR(name.c_str(), cudaPeekAtLastError());
+    }
+
+    if(precision == TransformerPrecision::Float32)
+      customCudaApplyRotaryInplace(reinterpret_cast<float*>(qBuf.buf), reinterpret_cast<float*>(kBuf.buf), ropeCosBuf, ropeSinBuf, batchSize, seqLen, numHeads, headDim);
+    else if(precision == TransformerPrecision::Float16)
+      customCudaApplyRotaryInplace(reinterpret_cast<half*>(qBuf.buf), reinterpret_cast<half*>(kBuf.buf), ropeCosBuf, ropeSinBuf, batchSize, seqLen, numHeads, headDim);
+#ifdef KATAGO_CUDA_BFLOAT16_AVAILABLE
+    else if(precision == TransformerPrecision::BFloat16)
+      customCudaApplyRotaryInplace(reinterpret_cast<bfloat16_t*>(qBuf.buf), reinterpret_cast<bfloat16_t*>(kBuf.buf), ropeCosBuf, ropeSinBuf, batchSize, seqLen, numHeads, headDim);
+#endif
+    else
+      ASSERT_UNREACHABLE;
     CUDA_ERR(name.c_str(), cudaPeekAtLastError());
 
-    customCudaAttentionLogits(
-      reinterpret_cast<float*>(qBuf.buf),
-      reinterpret_cast<float*>(kBuf.buf),
-      reinterpret_cast<float*>(logitsBuf.buf),
-      batchSize,
-      seqLen,
-      numHeads,
-      headDim,
-      1.0f / sqrt((float)headDim)
-    );
+    // Transpose Q/K/V from [B,S,H,D] to [B,H,S,D] for cuBLAS strided batched GEMM
+    if(precision == TransformerPrecision::Float32) {
+      customCudaTransposeBSHDtoBHSD(reinterpret_cast<float*>(qBuf.buf), reinterpret_cast<float*>(qBHSD.buf), batchSize, seqLen, numHeads, headDim);
+      customCudaTransposeBSHDtoBHSD(reinterpret_cast<float*>(kBuf.buf), reinterpret_cast<float*>(kBHSD.buf), batchSize, seqLen, numHeads, headDim);
+      customCudaTransposeBSHDtoBHSD(reinterpret_cast<float*>(vBuf.buf), reinterpret_cast<float*>(vBHSD.buf), batchSize, seqLen, numHeads, headDim);
+    }
+    else if(precision == TransformerPrecision::Float16) {
+      customCudaTransposeBSHDtoBHSD(reinterpret_cast<half*>(qBuf.buf), reinterpret_cast<half*>(qBHSD.buf), batchSize, seqLen, numHeads, headDim);
+      customCudaTransposeBSHDtoBHSD(reinterpret_cast<half*>(kBuf.buf), reinterpret_cast<half*>(kBHSD.buf), batchSize, seqLen, numHeads, headDim);
+      customCudaTransposeBSHDtoBHSD(reinterpret_cast<half*>(vBuf.buf), reinterpret_cast<half*>(vBHSD.buf), batchSize, seqLen, numHeads, headDim);
+    }
+#ifdef KATAGO_CUDA_BFLOAT16_AVAILABLE
+    else if(precision == TransformerPrecision::BFloat16) {
+      customCudaTransposeBSHDtoBHSD(reinterpret_cast<bfloat16_t*>(qBuf.buf), reinterpret_cast<bfloat16_t*>(qBHSD.buf), batchSize, seqLen, numHeads, headDim);
+      customCudaTransposeBSHDtoBHSD(reinterpret_cast<bfloat16_t*>(kBuf.buf), reinterpret_cast<bfloat16_t*>(kBHSD.buf), batchSize, seqLen, numHeads, headDim);
+      customCudaTransposeBSHDtoBHSD(reinterpret_cast<bfloat16_t*>(vBuf.buf), reinterpret_cast<bfloat16_t*>(vBHSD.buf), batchSize, seqLen, numHeads, headDim);
+    }
+#endif
+    else
+      ASSERT_UNREACHABLE;
     CUDA_ERR(name.c_str(), cudaPeekAtLastError());
 
-    customCudaAttentionSoftmaxInplace(reinterpret_cast<float*>(logitsBuf.buf), batchSize, seqLen, numHeads);
+    if(useOfficialAttention) {
+#ifdef KATAGO_CUDNN_SDPA_AVAILABLE
+      executeOfficialAttention(cudaHandles, batchSize, qBHSD.buf, kBHSD.buf, vBHSD.buf, outBHSD.buf, workspaceBuf, workspaceBytes);
+      if(precision == TransformerPrecision::Float16)
+        customCudaTransposeBHSDtoBSHD(reinterpret_cast<half*>(outBHSD.buf), reinterpret_cast<half*>(attnBuf.buf), batchSize, seqLen, numHeads, headDim);
+#ifdef KATAGO_CUDA_BFLOAT16_AVAILABLE
+      else if(precision == TransformerPrecision::BFloat16)
+        customCudaTransposeBHSDtoBSHD(reinterpret_cast<bfloat16_t*>(outBHSD.buf), reinterpret_cast<bfloat16_t*>(attnBuf.buf), batchSize, seqLen, numHeads, headDim);
+#endif
+      else
+        ASSERT_UNREACHABLE;
+#else
+      ASSERT_UNREACHABLE;
+#endif
+      CUDA_ERR(name.c_str(), cudaPeekAtLastError());
+      outProj.applyWithLowpInputToLowp(cudaHandles, scratch, tokenCount, attnBuf.buf, projBuf.buf);
+    }
+    else {
+      // Q @ K^T via cuBLAS strided batched GEMM
+      // Row-major: logits[S,S] = Q[S,D] * K[S,D]^T * scale
+      // cuBLAS col-major mapping: swap A/B, use OP_T on K
+      {
+        float scale = 1.0f / sqrtf((float)headDim);
+        float zero = 0.0f;
+        long long strideQK = (long long)seqLen * headDim;
+        long long strideLogits = (long long)seqLen * seqLen;
+        if(precision == TransformerPrecision::Float32) {
+          CUBLAS_ERR(name.c_str(), cublasSgemmStridedBatched(
+            cudaHandles->cublas,
+            CUBLAS_OP_T,
+            CUBLAS_OP_N,
+            seqLen,
+            seqLen,
+            headDim,
+            &scale,
+            reinterpret_cast<float*>(kBHSD.buf), headDim, strideQK,
+            reinterpret_cast<float*>(qBHSD.buf), headDim, strideQK,
+            &zero,
+            reinterpret_cast<float*>(logitsBuf.buf), seqLen, strideLogits,
+            batchSize * numHeads
+          ));
+        }
+        else {
+          cudaDataType_t dtype = transformerPrecisionToCudaType(precision);
+          CUBLAS_ERR(name.c_str(), cublasGemmStridedBatchedEx(
+            cudaHandles->cublas,
+            CUBLAS_OP_T,
+            CUBLAS_OP_N,
+            seqLen,
+            seqLen,
+            headDim,
+            &scale,
+            kBHSD.buf, dtype, headDim, strideQK,
+            qBHSD.buf, dtype, headDim, strideQK,
+            &zero,
+            logitsBuf.buf, CUDA_R_32F, seqLen, strideLogits,
+            batchSize * numHeads,
+            CUDA_R_32F,
+            CUBLAS_GEMM_DEFAULT
+          ));
+        }
+      }
+
+      // Softmax via cuDNN
+      {
+        float one = 1.0f;
+        float zero = 0.0f;
+        CUDNN_ERR(name.c_str(), cudnnSoftmaxForward(
+          cudaHandles->cudnn,
+          CUDNN_SOFTMAX_ACCURATE,
+          CUDNN_SOFTMAX_MODE_INSTANCE,
+          &one, (*softmaxDescriptors)[batchSize], logitsBuf.buf,
+          &zero, (*softmaxDescriptors)[batchSize], logitsBuf.buf));
+      }
+
+      if(transformerPrecisionUsesLowpStorage(precision)) {
+        int numLogitsElts = batchSize * numHeads * seqLen * seqLen;
+        transformerCopyFloatToPrecision(reinterpret_cast<const float*>(logitsBuf.buf), attnLowpBuf.buf, numLogitsElts, precision);
+        CUDA_ERR(name.c_str(), cudaPeekAtLastError());
+      }
+
+      // Attn @ V via cuBLAS strided batched GEMM
+      // Row-major: out[S,D] = attn[S,S] * V[S,D]
+      // cuBLAS col-major mapping: C_cm = V_cm * attn_cm
+      {
+        float one = 1.0f;
+        float zero = 0.0f;
+        long long strideV = (long long)seqLen * headDim;
+        long long strideLogits = (long long)seqLen * seqLen;
+        if(precision == TransformerPrecision::Float32) {
+          CUBLAS_ERR(name.c_str(), cublasSgemmStridedBatched(
+            cudaHandles->cublas,
+            CUBLAS_OP_N,
+            CUBLAS_OP_N,
+            headDim,
+            seqLen,
+            seqLen,
+            &one,
+            reinterpret_cast<float*>(vBHSD.buf), headDim, strideV,
+            reinterpret_cast<float*>(logitsBuf.buf), seqLen, strideLogits,
+            &zero,
+            reinterpret_cast<float*>(outBHSD.buf), headDim, strideV,
+            batchSize * numHeads
+          ));
+        }
+        else {
+          cudaDataType_t dtype = transformerPrecisionToCudaType(precision);
+          CUBLAS_ERR(name.c_str(), cublasGemmStridedBatchedEx(
+            cudaHandles->cublas,
+            CUBLAS_OP_N,
+            CUBLAS_OP_N,
+            headDim,
+            seqLen,
+            seqLen,
+            &one,
+            vBHSD.buf, dtype, headDim, strideV,
+            attnLowpBuf.buf, dtype, seqLen, strideLogits,
+            &zero,
+            outBHSD.buf, CUDA_R_32F, headDim, strideV,
+            batchSize * numHeads,
+            CUDA_R_32F,
+            CUBLAS_GEMM_DEFAULT
+          ));
+        }
+      }
+
+      // Transpose attention output from [B,H,S,D] back to [B,S,H,D]
+      customCudaTransposeBHSDtoBSHD(
+        reinterpret_cast<float*>(outBHSD.buf), reinterpret_cast<float*>(attnBuf.buf),
+        batchSize, seqLen, numHeads, headDim);
+      CUDA_ERR(name.c_str(), cudaPeekAtLastError());
+
+      outProj.applyToLowp(cudaHandles, scratch, tokenCount, attnBuf.buf, projBuf.buf);
+    }
+    if(precision == TransformerPrecision::Float32)
+      customCudaAddResidual(reinterpret_cast<float*>(xBuf), reinterpret_cast<float*>(projBuf.buf), tokenCount * hiddenSize);
+    else if(precision == TransformerPrecision::Float16)
+      customCudaAddResidual(reinterpret_cast<half*>(xBuf), reinterpret_cast<half*>(projBuf.buf), tokenCount * hiddenSize);
+#ifdef KATAGO_CUDA_BFLOAT16_AVAILABLE
+    else if(precision == TransformerPrecision::BFloat16)
+      customCudaAddResidual(reinterpret_cast<bfloat16_t*>(xBuf), reinterpret_cast<bfloat16_t*>(projBuf.buf), tokenCount * hiddenSize);
+#endif
+    else
+      ASSERT_UNREACHABLE;
     CUDA_ERR(name.c_str(), cudaPeekAtLastError());
 
-    customCudaAttentionValues(
-      reinterpret_cast<float*>(logitsBuf.buf),
-      reinterpret_cast<float*>(vBuf.buf),
-      reinterpret_cast<float*>(attnBuf.buf),
-      batchSize,
-      seqLen,
-      numHeads,
-      headDim
-    );
+    norm2.apply(tokenCount, xBuf, norm2Buf.buf);
+    ffnInProj.applyWithLowpInputToLowp(cudaHandles, scratch, tokenCount, norm2Buf.buf, ffnInterleavedBuf.buf);
+    {
+      void* ffnDstBufs[2] = {ffn1Buf.buf, ffnGateBuf.buf};
+      transformerSplitCombinedLinearOutput(name, ffnInterleavedBuf.buf, tokenCount, ffnDim, 2, precision, ffnDstBufs);
+      CUDA_ERR(name.c_str(), cudaPeekAtLastError());
+    }
+    if(precision == TransformerPrecision::Float32)
+      customCudaSiluMultiply(reinterpret_cast<float*>(ffn1Buf.buf), reinterpret_cast<float*>(ffnGateBuf.buf), reinterpret_cast<float*>(ffnActBuf.buf), tokenCount * ffnDim);
+    else if(precision == TransformerPrecision::Float16)
+      customCudaSiluMultiply(reinterpret_cast<half*>(ffn1Buf.buf), reinterpret_cast<half*>(ffnGateBuf.buf), reinterpret_cast<half*>(ffnActBuf.buf), tokenCount * ffnDim);
+#ifdef KATAGO_CUDA_BFLOAT16_AVAILABLE
+    else if(precision == TransformerPrecision::BFloat16)
+      customCudaSiluMultiply(reinterpret_cast<bfloat16_t*>(ffn1Buf.buf), reinterpret_cast<bfloat16_t*>(ffnGateBuf.buf), reinterpret_cast<bfloat16_t*>(ffnActBuf.buf), tokenCount * ffnDim);
+#endif
+    else
+      ASSERT_UNREACHABLE;
     CUDA_ERR(name.c_str(), cudaPeekAtLastError());
-
-    outProj.apply(cudaHandles, scratch, tokenCount, attnBuf.buf, projBuf.buf);
-    customCudaAddResidual(xBuf, reinterpret_cast<float*>(projBuf.buf), tokenCount * hiddenSize);
-    CUDA_ERR(name.c_str(), cudaPeekAtLastError());
-
-    norm2.apply(tokenCount, xBuf, reinterpret_cast<float*>(norm2Buf.buf));
-    ffnW1.apply(cudaHandles, scratch, tokenCount, norm2Buf.buf, ffn1Buf.buf);
-    ffnWGate.apply(cudaHandles, scratch, tokenCount, norm2Buf.buf, ffnGateBuf.buf);
-    customCudaSiluMultiply(
-      reinterpret_cast<float*>(ffn1Buf.buf),
-      reinterpret_cast<float*>(ffnGateBuf.buf),
-      reinterpret_cast<float*>(ffnActBuf.buf),
-      tokenCount * ffnDim
-    );
-    CUDA_ERR(name.c_str(), cudaPeekAtLastError());
-    ffnW2.apply(cudaHandles, scratch, tokenCount, ffnActBuf.buf, ffnOutBuf.buf);
-    customCudaAddResidual(xBuf, reinterpret_cast<float*>(ffnOutBuf.buf), tokenCount * hiddenSize);
+    ffnW2.applyWithLowpInputToLowp(cudaHandles, scratch, tokenCount, ffnActBuf.buf, ffnOutBuf.buf);
+    if(precision == TransformerPrecision::Float32)
+      customCudaAddResidual(reinterpret_cast<float*>(xBuf), reinterpret_cast<float*>(ffnOutBuf.buf), tokenCount * hiddenSize);
+    else if(precision == TransformerPrecision::Float16)
+      customCudaAddResidual(reinterpret_cast<half*>(xBuf), reinterpret_cast<half*>(ffnOutBuf.buf), tokenCount * hiddenSize);
+#ifdef KATAGO_CUDA_BFLOAT16_AVAILABLE
+    else if(precision == TransformerPrecision::BFloat16)
+      customCudaAddResidual(reinterpret_cast<bfloat16_t*>(xBuf), reinterpret_cast<bfloat16_t*>(ffnOutBuf.buf), tokenCount * hiddenSize);
+#endif
+    else
+      ASSERT_UNREACHABLE;
     CUDA_ERR(name.c_str(), cudaPeekAtLastError());
   }
 };
@@ -2377,28 +3614,29 @@ struct TransformerModel {
   const int scoreBeliefLen;
   const int scoreBeliefProjectSize;
   const bool inputsUsingNHWC;
+  const TransformerPrecision precision;
 
-  unique_ptr<CudnnManager> manager;
-  unique_ptr<ConvLayer> stemConv;
-  unique_ptr<TransformerLinear> stemGlobal;
+  std::unique_ptr<CudnnManager> manager;
+  std::unique_ptr<TransformerStemConv> stemConv;
+  std::unique_ptr<TransformerLinear> stemGlobal;
   float* posBuf;
   float* ropeCosBuf;
   float* ropeSinBuf;
-  vector<unique_ptr<TransformerBlock>> blocks;
-  unique_ptr<TransformerRMSNorm> finalNorm;
-  unique_ptr<TransformerLinear> policyBoard;
-  unique_ptr<TransformerLinear> policyPass;
-  unique_ptr<TransformerLinear> policyBoardFull;
-  unique_ptr<TransformerLinear> policyPassFull;
-  unique_ptr<TransformerLinear> valueHead;
-  unique_ptr<TransformerLinear> miscHead;
-  unique_ptr<TransformerLinear> moreMiscHead;
-  unique_ptr<TransformerLinear> scoreValueHead;
-  unique_ptr<TransformerLinear> ownershipHead;
-  unique_ptr<TransformerLinear> scoringHead;
-  unique_ptr<TransformerLinear> futurePosHead;
-  unique_ptr<TransformerLinear> sekiHead;
-  unique_ptr<TransformerLinear> scoreBeliefHead;
+  vector<std::unique_ptr<TransformerBlock>> blocks;
+  std::unique_ptr<TransformerRMSNorm> finalNorm;
+  std::unique_ptr<TransformerLinear> policyBoard;
+  std::unique_ptr<TransformerLinear> policyPass;
+  std::unique_ptr<TransformerLinear> policyBoardFull;
+  std::unique_ptr<TransformerLinear> policyPassFull;
+  std::unique_ptr<TransformerLinear> valueHead;
+  std::unique_ptr<TransformerLinear> miscHead;
+  std::unique_ptr<TransformerLinear> moreMiscHead;
+  std::unique_ptr<TransformerLinear> scoreValueHead;
+  std::unique_ptr<TransformerLinear> ownershipHead;
+  std::unique_ptr<TransformerLinear> scoringHead;
+  std::unique_ptr<TransformerLinear> futurePosHead;
+  std::unique_ptr<TransformerLinear> sekiHead;
+  std::unique_ptr<TransformerLinear> scoreBeliefHead;
   vector<float> scoreBeliefS2OffWeight;
   vector<float> scoreBeliefS2ParWeight;
 
@@ -2412,7 +3650,8 @@ struct TransformerModel {
     int maxBatchSz,
     int nnX,
     int nnY,
-    bool inputsUseNHWC
+    bool inputsUseNHWC,
+    TransformerPrecision precision_
   ) :
     name(desc->name),
     modelVersion(desc->modelVersion),
@@ -2444,6 +3683,7 @@ struct TransformerModel {
       (desc->scoreBeliefLen > 0 && desc->numScoreBeliefs > 0 ? desc->scoreBeliefLen * desc->numScoreBeliefs + desc->numScoreBeliefs : 0)
     ),
     inputsUsingNHWC(inputsUseNHWC),
+    precision(precision_),
     posBuf(nullptr),
     ropeCosBuf(nullptr),
     ropeSinBuf(nullptr)
@@ -2462,10 +3702,21 @@ struct TransformerModel {
 
     manager = std::make_unique<CudnnManager>(name + "_tf", maxBatchSize, nnXLen, nnYLen);
 
-    ConvLayerDesc stemConvDesc = makeTransformerConvDesc(name + "_stem_conv", numInputChannels, hiddenSize, desc->stemKernelSize, desc->stemConvWeight);
-    stemConv = std::make_unique<ConvLayer>(cudaHandles, manager.get(), &stemConvDesc, false, inputsUseNHWC, false);
+    stemConv = std::make_unique<TransformerStemConv>(
+      cudaHandles,
+      name + "_stem_conv",
+      maxBatchSize,
+      nnXLen,
+      nnYLen,
+      inputsUseNHWC,
+      numInputChannels,
+      hiddenSize,
+      desc->stemKernelSize,
+      desc->stemConvWeight,
+      precision
+    );
 
-    stemGlobal = std::make_unique<TransformerLinear>(cudaHandles, name + "_stem_global", numInputGlobalChannels, hiddenSize, desc->stemGlobalWeight);
+    stemGlobal = std::make_unique<TransformerLinear>(cudaHandles, name + "_stem_global", numInputGlobalChannels, hiddenSize, desc->stemGlobalWeight, precision);
 
     if(desc->hasPosEmbed) {
       void* buf = nullptr;
@@ -2484,7 +3735,7 @@ struct TransformerModel {
     }
 
     for(int i = 0; i < desc->numLayers; i++) {
-      blocks.push_back(make_unique<TransformerBlock>(
+      blocks.push_back(std::make_unique<TransformerBlock>(
         cudaHandles,
         desc->blocks[i],
         hiddenSize,
@@ -2492,34 +3743,36 @@ struct TransformerModel {
         headDim,
         desc->ffnDim,
         posLen * posLen,
-        i
+        maxBatchSize,
+        i,
+        precision
       ));
     }
 
-    finalNorm = make_unique<TransformerRMSNorm>(name + "_final_norm", desc->finalNormWeight);
+    finalNorm = std::make_unique<TransformerRMSNorm>(name + "_final_norm", desc->finalNormWeight, precision);
 
-    policyBoard = make_unique<TransformerLinear>(cudaHandles, name + "_policy_board", hiddenSize, 2, desc->policyBoardWeight);
-    policyPass = make_unique<TransformerLinear>(cudaHandles, name + "_policy_pass", hiddenSize, 2, desc->policyPassWeight);
+    policyBoard = std::make_unique<TransformerLinear>(cudaHandles, name + "_policy_board", hiddenSize, 2, desc->policyBoardWeight, precision);
+    policyPass = std::make_unique<TransformerLinear>(cudaHandles, name + "_policy_pass", hiddenSize, 2, desc->policyPassWeight, precision);
     if(!desc->policyBoardFullWeight.empty()) {
-      policyBoardFull = make_unique<TransformerLinear>(cudaHandles, name + "_policy_board_full", hiddenSize, numFullPolicyChannels, desc->policyBoardFullWeight);
-      policyPassFull = make_unique<TransformerLinear>(cudaHandles, name + "_policy_pass_full", hiddenSize, numFullPolicyChannels, desc->policyPassFullWeight);
-      miscHead = make_unique<TransformerLinear>(cudaHandles, name + "_misc", hiddenSize, numMiscChannels, desc->miscWeight);
-      moreMiscHead = make_unique<TransformerLinear>(cudaHandles, name + "_moremisc", hiddenSize, numMoreMiscChannels, desc->moreMiscWeight);
-      scoringHead = make_unique<TransformerLinear>(cudaHandles, name + "_scoring", hiddenSize, numScoringChannels, desc->scoringWeight);
-      futurePosHead = make_unique<TransformerLinear>(cudaHandles, name + "_futurepos", hiddenSize, numFuturePosChannels, desc->futurePosWeight);
-      sekiHead = make_unique<TransformerLinear>(cudaHandles, name + "_seki", hiddenSize, numSekiChannels, desc->sekiWeight);
+      policyBoardFull = std::make_unique<TransformerLinear>(cudaHandles, name + "_policy_board_full", hiddenSize, numFullPolicyChannels, desc->policyBoardFullWeight, precision);
+      policyPassFull = std::make_unique<TransformerLinear>(cudaHandles, name + "_policy_pass_full", hiddenSize, numFullPolicyChannels, desc->policyPassFullWeight, precision);
+      miscHead = std::make_unique<TransformerLinear>(cudaHandles, name + "_misc", hiddenSize, numMiscChannels, desc->miscWeight, precision);
+      moreMiscHead = std::make_unique<TransformerLinear>(cudaHandles, name + "_moremisc", hiddenSize, numMoreMiscChannels, desc->moreMiscWeight, precision);
+      scoringHead = std::make_unique<TransformerLinear>(cudaHandles, name + "_scoring", hiddenSize, numScoringChannels, desc->scoringWeight, precision);
+      futurePosHead = std::make_unique<TransformerLinear>(cudaHandles, name + "_futurepos", hiddenSize, numFuturePosChannels, desc->futurePosWeight, precision);
+      sekiHead = std::make_unique<TransformerLinear>(cudaHandles, name + "_seki", hiddenSize, numSekiChannels, desc->sekiWeight, precision);
       if(scoreBeliefProjectSize > 0) {
         if(scoreMode == 0)
-          scoreBeliefHead = make_unique<TransformerLinear>(cudaHandles, name + "_scorebelief_simple", hiddenSize, scoreBeliefProjectSize, desc->scoreBeliefSimpleWeight);
+          scoreBeliefHead = std::make_unique<TransformerLinear>(cudaHandles, name + "_scorebelief_simple", hiddenSize, scoreBeliefProjectSize, desc->scoreBeliefSimpleWeight, precision);
         else
-          scoreBeliefHead = make_unique<TransformerLinear>(cudaHandles, name + "_scorebelief_mix", hiddenSize, scoreBeliefProjectSize, desc->scoreBeliefMixWeight);
+          scoreBeliefHead = std::make_unique<TransformerLinear>(cudaHandles, name + "_scorebelief_mix", hiddenSize, scoreBeliefProjectSize, desc->scoreBeliefMixWeight, precision);
       }
       scoreBeliefS2OffWeight = desc->scoreBeliefS2OffWeight;
       scoreBeliefS2ParWeight = desc->scoreBeliefS2ParWeight;
     }
-    valueHead = make_unique<TransformerLinear>(cudaHandles, name + "_value", hiddenSize, 3, desc->valueWeight);
-    scoreValueHead = make_unique<TransformerLinear>(cudaHandles, name + "_scorevalue", hiddenSize, 6, desc->scoreValueWeight);
-    ownershipHead = make_unique<TransformerLinear>(cudaHandles, name + "_ownership", hiddenSize, 1, desc->ownershipWeight);
+    valueHead = std::make_unique<TransformerLinear>(cudaHandles, name + "_value", hiddenSize, 3, desc->valueWeight, precision);
+    scoreValueHead = std::make_unique<TransformerLinear>(cudaHandles, name + "_scorevalue", hiddenSize, 6, desc->scoreValueWeight, precision);
+    ownershipHead = std::make_unique<TransformerLinear>(cudaHandles, name + "_ownership", hiddenSize, 1, desc->ownershipWeight, precision);
   }
 
   ~TransformerModel() {
@@ -2530,12 +3783,33 @@ struct TransformerModel {
   }
 
   size_t requiredWorkspaceBytes(CudaHandles* cudaHandles, int batchSize) const {
-    return stemConv->requiredWorkspaceBytes(cudaHandles, batchSize);
+    size_t bytes = stemConv->requiredWorkspaceBytes(cudaHandles, batchSize);
+    for(const auto& block : blocks)
+      bytes = std::max(bytes, block->requiredWorkspaceBytes(batchSize));
+    return bytes;
   }
 
   bool supportsFullRawOutputs() const {
     return policyBoardFull != nullptr && policyPassFull != nullptr && miscHead != nullptr && moreMiscHead != nullptr &&
       scoringHead != nullptr && futurePosHead != nullptr && sekiHead != nullptr && scoreBeliefHead != nullptr;
+  }
+
+  const char* attentionPathName() const {
+    if(blocks.empty())
+      return transformerAttentionPathName(TransformerAttentionPath::Legacy);
+    bool sawOfficial = false;
+    bool sawLegacy = false;
+    for(const auto& block : blocks) {
+      if(block->usesOfficialAttention())
+        sawOfficial = true;
+      else
+        sawLegacy = true;
+    }
+    if(sawOfficial && sawLegacy)
+      return "mixed";
+    if(sawOfficial)
+      return transformerAttentionPathName(TransformerAttentionPath::CudnnSdpa);
+    return transformerAttentionPathName(TransformerAttentionPath::Legacy);
   }
 
   void apply(
@@ -2556,39 +3830,49 @@ struct TransformerModel {
     int tokenCount = batchSize * seqLen;
     size_t stemBytes = (size_t)batchSize * hiddenSize * seqLen * sizeof(float);
     size_t globalBytes = (size_t)batchSize * hiddenSize * sizeof(float);
-    size_t nlcBytes = (size_t)tokenCount * hiddenSize * sizeof(float);
+    size_t residentBytes = (size_t)tokenCount * hiddenSize * transformerPrecisionElemSize(precision);
+    size_t pooledBytes = (size_t)batchSize * hiddenSize * transformerPrecisionElemSize(precision);
 
     SizedBuf<void*> stemSpatialBuf(scratch->allocator, stemBytes);
     SizedBuf<void*> stemGlobalBuf(scratch->allocator, globalBytes);
-    SizedBuf<void*> xBuf(scratch->allocator, nlcBytes);
-    SizedBuf<void*> pooledBuf(scratch->allocator, globalBytes);
+    SizedBuf<void*> xBuf(scratch->allocator, residentBytes);
+    SizedBuf<void*> pooledBuf(scratch->allocator, pooledBytes);
 
-    stemConv->apply(cudaHandles, batchSize, false, inputBuf, stemSpatialBuf.buf, workspaceBuf, workspaceBytes);
+    stemConv->apply(cudaHandles, scratch, batchSize, inputBuf, reinterpret_cast<float*>(stemSpatialBuf.buf), workspaceBuf, workspaceBytes);
     stemGlobal->apply(cudaHandles, scratch, batchSize, inputGlobalBuf, stemGlobalBuf.buf);
-    customCudaNCHWToNLCAddBiasPos(
-      reinterpret_cast<float*>(stemSpatialBuf.buf),
-      reinterpret_cast<float*>(stemGlobalBuf.buf),
-      posBuf,
-      reinterpret_cast<float*>(xBuf.buf),
-      batchSize,
-      hiddenSize,
-      posLen,
-      posLen
-    );
+    if(precision == TransformerPrecision::Float32)
+      customCudaNCHWToNLCAddBiasPos(reinterpret_cast<float*>(stemSpatialBuf.buf), reinterpret_cast<float*>(stemGlobalBuf.buf), posBuf, reinterpret_cast<float*>(xBuf.buf), batchSize, hiddenSize, posLen, posLen);
+    else if(precision == TransformerPrecision::Float16)
+      customCudaNCHWToNLCAddBiasPos(reinterpret_cast<float*>(stemSpatialBuf.buf), reinterpret_cast<float*>(stemGlobalBuf.buf), posBuf, reinterpret_cast<half*>(xBuf.buf), batchSize, hiddenSize, posLen, posLen);
+#ifdef KATAGO_CUDA_BFLOAT16_AVAILABLE
+    else if(precision == TransformerPrecision::BFloat16)
+      customCudaNCHWToNLCAddBiasPos(reinterpret_cast<float*>(stemSpatialBuf.buf), reinterpret_cast<float*>(stemGlobalBuf.buf), posBuf, reinterpret_cast<bfloat16_t*>(xBuf.buf), batchSize, hiddenSize, posLen, posLen);
+#endif
+    else
+      ASSERT_UNREACHABLE;
     CUDA_ERR(name.c_str(), cudaPeekAtLastError());
 
     for(const auto& block : blocks)
-      block->apply(cudaHandles, scratch, batchSize, ropeCosBuf, ropeSinBuf, reinterpret_cast<float*>(xBuf.buf));
+      block->apply(cudaHandles, scratch, batchSize, ropeCosBuf, ropeSinBuf, xBuf.buf, workspaceBuf, workspaceBytes);
 
-    finalNorm->apply(tokenCount, reinterpret_cast<float*>(xBuf.buf), reinterpret_cast<float*>(xBuf.buf));
+    finalNorm->apply(tokenCount, xBuf.buf, xBuf.buf);
 
-    policyBoard->apply(cudaHandles, scratch, tokenCount, xBuf.buf, policyBuf);
-    customCudaMeanPoolNLC(reinterpret_cast<float*>(xBuf.buf), reinterpret_cast<float*>(pooledBuf.buf), batchSize, seqLen, hiddenSize);
+    policyBoard->applyWithLowpInput(cudaHandles, scratch, tokenCount, xBuf.buf, policyBuf);
+    if(precision == TransformerPrecision::Float32)
+      customCudaMeanPoolNLC(reinterpret_cast<float*>(xBuf.buf), reinterpret_cast<float*>(pooledBuf.buf), batchSize, seqLen, hiddenSize);
+    else if(precision == TransformerPrecision::Float16)
+      customCudaMeanPoolNLC(reinterpret_cast<half*>(xBuf.buf), reinterpret_cast<half*>(pooledBuf.buf), batchSize, seqLen, hiddenSize);
+#ifdef KATAGO_CUDA_BFLOAT16_AVAILABLE
+    else if(precision == TransformerPrecision::BFloat16)
+      customCudaMeanPoolNLC(reinterpret_cast<bfloat16_t*>(xBuf.buf), reinterpret_cast<bfloat16_t*>(pooledBuf.buf), batchSize, seqLen, hiddenSize);
+#endif
+    else
+      ASSERT_UNREACHABLE;
     CUDA_ERR(name.c_str(), cudaPeekAtLastError());
-    policyPass->apply(cudaHandles, scratch, batchSize, pooledBuf.buf, policyPassBuf);
-    valueHead->apply(cudaHandles, scratch, batchSize, pooledBuf.buf, valueBuf);
-    scoreValueHead->apply(cudaHandles, scratch, batchSize, pooledBuf.buf, scoreValueBuf);
-    ownershipHead->apply(cudaHandles, scratch, tokenCount, xBuf.buf, ownershipBuf);
+    policyPass->applyWithLowpInput(cudaHandles, scratch, batchSize, pooledBuf.buf, policyPassBuf);
+    valueHead->applyWithLowpInput(cudaHandles, scratch, batchSize, pooledBuf.buf, valueBuf);
+    scoreValueHead->applyWithLowpInput(cudaHandles, scratch, batchSize, pooledBuf.buf, scoreValueBuf);
+    ownershipHead->applyWithLowpInput(cudaHandles, scratch, tokenCount, xBuf.buf, ownershipBuf);
   }
 
   void applyFull(
@@ -2617,44 +3901,54 @@ struct TransformerModel {
     int tokenCount = batchSize * seqLen;
     size_t stemBytes = (size_t)batchSize * hiddenSize * seqLen * sizeof(float);
     size_t globalBytes = (size_t)batchSize * hiddenSize * sizeof(float);
-    size_t nlcBytes = (size_t)tokenCount * hiddenSize * sizeof(float);
+    size_t residentBytes = (size_t)tokenCount * hiddenSize * transformerPrecisionElemSize(precision);
+    size_t pooledBytes = (size_t)batchSize * hiddenSize * transformerPrecisionElemSize(precision);
 
     SizedBuf<void*> stemSpatialBuf(scratch->allocator, stemBytes);
     SizedBuf<void*> stemGlobalBuf(scratch->allocator, globalBytes);
-    SizedBuf<void*> xBuf(scratch->allocator, nlcBytes);
-    SizedBuf<void*> pooledBuf(scratch->allocator, globalBytes);
+    SizedBuf<void*> xBuf(scratch->allocator, residentBytes);
+    SizedBuf<void*> pooledBuf(scratch->allocator, pooledBytes);
 
-    stemConv->apply(cudaHandles, batchSize, false, inputBuf, stemSpatialBuf.buf, workspaceBuf, workspaceBytes);
+    stemConv->apply(cudaHandles, scratch, batchSize, inputBuf, reinterpret_cast<float*>(stemSpatialBuf.buf), workspaceBuf, workspaceBytes);
     stemGlobal->apply(cudaHandles, scratch, batchSize, inputGlobalBuf, stemGlobalBuf.buf);
-    customCudaNCHWToNLCAddBiasPos(
-      reinterpret_cast<float*>(stemSpatialBuf.buf),
-      reinterpret_cast<float*>(stemGlobalBuf.buf),
-      posBuf,
-      reinterpret_cast<float*>(xBuf.buf),
-      batchSize,
-      hiddenSize,
-      posLen,
-      posLen
-    );
+    if(precision == TransformerPrecision::Float32)
+      customCudaNCHWToNLCAddBiasPos(reinterpret_cast<float*>(stemSpatialBuf.buf), reinterpret_cast<float*>(stemGlobalBuf.buf), posBuf, reinterpret_cast<float*>(xBuf.buf), batchSize, hiddenSize, posLen, posLen);
+    else if(precision == TransformerPrecision::Float16)
+      customCudaNCHWToNLCAddBiasPos(reinterpret_cast<float*>(stemSpatialBuf.buf), reinterpret_cast<float*>(stemGlobalBuf.buf), posBuf, reinterpret_cast<half*>(xBuf.buf), batchSize, hiddenSize, posLen, posLen);
+#ifdef KATAGO_CUDA_BFLOAT16_AVAILABLE
+    else if(precision == TransformerPrecision::BFloat16)
+      customCudaNCHWToNLCAddBiasPos(reinterpret_cast<float*>(stemSpatialBuf.buf), reinterpret_cast<float*>(stemGlobalBuf.buf), posBuf, reinterpret_cast<bfloat16_t*>(xBuf.buf), batchSize, hiddenSize, posLen, posLen);
+#endif
+    else
+      ASSERT_UNREACHABLE;
     CUDA_ERR(name.c_str(), cudaPeekAtLastError());
 
     for(const auto& block : blocks)
-      block->apply(cudaHandles, scratch, batchSize, ropeCosBuf, ropeSinBuf, reinterpret_cast<float*>(xBuf.buf));
+      block->apply(cudaHandles, scratch, batchSize, ropeCosBuf, ropeSinBuf, xBuf.buf, workspaceBuf, workspaceBytes);
 
-    finalNorm->apply(tokenCount, reinterpret_cast<float*>(xBuf.buf), reinterpret_cast<float*>(xBuf.buf));
+    finalNorm->apply(tokenCount, xBuf.buf, xBuf.buf);
 
-    policyBoardFull->apply(cudaHandles, scratch, tokenCount, xBuf.buf, policyFullBuf);
-    ownershipHead->apply(cudaHandles, scratch, tokenCount, xBuf.buf, ownershipBuf);
-    scoringHead->apply(cudaHandles, scratch, tokenCount, xBuf.buf, scoringBuf);
-    futurePosHead->apply(cudaHandles, scratch, tokenCount, xBuf.buf, futurePosBuf);
-    sekiHead->apply(cudaHandles, scratch, tokenCount, xBuf.buf, sekiBuf);
-    customCudaMeanPoolNLC(reinterpret_cast<float*>(xBuf.buf), reinterpret_cast<float*>(pooledBuf.buf), batchSize, seqLen, hiddenSize);
+    policyBoardFull->applyWithLowpInput(cudaHandles, scratch, tokenCount, xBuf.buf, policyFullBuf);
+    ownershipHead->applyWithLowpInput(cudaHandles, scratch, tokenCount, xBuf.buf, ownershipBuf);
+    scoringHead->applyWithLowpInput(cudaHandles, scratch, tokenCount, xBuf.buf, scoringBuf);
+    futurePosHead->applyWithLowpInput(cudaHandles, scratch, tokenCount, xBuf.buf, futurePosBuf);
+    sekiHead->applyWithLowpInput(cudaHandles, scratch, tokenCount, xBuf.buf, sekiBuf);
+    if(precision == TransformerPrecision::Float32)
+      customCudaMeanPoolNLC(reinterpret_cast<float*>(xBuf.buf), reinterpret_cast<float*>(pooledBuf.buf), batchSize, seqLen, hiddenSize);
+    else if(precision == TransformerPrecision::Float16)
+      customCudaMeanPoolNLC(reinterpret_cast<half*>(xBuf.buf), reinterpret_cast<half*>(pooledBuf.buf), batchSize, seqLen, hiddenSize);
+#ifdef KATAGO_CUDA_BFLOAT16_AVAILABLE
+    else if(precision == TransformerPrecision::BFloat16)
+      customCudaMeanPoolNLC(reinterpret_cast<bfloat16_t*>(xBuf.buf), reinterpret_cast<bfloat16_t*>(pooledBuf.buf), batchSize, seqLen, hiddenSize);
+#endif
+    else
+      ASSERT_UNREACHABLE;
     CUDA_ERR(name.c_str(), cudaPeekAtLastError());
-    policyPassFull->apply(cudaHandles, scratch, batchSize, pooledBuf.buf, policyPassFullBuf);
-    valueHead->apply(cudaHandles, scratch, batchSize, pooledBuf.buf, valueBuf);
-    miscHead->apply(cudaHandles, scratch, batchSize, pooledBuf.buf, miscBuf);
-    moreMiscHead->apply(cudaHandles, scratch, batchSize, pooledBuf.buf, moreMiscBuf);
-    scoreBeliefHead->apply(cudaHandles, scratch, batchSize, pooledBuf.buf, scoreBeliefProjectBuf);
+    policyPassFull->applyWithLowpInput(cudaHandles, scratch, batchSize, pooledBuf.buf, policyPassFullBuf);
+    valueHead->applyWithLowpInput(cudaHandles, scratch, batchSize, pooledBuf.buf, valueBuf);
+    miscHead->applyWithLowpInput(cudaHandles, scratch, batchSize, pooledBuf.buf, miscBuf);
+    moreMiscHead->applyWithLowpInput(cudaHandles, scratch, batchSize, pooledBuf.buf, moreMiscBuf);
+    scoreBeliefHead->applyWithLowpInput(cudaHandles, scratch, batchSize, pooledBuf.buf, scoreBeliefProjectBuf);
   }
 };
 
@@ -2736,7 +4030,7 @@ static void finalizeTransformerScoreBelief(
 struct LoadedModel {
   bool isTransformer;
   ModelDesc modelDesc;
-  unique_ptr<TransformerModelDesc> transformerDesc;
+  std::unique_ptr<TransformerModelDesc> transformerDesc;
 
   LoadedModel(const string& fileName, const string& expectedSha256) {
     transformerDesc = std::make_unique<TransformerModelDesc>();
@@ -2785,6 +4079,10 @@ void NeuralNet::freeLoadedModel(LoadedModel* loadedModel) {
 
 const ModelDesc& NeuralNet::getModelDesc(const LoadedModel* loadedModel) {
   return loadedModel->modelDesc;
+}
+
+bool NeuralNet::isTransformerModel(const LoadedModel* loadedModel) {
+  return loadedModel->isTransformer;
 }
 
 //------------------------------------------------------------------------------
@@ -2957,8 +4255,9 @@ struct TransformerBuffers {
       bytes = std::max(bytes, m.requiredWorkspaceBytes(cudaHandles, batchSize));
     }
     workspaceBytes = bytes;
-    if(workspaceBytes > 0)
+    if(workspaceBytes > 0) {
       CUDA_ERR("TransformerBuffers", cudaMalloc(&workspaceBuf, workspaceBytes));
+    }
     else
       workspaceBuf = nullptr;
   }
@@ -2982,6 +4281,7 @@ struct ComputeContext {
   int nnXLen;
   int nnYLen;
   enabled_t useFP16Mode;
+  compute_precision_t precisionMode;
   enabled_t useNHWCMode;
 };
 
@@ -2994,6 +4294,7 @@ ComputeContext* NeuralNet::createComputeContext(
   const string& homeDataDirOverride,
   bool openCLReTunePerBoardSize,
   enabled_t useFP16Mode,
+  compute_precision_t precisionMode,
   enabled_t useNHWCMode,
   const LoadedModel* loadedModel
 ) {
@@ -3008,6 +4309,7 @@ ComputeContext* NeuralNet::createComputeContext(
   context->nnXLen = nnXLen;
   context->nnYLen = nnYLen;
   context->useFP16Mode = useFP16Mode;
+  context->precisionMode = precisionMode;
   context->useNHWCMode = useNHWCMode;
   return context;
 }
@@ -3027,6 +4329,7 @@ struct ComputeHandle {
   std::unique_ptr<Buffers> buffers;
   std::unique_ptr<TransformerBuffers> transformerBuffers;
   const bool usingFP16;
+  const TransformerPrecision transformerPrecision;
   const int nnXLen;
   const int nnYLen;
   const bool requireExactNNLen;
@@ -3042,10 +4345,12 @@ struct ComputeHandle {
     bool requireExactNNLen_,
     bool inputsUseNHWC_,
     bool useFP16,
-    bool useNHWC
+    bool useNHWC,
+    TransformerPrecision transformerPrecision_
   ) :
     isTransformer(loadedModel->isTransformer),
-    usingFP16(useFP16),
+    usingFP16(isTransformer ? transformerPrecision_ == TransformerPrecision::Float16 : useFP16),
+    transformerPrecision(transformerPrecision_),
     nnXLen(context->nnXLen),
     nnYLen(context->nnYLen),
     requireExactNNLen(requireExactNNLen_),
@@ -3064,7 +4369,7 @@ struct ComputeHandle {
     else {
       transformerModel = std::make_unique<TransformerModel>(
         cudaHandles.get(), loadedModel->transformerDesc.get(), maxBatchSize,
-        nnXLen, nnYLen, inputsUseNHWC
+        nnXLen, nnYLen, inputsUseNHWC, transformerPrecision
       );
       scratch = std::make_unique<ScratchBuffers>(maxBatchSize, nnXLen, nnYLen, false);
       transformerBuffers = std::make_unique<TransformerBuffers>(cudaHandles.get(), *transformerModel, maxBatchSize);
@@ -3102,45 +4407,74 @@ ComputeHandle* NeuralNet::createComputeHandle(
 
   bool useFP16 = false;
   bool useNHWC = false;
-  //Old GPUs - use FP32 and explicitly fail if FP16 enabled
-  if(prop.major < 5 || (prop.major == 5 && prop.minor < 3)) {
-    if(context->useFP16Mode == enabled_t::True)
-      throw StringError("Cuda device versions below 5.3 do not support useFP16=true");
-    if(context->useNHWCMode == enabled_t::True)
-      useNHWC = true;
-  }
-  //In theory these GPUs support FP16, so allow if the user wants.
-  else if(prop.major < 6) {
-    if(context->useFP16Mode == enabled_t::True)
-      useFP16 = true;
-    if(context->useNHWCMode == enabled_t::True)
-      useNHWC = true;
-  }
-  //On Pascal architecture, default to using FP16 operations
-  //Actually, just use FP32 - there's a risk that on certain cards this might just be a lot worse.
-  //A user manually fine-tuning for performance can just enable it themselves if they know how.
-  else if(prop.major < 7) {
-    if(context->useFP16Mode == enabled_t::True)
-      useFP16 = true;
-    if(context->useNHWCMode == enabled_t::True)
-      useNHWC = true;
-  }
-  //On Volta and higher, use FP16 and NHWC together because we have tensor cores.
-  else {
-    if(context->useFP16Mode == enabled_t::True || context->useFP16Mode == enabled_t::Auto)
-      useFP16 = true;
-    if(context->useNHWCMode == enabled_t::True || (context->useNHWCMode == enabled_t::Auto && useFP16))
-      useNHWC = true;
-  }
-
+  TransformerPrecision transformerPrecision = TransformerPrecision::Float32;
   if(loadedModel->isTransformer) {
-    useFP16 = false;
+    transformerPrecision = chooseTransformerPrecision(context->precisionMode, prop.major, prop.minor);
+    useFP16 = (transformerPrecision == TransformerPrecision::Float16);
     useNHWC = false;
     if(!requireExactNNLen) {
       throw StringError("Transformer CUDA backend 仅支持 requireExactNNLen=true，且棋盘尺寸必须固定等于模型 pos_len");
     }
   }
+  else {
+    if(context->precisionMode == compute_precision_t::BF16)
+      throw StringError("Cuda CNN backend 暂不支持 bf16 precision");
 
+    enabled_t effectiveUseFP16Mode = context->useFP16Mode;
+    if(context->precisionMode == compute_precision_t::FP16)
+      effectiveUseFP16Mode = enabled_t::True;
+    else if(context->precisionMode == compute_precision_t::FP32)
+      effectiveUseFP16Mode = enabled_t::False;
+
+    //Old GPUs - use FP32 and explicitly fail if FP16 enabled
+    if(prop.major < 5 || (prop.major == 5 && prop.minor < 3)) {
+      if(effectiveUseFP16Mode == enabled_t::True)
+        throw StringError("Cuda device versions below 5.3 do not support useFP16=true");
+      if(context->useNHWCMode == enabled_t::True)
+        useNHWC = true;
+    }
+    //In theory these GPUs support FP16, so allow if the user wants.
+    else if(prop.major < 6) {
+      if(effectiveUseFP16Mode == enabled_t::True)
+        useFP16 = true;
+      if(context->useNHWCMode == enabled_t::True)
+        useNHWC = true;
+    }
+    //On Pascal architecture, default to using FP16 operations
+    //Actually, just use FP32 - there's a risk that on certain cards this might just be a lot worse.
+    //A user manually fine-tuning for performance can just enable it themselves if they know how.
+    else if(prop.major < 7) {
+      if(effectiveUseFP16Mode == enabled_t::True)
+        useFP16 = true;
+      if(context->useNHWCMode == enabled_t::True)
+        useNHWC = true;
+    }
+    //On Volta and higher, use FP16 and NHWC together because we have tensor cores.
+    else {
+      if(effectiveUseFP16Mode == enabled_t::True || effectiveUseFP16Mode == enabled_t::Auto)
+        useFP16 = true;
+      if(context->useNHWCMode == enabled_t::True || (context->useNHWCMode == enabled_t::Auto && useFP16))
+        useNHWC = true;
+    }
+  }
+
+  if(
+    loadedModel->isTransformer &&
+    transformerPrecision == TransformerPrecision::Float16
+  ) {
+    const string warning =
+      "WARNING: CUDA Transformer fp16 inference may overflow to NaN/Inf on some models or positions. "
+      "This is more likely when the checkpoint was trained with bf16/fp32 or mixed precision. "
+      "Validate raw outputs before relying on fp16.";
+    if(logger != NULL)
+      logger->write(warning);
+    else
+      cerr << warning << endl;
+  }
+
+  ComputeHandle* gpuHandle = new ComputeHandle(
+    context,loadedModel,prop.major,prop.minor,maxBatchSize,requireExactNNLen,inputsUseNHWC,useFP16,useNHWC,transformerPrecision
+  );
   if(logger != NULL) {
     logger->write(
       "Cuda backend thread " + Global::intToString(serverThreadIdx) + ": Found GPU " + string(prop.name)
@@ -3152,16 +4486,16 @@ ComputeHandle* NeuralNet::createComputeHandle(
       "Cuda backend thread " + Global::intToString(serverThreadIdx) + ": Model version " + Global::intToString(loadedModel->modelDesc.modelVersion) +
       " useFP16 = " + Global::boolToString(useFP16) +
       " useNHWC = " + Global::boolToString(useNHWC) +
-      " modelType = " + string(loadedModel->isTransformer ? "transformer" : "cnn")
+      " modelType = " + string(loadedModel->isTransformer ? "transformer" : "cnn") +
+      (loadedModel->isTransformer ?
+        " transformerPrecision = " + string(transformerPrecisionName(transformerPrecision)) +
+        " transformerAttention = " + string(gpuHandle->transformerModel->attentionPathName())
+        : "")
     );
     logger->write(
       "Cuda backend thread " + Global::intToString(serverThreadIdx) + ": Model name: " + loadedModel->modelDesc.name
     );
   }
-
-  ComputeHandle* gpuHandle = new ComputeHandle(
-    context,loadedModel,prop.major,prop.minor,maxBatchSize,requireExactNNLen,inputsUseNHWC,useFP16,useNHWC
-  );
   return gpuHandle;
 }
 

@@ -60,7 +60,9 @@ NNEvaluator::NNEvaluator(
   const string& openCLTunerFile,
   const string& homeDataDirOverride,
   bool openCLReTunePerBoardSize,
+  nn_model_type_t modelType,
   enabled_t useFP16Mode,
+  compute_precision_t precisionMode,
   enabled_t useNHWCMode,
   int numThr,
   const vector<int>& gpuIdxByServerThr,
@@ -76,6 +78,7 @@ NNEvaluator::NNEvaluator(
    policySize(NNPos::getPolicySize(xLen,yLen)),
    inputsUseNHWC(iUseNHWC),
    usingFP16Mode(useFP16Mode),
+   usingPrecisionMode(precisionMode),
    usingNHWCMode(useNHWCMode),
    numThreads(numThr),
    gpuIdxByServerThread(gpuIdxByServerThr),
@@ -134,6 +137,10 @@ NNEvaluator::NNEvaluator(
     auto last = std::unique(gpuIdxs.begin(), gpuIdxs.end());
     gpuIdxs.erase(last,gpuIdxs.end());
     loadedModel = NeuralNet::loadModelFile(modelFileName,expectedSha256);
+    if(modelType == nn_model_type_t::CNN && NeuralNet::isTransformerModel(loadedModel))
+      throw StringError("nnModelType=cnn，但模型文件实际是 transformer: " + modelFileName);
+    if(modelType == nn_model_type_t::TF && !NeuralNet::isTransformerModel(loadedModel))
+      throw StringError("nnModelType=tf，但模型文件实际是 cnn: " + modelFileName);
     const ModelDesc& desc = NeuralNet::getModelDesc(loadedModel);
     internalModelName = desc.name;
     modelVersion = desc.modelVersion;
@@ -143,7 +150,7 @@ NNEvaluator::NNEvaluator(
     computeContext = NeuralNet::createComputeContext(
       gpuIdxs,logger,nnXLen,nnYLen,
       openCLTunerFile,homeDataDirOverride,openCLReTunePerBoardSize,
-      usingFP16Mode,usingNHWCMode,loadedModel
+      usingFP16Mode,usingPrecisionMode,usingNHWCMode,loadedModel
     );
   }
   else {
@@ -290,6 +297,9 @@ double NNEvaluator::getTrunkSpatialConvDepth() const {
 
 enabled_t NNEvaluator::getUsingFP16Mode() const {
   return usingFP16Mode;
+}
+compute_precision_t NNEvaluator::getUsingPrecisionMode() const {
+  return usingPrecisionMode;
 }
 enabled_t NNEvaluator::getUsingNHWCMode() const {
   return usingNHWCMode;

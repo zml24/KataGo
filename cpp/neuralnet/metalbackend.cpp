@@ -551,20 +551,34 @@ const ModelDesc& NeuralNet::getModelDesc(const LoadedModel* loadedModel) {
   return loadedModel->modelDesc;
 }
 
+bool NeuralNet::isTransformerModel(const LoadedModel* loadedModel) {
+  return loadedModel->isTransformer;
+}
+
 //------------------------------------------------------------------------------
 
-ComputeContext::ComputeContext(int nnX, int nnY, enabled_t useFP16Mode, enabled_t useNHWCMode):
+static int32_t transformerPrecisionModeToRaw(compute_precision_t precisionMode) {
+  return
+    precisionMode == compute_precision_t::FP32 ? 0 :
+    precisionMode == compute_precision_t::FP16 ? 1 :
+    precisionMode == compute_precision_t::BF16 ? 2 :
+    3;
+}
+
+ComputeContext::ComputeContext(int nnX, int nnY, enabled_t useFP16Mode, compute_precision_t precisionMode, enabled_t useNHWCMode):
 metalComputeContext(createMetalComputeContext(
   nnX,
   nnY,
   (useFP16Mode == enabled_t::False) ? SWEnable::False() :
   (useFP16Mode == enabled_t::True) ? SWEnable::True() :
   SWEnable::Auto(),
+  transformerPrecisionModeToRaw(precisionMode),
   (useNHWCMode == enabled_t::False) ? SWEnable::False() :
   (useNHWCMode == enabled_t::True) ? SWEnable::True() :
   SWEnable::Auto()
 )) {
   this->useFP16Mode = useFP16Mode;
+  this->precisionMode = precisionMode;
 }
 
 ComputeContext::~ComputeContext() {
@@ -596,6 +610,7 @@ ComputeContext* NeuralNet::createComputeContext(
   const string& homeDataDirOverride,
   bool openCLReTunePerBoardSize,
   enabled_t useFP16Mode,
+  compute_precision_t precisionMode,
   enabled_t useNHWCMode,
   const LoadedModel* loadedModel) {
 
@@ -604,9 +619,32 @@ ComputeContext* NeuralNet::createComputeContext(
   (void)openCLTunerFile;
   (void)homeDataDirOverride;
   (void)openCLReTunePerBoardSize;
-  (void)loadedModel;
+  if(loadedModel != nullptr && loadedModel->isTransformer) {
+    if(precisionMode == compute_precision_t::Auto) {
+      if(useFP16Mode == enabled_t::False)
+        precisionMode = compute_precision_t::FP32;
+      else if(useFP16Mode == enabled_t::True)
+        precisionMode = compute_precision_t::FP16;
+      else
+        precisionMode = metalDeviceSupportsTransformerBFloat16() ? compute_precision_t::BF16 : compute_precision_t::FP16;
+    }
+    if(precisionMode == compute_precision_t::BF16 && !metalDeviceSupportsTransformerBFloat16())
+      throw StringError("Metal backend: 当前设备不支持 Transformer bf16 推理");
+    if(precisionMode == compute_precision_t::FP16)
+      useFP16Mode = enabled_t::True;
+    else
+      useFP16Mode = enabled_t::False;
+  }
+  else {
+    if(precisionMode == compute_precision_t::BF16)
+      throw StringError("Metal backend: cnn 模型不支持显式 bf16 precision");
+    if(precisionMode == compute_precision_t::FP16)
+      useFP16Mode = enabled_t::True;
+    else if(precisionMode == compute_precision_t::FP32)
+      useFP16Mode = enabled_t::False;
+  }
 
-  return new ComputeContext(nnXLen, nnYLen, useFP16Mode, useNHWCMode);
+  return new ComputeContext(nnXLen, nnYLen, useFP16Mode, precisionMode, useNHWCMode);
 }
 
 /**
@@ -659,7 +697,7 @@ metalTransformerHandle(
   /* Use FP16 mode if the model supports it and the user has not explicitly
    * disabled it. */
   useFP16 =
-    isTransformer ? (context->useFP16Mode == enabled_t::True) :
+    isTransformer ? (context->precisionMode == compute_precision_t::FP16) :
     (context->useFP16Mode != enabled_t::False);
 
   (void)serverThreadIdx;
