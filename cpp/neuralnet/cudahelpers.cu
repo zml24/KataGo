@@ -1936,7 +1936,6 @@ void customCudaApplyCScaleBiasNHWC(const half* in, half* out, const half* scale,
 //--------------------------------------------------------------------------------------------------------------
 // Transformer helpers
 
-__global__
 template<typename T>
 __device__ __forceinline__ float transformerToFloat(T value);
 template<>
