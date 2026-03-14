@@ -2394,11 +2394,11 @@ static vector<float> transformerConcatLinearWeightsByOutput(
   int inChannels,
   const vector<int>& outChannelsPerSet
 ) {
-  ASSERT(weightSets.size() == outChannelsPerSet.size());
+  assert(weightSets.size() == outChannelsPerSet.size());
   int totalOutChannels = 0;
   for(size_t i = 0; i < weightSets.size(); i++) {
-    ASSERT(weightSets[i] != nullptr);
-    ASSERT((int)weightSets[i]->size() == inChannels * outChannelsPerSet[i]);
+    assert(weightSets[i] != nullptr);
+    assert((int)weightSets[i]->size() == inChannels * outChannelsPerSet[i]);
     totalOutChannels += outChannelsPerSet[i];
   }
 
@@ -2922,7 +2922,7 @@ struct TransformerLinear {
     const void* lowpInputBuf,
     void* lowpOutputBuf
   ) const {
-    ASSERT(transformerPrecisionUsesLowpStorage(precision));
+    assert(transformerPrecisionUsesLowpStorage(precision));
     cudaDataType_t dtype = transformerPrecisionToCudaType(precision);
 
     cublasLtMatmulDesc_t operationDesc = nullptr;
@@ -3035,7 +3035,7 @@ struct TransformerLinear {
     const void* lowpInputBuf,
     void* lowpOutputBuf
   ) const {
-    ASSERT(transformerPrecisionUsesLowpStorage(precision));
+    assert(transformerPrecisionUsesLowpStorage(precision));
 #ifdef KATAGO_CUBLASLT_AVAILABLE
     if(tryRunLowpMatmulWithCublasLt(cudaHandles, scratch, batchSize, lowpInputBuf, lowpOutputBuf))
       return;
@@ -3331,6 +3331,8 @@ struct TransformerBlock {
     void* workspaceBuf,
     size_t workspaceBytes
   ) const {
+    (void)workspaceBuf;
+    (void)workspaceBytes;
     int tokenCount = batchSize * seqLen;
     size_t residentEltSize = transformerPrecisionElemSize(precision);
     size_t hiddenBytes = (size_t)tokenCount * hiddenSize * residentEltSize;
