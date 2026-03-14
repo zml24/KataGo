@@ -107,19 +107,23 @@ def update_diff_stats(stats, diff):
     stats["maxAbs"] = max(stats["maxAbs"], abs_diff)
 
 
-def compare_scalar(lhs, rhs, stats):
+def compare_scalar(lhs, rhs, stats, named_stats=None):
     diff = float(lhs) - float(rhs)
     update_diff_stats(stats, diff)
+    if named_stats is not None:
+        update_diff_stats(named_stats, diff)
     return abs(diff)
 
 
-def compare_list(lhs, rhs, stats):
+def compare_list(lhs, rhs, stats, named_stats=None):
     if len(lhs) != len(rhs):
         raise ValueError(f"length mismatch: {len(lhs)} vs {len(rhs)}")
     max_abs = 0.0
     for a, b in zip(lhs, rhs):
         diff = float(a) - float(b)
         update_diff_stats(stats, diff)
+        if named_stats is not None:
+            update_diff_stats(named_stats, diff)
         max_abs = max(max_abs, abs(diff))
     return max_abs
 
@@ -141,8 +145,41 @@ def finalize_diff_stats(stats):
     }
 
 
+def ensure_field_stats(field_stats, group_name, field_name):
+    group = field_stats.setdefault(group_name, {})
+    if field_name not in group:
+        group[field_name] = new_diff_stats()
+    return group[field_name]
+
+
+def merge_diff_stats(dst, src):
+    dst["count"] += src["count"]
+    dst["sumAbs"] += src["sumAbs"]
+    dst["sum"] += src["sum"]
+    dst["maxAbs"] = max(dst["maxAbs"], src["maxAbs"])
+
+
+def merge_field_stats(dst, src):
+    for group_name, group in src.items():
+        dst_group = dst.setdefault(group_name, {})
+        for field_name, stats in group.items():
+            if field_name not in dst_group:
+                dst_group[field_name] = new_diff_stats()
+            merge_diff_stats(dst_group[field_name], stats)
+
+
+def finalize_field_stats(field_stats):
+    result = {}
+    for group_name, group in field_stats.items():
+        result[group_name] = {}
+        for field_name, stats in group.items():
+            result[group_name][field_name] = finalize_diff_stats(stats)
+    return result
+
+
 sample_reports = []
 global_stats = new_diff_stats()
+global_field_stats = {}
 
 if len(baseline["samples"]) != len(candidate["samples"]):
     raise ValueError("sample count mismatch")
@@ -153,45 +190,47 @@ for baseline_sample, candidate_sample in zip(baseline["samples"], candidate["sam
             f"sample mismatch: {baseline_sample['name']} vs {candidate_sample['name']}"
         )
 
+    sample_field_stats = {}
     report = {
         "name": baseline_sample["name"],
         "raw": {
-            "policy": compare_list(baseline_sample["raw"]["policy"], candidate_sample["raw"]["policy"], global_stats),
-            "policyPass": compare_list(baseline_sample["raw"]["policyPass"], candidate_sample["raw"]["policyPass"], global_stats),
-            "value": compare_list(baseline_sample["raw"]["value"], candidate_sample["raw"]["value"], global_stats),
-            "scoreValue": compare_list(baseline_sample["raw"]["scoreValue"], candidate_sample["raw"]["scoreValue"], global_stats),
-            "ownership": compare_list(baseline_sample["raw"]["ownership"], candidate_sample["raw"]["ownership"], global_stats),
+            "policy": compare_list(baseline_sample["raw"]["policy"], candidate_sample["raw"]["policy"], global_stats, ensure_field_stats(sample_field_stats, "raw", "policy")),
+            "policyPass": compare_list(baseline_sample["raw"]["policyPass"], candidate_sample["raw"]["policyPass"], global_stats, ensure_field_stats(sample_field_stats, "raw", "policyPass")),
+            "value": compare_list(baseline_sample["raw"]["value"], candidate_sample["raw"]["value"], global_stats, ensure_field_stats(sample_field_stats, "raw", "value")),
+            "scoreValue": compare_list(baseline_sample["raw"]["scoreValue"], candidate_sample["raw"]["scoreValue"], global_stats, ensure_field_stats(sample_field_stats, "raw", "scoreValue")),
+            "ownership": compare_list(baseline_sample["raw"]["ownership"], candidate_sample["raw"]["ownership"], global_stats, ensure_field_stats(sample_field_stats, "raw", "ownership")),
         },
         "nnOutput": {
-            "policyProbs": compare_list(baseline_sample["nnOutput"]["policyProbs"], candidate_sample["nnOutput"]["policyProbs"], global_stats),
-            "whiteOwnerMap": compare_list(baseline_sample["nnOutput"]["whiteOwnerMap"], candidate_sample["nnOutput"]["whiteOwnerMap"], global_stats),
-            "whiteWinProb": compare_scalar(baseline_sample["nnOutput"]["whiteWinProb"], candidate_sample["nnOutput"]["whiteWinProb"], global_stats),
-            "whiteLossProb": compare_scalar(baseline_sample["nnOutput"]["whiteLossProb"], candidate_sample["nnOutput"]["whiteLossProb"], global_stats),
-            "whiteNoResultProb": compare_scalar(baseline_sample["nnOutput"]["whiteNoResultProb"], candidate_sample["nnOutput"]["whiteNoResultProb"], global_stats),
-            "whiteScoreMean": compare_scalar(baseline_sample["nnOutput"]["whiteScoreMean"], candidate_sample["nnOutput"]["whiteScoreMean"], global_stats),
-            "whiteScoreMeanSq": compare_scalar(baseline_sample["nnOutput"]["whiteScoreMeanSq"], candidate_sample["nnOutput"]["whiteScoreMeanSq"], global_stats),
-            "whiteLead": compare_scalar(baseline_sample["nnOutput"]["whiteLead"], candidate_sample["nnOutput"]["whiteLead"], global_stats),
-            "varTimeLeft": compare_scalar(baseline_sample["nnOutput"]["varTimeLeft"], candidate_sample["nnOutput"]["varTimeLeft"], global_stats),
-            "shorttermWinlossError": compare_scalar(baseline_sample["nnOutput"]["shorttermWinlossError"], candidate_sample["nnOutput"]["shorttermWinlossError"], global_stats),
-            "shorttermScoreError": compare_scalar(baseline_sample["nnOutput"]["shorttermScoreError"], candidate_sample["nnOutput"]["shorttermScoreError"], global_stats),
+            "policyProbs": compare_list(baseline_sample["nnOutput"]["policyProbs"], candidate_sample["nnOutput"]["policyProbs"], global_stats, ensure_field_stats(sample_field_stats, "nnOutput", "policyProbs")),
+            "whiteOwnerMap": compare_list(baseline_sample["nnOutput"]["whiteOwnerMap"], candidate_sample["nnOutput"]["whiteOwnerMap"], global_stats, ensure_field_stats(sample_field_stats, "nnOutput", "whiteOwnerMap")),
+            "whiteWinProb": compare_scalar(baseline_sample["nnOutput"]["whiteWinProb"], candidate_sample["nnOutput"]["whiteWinProb"], global_stats, ensure_field_stats(sample_field_stats, "nnOutput", "whiteWinProb")),
+            "whiteLossProb": compare_scalar(baseline_sample["nnOutput"]["whiteLossProb"], candidate_sample["nnOutput"]["whiteLossProb"], global_stats, ensure_field_stats(sample_field_stats, "nnOutput", "whiteLossProb")),
+            "whiteNoResultProb": compare_scalar(baseline_sample["nnOutput"]["whiteNoResultProb"], candidate_sample["nnOutput"]["whiteNoResultProb"], global_stats, ensure_field_stats(sample_field_stats, "nnOutput", "whiteNoResultProb")),
+            "whiteScoreMean": compare_scalar(baseline_sample["nnOutput"]["whiteScoreMean"], candidate_sample["nnOutput"]["whiteScoreMean"], global_stats, ensure_field_stats(sample_field_stats, "nnOutput", "whiteScoreMean")),
+            "whiteScoreMeanSq": compare_scalar(baseline_sample["nnOutput"]["whiteScoreMeanSq"], candidate_sample["nnOutput"]["whiteScoreMeanSq"], global_stats, ensure_field_stats(sample_field_stats, "nnOutput", "whiteScoreMeanSq")),
+            "whiteLead": compare_scalar(baseline_sample["nnOutput"]["whiteLead"], candidate_sample["nnOutput"]["whiteLead"], global_stats, ensure_field_stats(sample_field_stats, "nnOutput", "whiteLead")),
+            "varTimeLeft": compare_scalar(baseline_sample["nnOutput"]["varTimeLeft"], candidate_sample["nnOutput"]["varTimeLeft"], global_stats, ensure_field_stats(sample_field_stats, "nnOutput", "varTimeLeft")),
+            "shorttermWinlossError": compare_scalar(baseline_sample["nnOutput"]["shorttermWinlossError"], candidate_sample["nnOutput"]["shorttermWinlossError"], global_stats, ensure_field_stats(sample_field_stats, "nnOutput", "shorttermWinlossError")),
+            "shorttermScoreError": compare_scalar(baseline_sample["nnOutput"]["shorttermScoreError"], candidate_sample["nnOutput"]["shorttermScoreError"], global_stats, ensure_field_stats(sample_field_stats, "nnOutput", "shorttermScoreError")),
         },
     }
 
     if "rawFull" in baseline_sample and "rawFull" in candidate_sample:
         report["rawFull"] = {
-            "policy": compare_list(baseline_sample["rawFull"]["policy"], candidate_sample["rawFull"]["policy"], global_stats),
-            "policyPass": compare_list(baseline_sample["rawFull"]["policyPass"], candidate_sample["rawFull"]["policyPass"], global_stats),
-            "value": compare_list(baseline_sample["rawFull"]["value"], candidate_sample["rawFull"]["value"], global_stats),
-            "misc": compare_list(baseline_sample["rawFull"]["misc"], candidate_sample["rawFull"]["misc"], global_stats),
-            "moreMisc": compare_list(baseline_sample["rawFull"]["moreMisc"], candidate_sample["rawFull"]["moreMisc"], global_stats),
-            "ownership": compare_list(baseline_sample["rawFull"]["ownership"], candidate_sample["rawFull"]["ownership"], global_stats),
-            "scoring": compare_list(baseline_sample["rawFull"]["scoring"], candidate_sample["rawFull"]["scoring"], global_stats),
-            "futurePos": compare_list(baseline_sample["rawFull"]["futurePos"], candidate_sample["rawFull"]["futurePos"], global_stats),
-            "seki": compare_list(baseline_sample["rawFull"]["seki"], candidate_sample["rawFull"]["seki"], global_stats),
-            "scoreBelief": compare_list(baseline_sample["rawFull"]["scoreBelief"], candidate_sample["rawFull"]["scoreBelief"], global_stats),
+            "policy": compare_list(baseline_sample["rawFull"]["policy"], candidate_sample["rawFull"]["policy"], global_stats, ensure_field_stats(sample_field_stats, "rawFull", "policy")),
+            "policyPass": compare_list(baseline_sample["rawFull"]["policyPass"], candidate_sample["rawFull"]["policyPass"], global_stats, ensure_field_stats(sample_field_stats, "rawFull", "policyPass")),
+            "value": compare_list(baseline_sample["rawFull"]["value"], candidate_sample["rawFull"]["value"], global_stats, ensure_field_stats(sample_field_stats, "rawFull", "value")),
+            "misc": compare_list(baseline_sample["rawFull"]["misc"], candidate_sample["rawFull"]["misc"], global_stats, ensure_field_stats(sample_field_stats, "rawFull", "misc")),
+            "moreMisc": compare_list(baseline_sample["rawFull"]["moreMisc"], candidate_sample["rawFull"]["moreMisc"], global_stats, ensure_field_stats(sample_field_stats, "rawFull", "moreMisc")),
+            "ownership": compare_list(baseline_sample["rawFull"]["ownership"], candidate_sample["rawFull"]["ownership"], global_stats, ensure_field_stats(sample_field_stats, "rawFull", "ownership")),
+            "scoring": compare_list(baseline_sample["rawFull"]["scoring"], candidate_sample["rawFull"]["scoring"], global_stats, ensure_field_stats(sample_field_stats, "rawFull", "scoring")),
+            "futurePos": compare_list(baseline_sample["rawFull"]["futurePos"], candidate_sample["rawFull"]["futurePos"], global_stats, ensure_field_stats(sample_field_stats, "rawFull", "futurePos")),
+            "seki": compare_list(baseline_sample["rawFull"]["seki"], candidate_sample["rawFull"]["seki"], global_stats, ensure_field_stats(sample_field_stats, "rawFull", "seki")),
+            "scoreBelief": compare_list(baseline_sample["rawFull"]["scoreBelief"], candidate_sample["rawFull"]["scoreBelief"], global_stats, ensure_field_stats(sample_field_stats, "rawFull", "scoreBelief")),
         }
 
     sample_reports.append(report)
+    merge_field_stats(global_field_stats, sample_field_stats)
 
 aggregate = finalize_diff_stats(global_stats)
 
@@ -202,6 +241,7 @@ result = {
     "meanAbsErr": aggregate["meanAbsErr"],
     "meanDiff": aggregate["meanDiff"],
     "numComparedValues": aggregate["numComparedValues"],
+    "aggregateByField": finalize_field_stats(global_field_stats),
     "samples": sample_reports,
 }
 
