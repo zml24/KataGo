@@ -3776,31 +3776,36 @@ struct TransformerModel {
             descriptor: descriptor.policyBoard,
             sourceTensor: xFinal,
             outputShape: [-1, seqLen as NSNumber, descriptor.policyBoard.outChannels],
-            computationDataType: stableLinearDataType), to: .float32)
+            computationDataType: .float32,
+            outputDataType: .float32), to: .float32)
         policyPassTensor = castTensorIfNeeded(graph: graph, sourceTensor: transformerLinear(
             graph: graph,
             descriptor: descriptor.policyPass,
             sourceTensor: pooled,
             outputShape: [-1, descriptor.policyPass.outChannels],
-            computationDataType: stableLinearDataType), to: .float32)
+            computationDataType: .float32,
+            outputDataType: .float32), to: .float32)
         valueTensor = castTensorIfNeeded(graph: graph, sourceTensor: transformerLinear(
             graph: graph,
             descriptor: descriptor.value,
             sourceTensor: pooled,
             outputShape: [-1, descriptor.value.outChannels],
-            computationDataType: stableLinearDataType), to: .float32)
+            computationDataType: .float32,
+            outputDataType: .float32), to: .float32)
         scoreValueTensor = castTensorIfNeeded(graph: graph, sourceTensor: transformerLinear(
             graph: graph,
             descriptor: descriptor.scoreValue,
             sourceTensor: pooled,
             outputShape: [-1, descriptor.scoreValue.outChannels],
-            computationDataType: stableLinearDataType), to: .float32)
+            computationDataType: .float32,
+            outputDataType: .float32), to: .float32)
         let ownershipExpanded = transformerLinear(
             graph: graph,
             descriptor: descriptor.ownership,
             sourceTensor: xFinal,
             outputShape: [-1, seqLen as NSNumber, 1],
-            computationDataType: stableLinearDataType)
+            computationDataType: .float32,
+            outputDataType: .float32)
         ownershipTensor = castTensorIfNeeded(
             graph: graph,
             sourceTensor: graph.reshape(ownershipExpanded, shape: [-1, seqLen as NSNumber], name: nil),
@@ -3812,31 +3817,36 @@ struct TransformerModel {
                 descriptor: descriptor.policyBoardFull,
                 sourceTensor: xFinal,
                 outputShape: [-1, seqLen as NSNumber, descriptor.policyBoardFull.outChannels],
-                computationDataType: stableLinearDataType), to: .float32)
+                computationDataType: .float32,
+                outputDataType: .float32), to: .float32)
             fullPolicyPassTensor = castTensorIfNeeded(graph: graph, sourceTensor: transformerLinear(
                 graph: graph,
                 descriptor: descriptor.policyPassFull,
                 sourceTensor: pooled,
                 outputShape: [-1, descriptor.policyPassFull.outChannels],
-                computationDataType: stableLinearDataType), to: .float32)
+                computationDataType: .float32,
+                outputDataType: .float32), to: .float32)
             miscTensor = castTensorIfNeeded(graph: graph, sourceTensor: transformerLinear(
                 graph: graph,
                 descriptor: descriptor.misc,
                 sourceTensor: pooled,
                 outputShape: [-1, descriptor.misc.outChannels],
-                computationDataType: stableLinearDataType), to: .float32)
+                computationDataType: .float32,
+                outputDataType: .float32), to: .float32)
             moreMiscTensor = castTensorIfNeeded(graph: graph, sourceTensor: transformerLinear(
                 graph: graph,
                 descriptor: descriptor.moreMisc,
                 sourceTensor: pooled,
                 outputShape: [-1, descriptor.moreMisc.outChannels],
-                computationDataType: stableLinearDataType), to: .float32)
+                computationDataType: .float32,
+                outputDataType: .float32), to: .float32)
             let scoringExpanded = transformerLinear(
                 graph: graph,
                 descriptor: descriptor.scoring,
                 sourceTensor: xFinal,
                 outputShape: [-1, seqLen as NSNumber, 1],
-                computationDataType: stableLinearDataType)
+                computationDataType: .float32,
+                outputDataType: .float32)
             scoringTensor = castTensorIfNeeded(
                 graph: graph,
                 sourceTensor: graph.reshape(scoringExpanded, shape: [-1, seqLen as NSNumber], name: nil),
@@ -3846,19 +3856,22 @@ struct TransformerModel {
                 descriptor: descriptor.futurePos,
                 sourceTensor: xFinal,
                 outputShape: [-1, seqLen as NSNumber, descriptor.futurePos.outChannels],
-                computationDataType: stableLinearDataType), to: .float32)
+                computationDataType: .float32,
+                outputDataType: .float32), to: .float32)
             sekiTensor = castTensorIfNeeded(graph: graph, sourceTensor: transformerLinear(
                 graph: graph,
                 descriptor: descriptor.seki,
                 sourceTensor: xFinal,
                 outputShape: [-1, seqLen as NSNumber, descriptor.seki.outChannels],
-                computationDataType: stableLinearDataType), to: .float32)
+                computationDataType: .float32,
+                outputDataType: .float32), to: .float32)
             scoreBeliefProjectTensor = castTensorIfNeeded(graph: graph, sourceTensor: transformerLinear(
                 graph: graph,
                 descriptor: descriptor.scoreBelief,
                 sourceTensor: pooled,
                 outputShape: [-1, descriptor.scoreBelief.outChannels],
-                computationDataType: stableLinearDataType), to: .float32)
+                computationDataType: .float32,
+                outputDataType: .float32), to: .float32)
             fullTargets = [
                 fullPolicyPassTensor!,
                 fullPolicyTensor!,
