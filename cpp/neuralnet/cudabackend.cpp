@@ -3753,28 +3753,29 @@ struct TransformerModel {
 
     finalNorm = std::make_unique<TransformerRMSNorm>(name + "_final_norm", desc->finalNormWeight, precision);
 
-    policyBoard = std::make_unique<TransformerLinear>(cudaHandles, name + "_policy_board", hiddenSize, 2, desc->policyBoardWeight, precision);
-    policyPass = std::make_unique<TransformerLinear>(cudaHandles, name + "_policy_pass", hiddenSize, 2, desc->policyPassWeight, precision);
+    // All head linear layers use FP32 precision for numerical accuracy (matching training behavior).
+    policyBoard = std::make_unique<TransformerLinear>(cudaHandles, name + "_policy_board", hiddenSize, 2, desc->policyBoardWeight, TransformerPrecision::Float32);
+    policyPass = std::make_unique<TransformerLinear>(cudaHandles, name + "_policy_pass", hiddenSize, 2, desc->policyPassWeight, TransformerPrecision::Float32);
     if(!desc->policyBoardFullWeight.empty()) {
-      policyBoardFull = std::make_unique<TransformerLinear>(cudaHandles, name + "_policy_board_full", hiddenSize, numFullPolicyChannels, desc->policyBoardFullWeight, precision);
-      policyPassFull = std::make_unique<TransformerLinear>(cudaHandles, name + "_policy_pass_full", hiddenSize, numFullPolicyChannels, desc->policyPassFullWeight, precision);
-      miscHead = std::make_unique<TransformerLinear>(cudaHandles, name + "_misc", hiddenSize, numMiscChannels, desc->miscWeight, precision);
-      moreMiscHead = std::make_unique<TransformerLinear>(cudaHandles, name + "_moremisc", hiddenSize, numMoreMiscChannels, desc->moreMiscWeight, precision);
-      scoringHead = std::make_unique<TransformerLinear>(cudaHandles, name + "_scoring", hiddenSize, numScoringChannels, desc->scoringWeight, precision);
-      futurePosHead = std::make_unique<TransformerLinear>(cudaHandles, name + "_futurepos", hiddenSize, numFuturePosChannels, desc->futurePosWeight, precision);
-      sekiHead = std::make_unique<TransformerLinear>(cudaHandles, name + "_seki", hiddenSize, numSekiChannels, desc->sekiWeight, precision);
+      policyBoardFull = std::make_unique<TransformerLinear>(cudaHandles, name + "_policy_board_full", hiddenSize, numFullPolicyChannels, desc->policyBoardFullWeight, TransformerPrecision::Float32);
+      policyPassFull = std::make_unique<TransformerLinear>(cudaHandles, name + "_policy_pass_full", hiddenSize, numFullPolicyChannels, desc->policyPassFullWeight, TransformerPrecision::Float32);
+      miscHead = std::make_unique<TransformerLinear>(cudaHandles, name + "_misc", hiddenSize, numMiscChannels, desc->miscWeight, TransformerPrecision::Float32);
+      moreMiscHead = std::make_unique<TransformerLinear>(cudaHandles, name + "_moremisc", hiddenSize, numMoreMiscChannels, desc->moreMiscWeight, TransformerPrecision::Float32);
+      scoringHead = std::make_unique<TransformerLinear>(cudaHandles, name + "_scoring", hiddenSize, numScoringChannels, desc->scoringWeight, TransformerPrecision::Float32);
+      futurePosHead = std::make_unique<TransformerLinear>(cudaHandles, name + "_futurepos", hiddenSize, numFuturePosChannels, desc->futurePosWeight, TransformerPrecision::Float32);
+      sekiHead = std::make_unique<TransformerLinear>(cudaHandles, name + "_seki", hiddenSize, numSekiChannels, desc->sekiWeight, TransformerPrecision::Float32);
       if(scoreBeliefProjectSize > 0) {
         if(scoreMode == 0)
-          scoreBeliefHead = std::make_unique<TransformerLinear>(cudaHandles, name + "_scorebelief_simple", hiddenSize, scoreBeliefProjectSize, desc->scoreBeliefSimpleWeight, precision);
+          scoreBeliefHead = std::make_unique<TransformerLinear>(cudaHandles, name + "_scorebelief_simple", hiddenSize, scoreBeliefProjectSize, desc->scoreBeliefSimpleWeight, TransformerPrecision::Float32);
         else
-          scoreBeliefHead = std::make_unique<TransformerLinear>(cudaHandles, name + "_scorebelief_mix", hiddenSize, scoreBeliefProjectSize, desc->scoreBeliefMixWeight, precision);
+          scoreBeliefHead = std::make_unique<TransformerLinear>(cudaHandles, name + "_scorebelief_mix", hiddenSize, scoreBeliefProjectSize, desc->scoreBeliefMixWeight, TransformerPrecision::Float32);
       }
       scoreBeliefS2OffWeight = desc->scoreBeliefS2OffWeight;
       scoreBeliefS2ParWeight = desc->scoreBeliefS2ParWeight;
     }
-    valueHead = std::make_unique<TransformerLinear>(cudaHandles, name + "_value", hiddenSize, 3, desc->valueWeight, precision);
-    scoreValueHead = std::make_unique<TransformerLinear>(cudaHandles, name + "_scorevalue", hiddenSize, 6, desc->scoreValueWeight, precision);
-    ownershipHead = std::make_unique<TransformerLinear>(cudaHandles, name + "_ownership", hiddenSize, 1, desc->ownershipWeight, precision);
+    valueHead = std::make_unique<TransformerLinear>(cudaHandles, name + "_value", hiddenSize, 3, desc->valueWeight, TransformerPrecision::Float32);
+    scoreValueHead = std::make_unique<TransformerLinear>(cudaHandles, name + "_scorevalue", hiddenSize, 6, desc->scoreValueWeight, TransformerPrecision::Float32);
+    ownershipHead = std::make_unique<TransformerLinear>(cudaHandles, name + "_ownership", hiddenSize, 1, desc->ownershipWeight, TransformerPrecision::Float32);
   }
 
   ~TransformerModel() {
@@ -3859,22 +3860,33 @@ struct TransformerModel {
 
     finalNorm->apply(tokenCount, xBuf.buf, xBuf.buf);
 
-    policyBoard->applyWithLowpInput(cudaHandles, scratch, tokenCount, xBuf.buf, policyBuf);
-    if(precision == TransformerPrecision::Float32)
+    // Match training behavior: convert final activations to FP32 before output heads.
+    if(precision != TransformerPrecision::Float32) {
+      SizedBuf<void*> xFP32Buf(scratch->allocator, (size_t)tokenCount * hiddenSize * sizeof(float));
+      SizedBuf<void*> pooledFP32Buf(scratch->allocator, (size_t)batchSize * hiddenSize * sizeof(float));
+      transformerCopyPrecisionToFloat(xBuf.buf, reinterpret_cast<float*>(xFP32Buf.buf), tokenCount * hiddenSize, precision);
+      CUDA_ERR(name.c_str(), cudaPeekAtLastError());
+
+      policyBoard->applyWithLowpInput(cudaHandles, scratch, tokenCount, xFP32Buf.buf, policyBuf);
+      ownershipHead->applyWithLowpInput(cudaHandles, scratch, tokenCount, xFP32Buf.buf, ownershipBuf);
+
+      customCudaMeanPoolNLC(reinterpret_cast<float*>(xFP32Buf.buf), reinterpret_cast<float*>(pooledFP32Buf.buf), batchSize, seqLen, hiddenSize);
+      CUDA_ERR(name.c_str(), cudaPeekAtLastError());
+
+      policyPass->applyWithLowpInput(cudaHandles, scratch, batchSize, pooledFP32Buf.buf, policyPassBuf);
+      valueHead->applyWithLowpInput(cudaHandles, scratch, batchSize, pooledFP32Buf.buf, valueBuf);
+      scoreValueHead->applyWithLowpInput(cudaHandles, scratch, batchSize, pooledFP32Buf.buf, scoreValueBuf);
+    } else {
+      policyBoard->applyWithLowpInput(cudaHandles, scratch, tokenCount, xBuf.buf, policyBuf);
+      ownershipHead->applyWithLowpInput(cudaHandles, scratch, tokenCount, xBuf.buf, ownershipBuf);
+
       customCudaMeanPoolNLC(reinterpret_cast<float*>(xBuf.buf), reinterpret_cast<float*>(pooledBuf.buf), batchSize, seqLen, hiddenSize);
-    else if(precision == TransformerPrecision::Float16)
-      customCudaMeanPoolNLC(reinterpret_cast<half*>(xBuf.buf), reinterpret_cast<half*>(pooledBuf.buf), batchSize, seqLen, hiddenSize);
-#ifdef KATAGO_CUDA_BFLOAT16_AVAILABLE
-    else if(precision == TransformerPrecision::BFloat16)
-      customCudaMeanPoolNLC(reinterpret_cast<bfloat16_t*>(xBuf.buf), reinterpret_cast<bfloat16_t*>(pooledBuf.buf), batchSize, seqLen, hiddenSize);
-#endif
-    else
-      ASSERT_UNREACHABLE;
-    CUDA_ERR(name.c_str(), cudaPeekAtLastError());
-    policyPass->applyWithLowpInput(cudaHandles, scratch, batchSize, pooledBuf.buf, policyPassBuf);
-    valueHead->applyWithLowpInput(cudaHandles, scratch, batchSize, pooledBuf.buf, valueBuf);
-    scoreValueHead->applyWithLowpInput(cudaHandles, scratch, batchSize, pooledBuf.buf, scoreValueBuf);
-    ownershipHead->applyWithLowpInput(cudaHandles, scratch, tokenCount, xBuf.buf, ownershipBuf);
+      CUDA_ERR(name.c_str(), cudaPeekAtLastError());
+
+      policyPass->applyWithLowpInput(cudaHandles, scratch, batchSize, pooledBuf.buf, policyPassBuf);
+      valueHead->applyWithLowpInput(cudaHandles, scratch, batchSize, pooledBuf.buf, valueBuf);
+      scoreValueHead->applyWithLowpInput(cudaHandles, scratch, batchSize, pooledBuf.buf, scoreValueBuf);
+    }
   }
 
   void applyFull(
@@ -3930,27 +3942,43 @@ struct TransformerModel {
 
     finalNorm->apply(tokenCount, xBuf.buf, xBuf.buf);
 
-    policyBoardFull->applyWithLowpInput(cudaHandles, scratch, tokenCount, xBuf.buf, policyFullBuf);
-    ownershipHead->applyWithLowpInput(cudaHandles, scratch, tokenCount, xBuf.buf, ownershipBuf);
-    scoringHead->applyWithLowpInput(cudaHandles, scratch, tokenCount, xBuf.buf, scoringBuf);
-    futurePosHead->applyWithLowpInput(cudaHandles, scratch, tokenCount, xBuf.buf, futurePosBuf);
-    sekiHead->applyWithLowpInput(cudaHandles, scratch, tokenCount, xBuf.buf, sekiBuf);
-    if(precision == TransformerPrecision::Float32)
+    // Match training behavior: convert final activations to FP32 before output heads.
+    if(precision != TransformerPrecision::Float32) {
+      SizedBuf<void*> xFP32Buf(scratch->allocator, (size_t)tokenCount * hiddenSize * sizeof(float));
+      SizedBuf<void*> pooledFP32Buf(scratch->allocator, (size_t)batchSize * hiddenSize * sizeof(float));
+      transformerCopyPrecisionToFloat(xBuf.buf, reinterpret_cast<float*>(xFP32Buf.buf), tokenCount * hiddenSize, precision);
+      CUDA_ERR(name.c_str(), cudaPeekAtLastError());
+
+      policyBoardFull->applyWithLowpInput(cudaHandles, scratch, tokenCount, xFP32Buf.buf, policyFullBuf);
+      ownershipHead->applyWithLowpInput(cudaHandles, scratch, tokenCount, xFP32Buf.buf, ownershipBuf);
+      scoringHead->applyWithLowpInput(cudaHandles, scratch, tokenCount, xFP32Buf.buf, scoringBuf);
+      futurePosHead->applyWithLowpInput(cudaHandles, scratch, tokenCount, xFP32Buf.buf, futurePosBuf);
+      sekiHead->applyWithLowpInput(cudaHandles, scratch, tokenCount, xFP32Buf.buf, sekiBuf);
+
+      customCudaMeanPoolNLC(reinterpret_cast<float*>(xFP32Buf.buf), reinterpret_cast<float*>(pooledFP32Buf.buf), batchSize, seqLen, hiddenSize);
+      CUDA_ERR(name.c_str(), cudaPeekAtLastError());
+
+      policyPassFull->applyWithLowpInput(cudaHandles, scratch, batchSize, pooledFP32Buf.buf, policyPassFullBuf);
+      valueHead->applyWithLowpInput(cudaHandles, scratch, batchSize, pooledFP32Buf.buf, valueBuf);
+      miscHead->applyWithLowpInput(cudaHandles, scratch, batchSize, pooledFP32Buf.buf, miscBuf);
+      moreMiscHead->applyWithLowpInput(cudaHandles, scratch, batchSize, pooledFP32Buf.buf, moreMiscBuf);
+      scoreBeliefHead->applyWithLowpInput(cudaHandles, scratch, batchSize, pooledFP32Buf.buf, scoreBeliefProjectBuf);
+    } else {
+      policyBoardFull->applyWithLowpInput(cudaHandles, scratch, tokenCount, xBuf.buf, policyFullBuf);
+      ownershipHead->applyWithLowpInput(cudaHandles, scratch, tokenCount, xBuf.buf, ownershipBuf);
+      scoringHead->applyWithLowpInput(cudaHandles, scratch, tokenCount, xBuf.buf, scoringBuf);
+      futurePosHead->applyWithLowpInput(cudaHandles, scratch, tokenCount, xBuf.buf, futurePosBuf);
+      sekiHead->applyWithLowpInput(cudaHandles, scratch, tokenCount, xBuf.buf, sekiBuf);
+
       customCudaMeanPoolNLC(reinterpret_cast<float*>(xBuf.buf), reinterpret_cast<float*>(pooledBuf.buf), batchSize, seqLen, hiddenSize);
-    else if(precision == TransformerPrecision::Float16)
-      customCudaMeanPoolNLC(reinterpret_cast<half*>(xBuf.buf), reinterpret_cast<half*>(pooledBuf.buf), batchSize, seqLen, hiddenSize);
-#ifdef KATAGO_CUDA_BFLOAT16_AVAILABLE
-    else if(precision == TransformerPrecision::BFloat16)
-      customCudaMeanPoolNLC(reinterpret_cast<bfloat16_t*>(xBuf.buf), reinterpret_cast<bfloat16_t*>(pooledBuf.buf), batchSize, seqLen, hiddenSize);
-#endif
-    else
-      ASSERT_UNREACHABLE;
-    CUDA_ERR(name.c_str(), cudaPeekAtLastError());
-    policyPassFull->applyWithLowpInput(cudaHandles, scratch, batchSize, pooledBuf.buf, policyPassFullBuf);
-    valueHead->applyWithLowpInput(cudaHandles, scratch, batchSize, pooledBuf.buf, valueBuf);
-    miscHead->applyWithLowpInput(cudaHandles, scratch, batchSize, pooledBuf.buf, miscBuf);
-    moreMiscHead->applyWithLowpInput(cudaHandles, scratch, batchSize, pooledBuf.buf, moreMiscBuf);
-    scoreBeliefHead->applyWithLowpInput(cudaHandles, scratch, batchSize, pooledBuf.buf, scoreBeliefProjectBuf);
+      CUDA_ERR(name.c_str(), cudaPeekAtLastError());
+
+      policyPassFull->applyWithLowpInput(cudaHandles, scratch, batchSize, pooledBuf.buf, policyPassFullBuf);
+      valueHead->applyWithLowpInput(cudaHandles, scratch, batchSize, pooledBuf.buf, valueBuf);
+      miscHead->applyWithLowpInput(cudaHandles, scratch, batchSize, pooledBuf.buf, miscBuf);
+      moreMiscHead->applyWithLowpInput(cudaHandles, scratch, batchSize, pooledBuf.buf, moreMiscBuf);
+      scoreBeliefHead->applyWithLowpInput(cudaHandles, scratch, batchSize, pooledBuf.buf, scoreBeliefProjectBuf);
+    }
   }
 };
 

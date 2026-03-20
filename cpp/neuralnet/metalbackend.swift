@@ -3769,40 +3769,42 @@ struct TransformerModel {
         }
 
         let xFinal = transformerRMSNorm(graph: graph, sourceTensor: x, descriptor: descriptor.finalNorm)
-        let pooled = transformerMeanPool(graph: graph, sourceTensor: xFinal, seqLen: seqLen)
+        // Match training behavior: convert final activations to FP32 before output heads.
+        let xFinalFP32 = castTensorIfNeeded(graph: graph, sourceTensor: xFinal, to: .float32)
+        let pooledFP32 = transformerMeanPool(graph: graph, sourceTensor: xFinalFP32, seqLen: seqLen)
 
         policyTensor = castTensorIfNeeded(graph: graph, sourceTensor: transformerLinear(
             graph: graph,
             descriptor: descriptor.policyBoard,
-            sourceTensor: xFinal,
+            sourceTensor: xFinalFP32,
             outputShape: [-1, seqLen as NSNumber, descriptor.policyBoard.outChannels],
             computationDataType: .float32,
             outputDataType: .float32), to: .float32)
         policyPassTensor = castTensorIfNeeded(graph: graph, sourceTensor: transformerLinear(
             graph: graph,
             descriptor: descriptor.policyPass,
-            sourceTensor: pooled,
+            sourceTensor: pooledFP32,
             outputShape: [-1, descriptor.policyPass.outChannels],
             computationDataType: .float32,
             outputDataType: .float32), to: .float32)
         valueTensor = castTensorIfNeeded(graph: graph, sourceTensor: transformerLinear(
             graph: graph,
             descriptor: descriptor.value,
-            sourceTensor: pooled,
+            sourceTensor: pooledFP32,
             outputShape: [-1, descriptor.value.outChannels],
             computationDataType: .float32,
             outputDataType: .float32), to: .float32)
         scoreValueTensor = castTensorIfNeeded(graph: graph, sourceTensor: transformerLinear(
             graph: graph,
             descriptor: descriptor.scoreValue,
-            sourceTensor: pooled,
+            sourceTensor: pooledFP32,
             outputShape: [-1, descriptor.scoreValue.outChannels],
             computationDataType: .float32,
             outputDataType: .float32), to: .float32)
         let ownershipExpanded = transformerLinear(
             graph: graph,
             descriptor: descriptor.ownership,
-            sourceTensor: xFinal,
+            sourceTensor: xFinalFP32,
             outputShape: [-1, seqLen as NSNumber, 1],
             computationDataType: .float32,
             outputDataType: .float32)
@@ -3815,35 +3817,35 @@ struct TransformerModel {
             fullPolicyTensor = castTensorIfNeeded(graph: graph, sourceTensor: transformerLinear(
                 graph: graph,
                 descriptor: descriptor.policyBoardFull,
-                sourceTensor: xFinal,
+                sourceTensor: xFinalFP32,
                 outputShape: [-1, seqLen as NSNumber, descriptor.policyBoardFull.outChannels],
                 computationDataType: .float32,
                 outputDataType: .float32), to: .float32)
             fullPolicyPassTensor = castTensorIfNeeded(graph: graph, sourceTensor: transformerLinear(
                 graph: graph,
                 descriptor: descriptor.policyPassFull,
-                sourceTensor: pooled,
+                sourceTensor: pooledFP32,
                 outputShape: [-1, descriptor.policyPassFull.outChannels],
                 computationDataType: .float32,
                 outputDataType: .float32), to: .float32)
             miscTensor = castTensorIfNeeded(graph: graph, sourceTensor: transformerLinear(
                 graph: graph,
                 descriptor: descriptor.misc,
-                sourceTensor: pooled,
+                sourceTensor: pooledFP32,
                 outputShape: [-1, descriptor.misc.outChannels],
                 computationDataType: .float32,
                 outputDataType: .float32), to: .float32)
             moreMiscTensor = castTensorIfNeeded(graph: graph, sourceTensor: transformerLinear(
                 graph: graph,
                 descriptor: descriptor.moreMisc,
-                sourceTensor: pooled,
+                sourceTensor: pooledFP32,
                 outputShape: [-1, descriptor.moreMisc.outChannels],
                 computationDataType: .float32,
                 outputDataType: .float32), to: .float32)
             let scoringExpanded = transformerLinear(
                 graph: graph,
                 descriptor: descriptor.scoring,
-                sourceTensor: xFinal,
+                sourceTensor: xFinalFP32,
                 outputShape: [-1, seqLen as NSNumber, 1],
                 computationDataType: .float32,
                 outputDataType: .float32)
@@ -3854,21 +3856,21 @@ struct TransformerModel {
             futurePosTensor = castTensorIfNeeded(graph: graph, sourceTensor: transformerLinear(
                 graph: graph,
                 descriptor: descriptor.futurePos,
-                sourceTensor: xFinal,
+                sourceTensor: xFinalFP32,
                 outputShape: [-1, seqLen as NSNumber, descriptor.futurePos.outChannels],
                 computationDataType: .float32,
                 outputDataType: .float32), to: .float32)
             sekiTensor = castTensorIfNeeded(graph: graph, sourceTensor: transformerLinear(
                 graph: graph,
                 descriptor: descriptor.seki,
-                sourceTensor: xFinal,
+                sourceTensor: xFinalFP32,
                 outputShape: [-1, seqLen as NSNumber, descriptor.seki.outChannels],
                 computationDataType: .float32,
                 outputDataType: .float32), to: .float32)
             scoreBeliefProjectTensor = castTensorIfNeeded(graph: graph, sourceTensor: transformerLinear(
                 graph: graph,
                 descriptor: descriptor.scoreBelief,
-                sourceTensor: pooled,
+                sourceTensor: pooledFP32,
                 outputShape: [-1, descriptor.scoreBelief.outChannels],
                 computationDataType: .float32,
                 outputDataType: .float32), to: .float32)
