@@ -14,6 +14,7 @@
 #include "../neuralnet/nneval.h"
 #include "../neuralnet/nninputs.h"
 #include "../neuralnet/nninterface.h"
+#include "../neuralnet/transformerdesc.h"
 
 using namespace std;
 using namespace nvinfer1;
@@ -87,11 +88,39 @@ void NeuralNet::freeComputeContext(ComputeContext* computeContext) {
 }
 
 struct LoadedModel {
+  bool isTransformer;
   ModelDesc modelDesc;
+  std::unique_ptr<TransformerModelDesc> transformerDesc;
 
   LoadedModel(const string& fileName, const string& expectedSha256) {
-    ModelDesc::loadFromFileMaybeGZipped(fileName, modelDesc, expectedSha256);
-    modelDesc.applyScale8ToReduceActivations();
+    transformerDesc = std::make_unique<TransformerModelDesc>();
+    if(TransformerModelDesc::tryLoadFromFileMaybeGZipped(fileName, expectedSha256, *transformerDesc)) {
+      isTransformer = true;
+      modelDesc.name = transformerDesc->name;
+      modelDesc.sha256 = transformerDesc->sha256;
+      modelDesc.modelVersion = transformerDesc->modelVersion;
+      modelDesc.numInputChannels = transformerDesc->numInputChannels;
+      modelDesc.numInputGlobalChannels = transformerDesc->numInputGlobalChannels;
+      modelDesc.numInputMetaChannels = 0;
+      modelDesc.numPolicyChannels = 2;
+      modelDesc.numValueChannels = 3;
+      modelDesc.numScoreValueChannels = 6;
+      modelDesc.numOwnershipChannels = 1;
+      modelDesc.metaEncoderVersion = 0;
+      modelDesc.postProcessParams = transformerDesc->postProcessParams;
+      modelDesc.trunk.trunkNumChannels = transformerDesc->hiddenSize;
+      modelDesc.trunk.numBlocks = transformerDesc->numLayers;
+      modelDesc.trunk.initialConv.convXSize = transformerDesc->stemKernelSize;
+      modelDesc.trunk.initialConv.convYSize = transformerDesc->stemKernelSize;
+      modelDesc.trunk.initialConv.inChannels = transformerDesc->numInputChannels;
+      modelDesc.trunk.initialConv.outChannels = transformerDesc->hiddenSize;
+    }
+    else {
+      isTransformer = false;
+      transformerDesc.reset();
+      ModelDesc::loadFromFileMaybeGZipped(fileName, modelDesc, expectedSha256);
+      modelDesc.applyScale8ToReduceActivations();
+    }
   }
 
   LoadedModel() = delete;
@@ -113,7 +142,7 @@ const ModelDesc& NeuralNet::getModelDesc(const LoadedModel* loadedModel) {
 }
 
 bool NeuralNet::isTransformerModel(const LoadedModel* loadedModel) {
-  return false;
+  return loadedModel->isTransformer;
 }
 
 struct TRTModel {
@@ -125,6 +154,7 @@ struct TRTModel {
   // TensorRT keeps only reference to weights before engine is built
   const LoadedModel* rawModel;
   vector<unique_ptr<float[]>> extraWeights;
+  vector<unique_ptr<int32_t[]>> extraIntWeights;
 
   int modelVersion;
   uint8_t tuneHash[32];
@@ -986,6 +1016,783 @@ struct ModelParser {
   }
 };
 
+//--------------------------------------------------------------
+// TransformerModelParser: Builds a TRT network for Transformer models
+//--------------------------------------------------------------
+
+struct TransformerModelParser {
+  unique_ptr<TRTModel> model;
+
+  ITensor* inputMask;
+  ITensor* inputSpatial;
+  ITensor* inputGlobal;
+
+  string tuneDesc;
+
+  static constexpr int tuneSalt = 7;
+
+  // Store weight data that must outlive network building
+  Weights makeWeights(const vector<float>& data) {
+    return Weights{DataType::kFLOAT, data.data(), (int64_t)data.size()};
+  }
+
+  Weights makeWeights(const float* data, int64_t count) {
+    return Weights{DataType::kFLOAT, data, count};
+  }
+
+  unique_ptr<TRTModel> build(
+    unique_ptr<INetworkDefinition> net,
+    IOptimizationProfile* profile,
+    const LoadedModel* rawModel,
+    int nnXLen,
+    int nnYLen,
+    int maxBatchSize,
+    bool requireExactNNLen) {
+    model = make_unique<TRTModel>();
+
+    model->nnXLen = nnXLen;
+    model->nnYLen = nnYLen;
+    model->profile = profile;
+    model->network = move(net);
+    model->rawModel = rawModel;
+    model->maxBatchSize = maxBatchSize;
+    model->requireExactNNLen = requireExactNNLen;
+
+    auto& network = model->network;
+    const TransformerModelDesc* desc = rawModel->transformerDesc.get();
+
+    int posLen = desc->posLen;
+    int hiddenSize = desc->hiddenSize;
+    int numHeads = desc->numHeads;
+    int numLayers = desc->numLayers;
+
+    if(desc->modelVersion != 15)
+      throw StringError("TensorRT Transformer backend currently only supports model version 15");
+    if(!requireExactNNLen)
+      throw StringError("TensorRT Transformer backend requires requireExactNNLen=true");
+    if(nnXLen != posLen || nnYLen != posLen)
+      throw StringError("TensorRT Transformer backend requires nnXLen == nnYLen == posLen");
+
+    tuneDesc = Global::strprintf(
+      R"|("salt"(%d)"transformer"(%d,%d,%d,%d,%d,%d,%d))|",
+      tuneSalt,
+      desc->modelVersion,
+      desc->numInputChannels,
+      desc->numInputGlobalChannels,
+      hiddenSize,
+      numHeads,
+      numLayers,
+      desc->ffnDim
+    );
+
+    model->modelVersion = desc->modelVersion;
+    network->setName(desc->name.c_str());
+
+    initInputs(desc);
+
+    int seqLen = posLen * posLen;
+    ITensor* stem = buildStem(desc, seqLen);
+    ITensor* trunk = buildTransformerBlocks(stem, desc, seqLen);
+    ITensor* normed = buildRMSNorm(trunk, desc->finalNormWeight, hiddenSize, "final_norm");
+
+    // Mean pool: [N, L, C] → [N, C]
+    auto poolLayer = network->addReduce(*normed, ReduceOperation::kAVG, 1U << 1, false);
+    poolLayer->setName("mean_pool");
+    poolLayer->setPrecision(DataType::kFLOAT);
+    poolLayer->setOutputType(0, DataType::kFLOAT);
+    ITensor* pooled = poolLayer->getOutput(0);  // [N, C]
+
+    buildTransformerPolicyHead(normed, pooled, desc, seqLen);
+    buildTransformerValueHead(normed, pooled, desc, seqLen);
+
+    // Build full head outputs if the model supports them
+    if(!desc->policyBoardFullWeight.empty())
+      buildTransformerFullHeads(normed, pooled, desc, seqLen);
+
+    SHA2::get256(tuneDesc.c_str(), model->tuneHash);
+
+    return move(model);
+  }
+
+  void initInputs(const TransformerModelDesc* desc) {
+    auto profile = model->profile;
+    auto& network = model->network;
+
+    int nnXLen = model->nnXLen;
+    int nnYLen = model->nnYLen;
+    int numInputChannels = desc->numInputChannels;
+    int numInputGlobalChannels = desc->numInputGlobalChannels;
+
+    int numFeatures = NNModelVersion::getNumSpatialFeatures(desc->modelVersion);
+    if(numInputChannels != numFeatures)
+      throw StringError(Global::strprintf(
+        "Transformer net numInputChannels (%d) was not the expected number based on version (%d)",
+        numInputChannels, numFeatures));
+    int numGlobalFeatures = NNModelVersion::getNumGlobalFeatures(desc->modelVersion);
+    if(numInputGlobalChannels != numGlobalFeatures)
+      throw StringError(Global::strprintf(
+        "Transformer net numInputGlobalChannels (%d) was not the expected number based on version (%d)",
+        numInputGlobalChannels, numGlobalFeatures));
+
+    // InputMask: still registered to keep buffer interface consistent with CNN
+    inputMask = network->addInput("InputMask", DataType::kFLOAT, {4, {-1, 1, nnYLen, nnXLen}});
+    inputMask->setAllowedFormats(1U << static_cast<int>(TensorFormat::kLINEAR));
+    profile->setDimensions("InputMask", OptProfileSelector::kMIN, Dims4(1, 1, nnYLen, nnXLen));
+    profile->setDimensions("InputMask", OptProfileSelector::kOPT, Dims4(model->maxBatchSize, 1, nnYLen, nnXLen));
+    profile->setDimensions("InputMask", OptProfileSelector::kMAX, Dims4(model->maxBatchSize, 1, nnYLen, nnXLen));
+
+    inputSpatial = network->addInput("InputSpatial", DataType::kFLOAT, {4, {-1, numInputChannels, nnYLen, nnXLen}});
+    inputSpatial->setAllowedFormats(1U << static_cast<int>(TensorFormat::kLINEAR));
+    profile->setDimensions("InputSpatial", OptProfileSelector::kMIN, Dims4(1, numInputChannels, nnYLen, nnXLen));
+    profile->setDimensions("InputSpatial", OptProfileSelector::kOPT, Dims4(model->maxBatchSize, numInputChannels, nnYLen, nnXLen));
+    profile->setDimensions("InputSpatial", OptProfileSelector::kMAX, Dims4(model->maxBatchSize, numInputChannels, nnYLen, nnXLen));
+
+    inputGlobal = network->addInput("InputGlobal", DataType::kFLOAT, {4, {-1, numInputGlobalChannels, 1, 1}});
+    inputGlobal->setAllowedFormats(1U << static_cast<int>(TensorFormat::kLINEAR));
+    profile->setDimensions("InputGlobal", OptProfileSelector::kMIN, Dims4(1, numInputGlobalChannels, 1, 1));
+    profile->setDimensions("InputGlobal", OptProfileSelector::kOPT, Dims4(model->maxBatchSize, numInputGlobalChannels, 1, 1));
+    profile->setDimensions("InputGlobal", OptProfileSelector::kMAX, Dims4(model->maxBatchSize, numInputGlobalChannels, 1, 1));
+  }
+
+  // --- Primitive operations ---
+
+  ITensor* buildRMSNorm(ITensor* input, const vector<float>& weight, int channels, const string& name) {
+    auto& network = model->network;
+    // input: [N, L, C]
+    // square = input * input
+    auto squareLayer = network->addElementWise(*input, *input, ElementWiseOperation::kPROD);
+    squareLayer->setName((name + "/square").c_str());
+    squareLayer->setPrecision(DataType::kFLOAT);
+
+    // meanSq = reduce_mean(square, axis=2, keepDim=true) → [N, L, 1]
+    auto meanSqLayer = network->addReduce(*squareLayer->getOutput(0), ReduceOperation::kAVG, 1U << 2, true);
+    meanSqLayer->setName((name + "/meanSq").c_str());
+    meanSqLayer->setPrecision(DataType::kFLOAT);
+
+    // eps constant
+    auto epsData = make_unique<float[]>(1);
+    epsData[0] = 1e-6f;
+    auto epsLayer = network->addConstant({3, {1, 1, 1}}, makeWeights(epsData.get(), 1));
+    epsLayer->setName((name + "/eps").c_str());
+    model->extraWeights.push_back(move(epsData));
+
+    // meanSqEps = meanSq + eps
+    auto addEpsLayer = network->addElementWise(*meanSqLayer->getOutput(0), *epsLayer->getOutput(0), ElementWiseOperation::kSUM);
+    addEpsLayer->setName((name + "/addEps").c_str());
+    addEpsLayer->setPrecision(DataType::kFLOAT);
+
+    // rsqrt = 1/sqrt(meanSqEps)
+    auto sqrtLayer = network->addUnary(*addEpsLayer->getOutput(0), UnaryOperation::kSQRT);
+    sqrtLayer->setName((name + "/sqrt").c_str());
+    sqrtLayer->setPrecision(DataType::kFLOAT);
+
+    auto recipLayer = network->addUnary(*sqrtLayer->getOutput(0), UnaryOperation::kRECIP);
+    recipLayer->setName((name + "/recip").c_str());
+    recipLayer->setPrecision(DataType::kFLOAT);
+
+    // normalized = input * rsqrt
+    auto normLayer = network->addElementWise(*input, *recipLayer->getOutput(0), ElementWiseOperation::kPROD);
+    normLayer->setName((name + "/norm").c_str());
+    normLayer->setPrecision(DataType::kFLOAT);
+
+    // weight constant [1, 1, C]
+    auto weightLayer = network->addConstant({3, {1, 1, channels}}, makeWeights(weight));
+    weightLayer->setName((name + "/weight").c_str());
+
+    // output = normalized * weight
+    auto scaleLayer = network->addElementWise(*normLayer->getOutput(0), *weightLayer->getOutput(0), ElementWiseOperation::kPROD);
+    scaleLayer->setName((name + "/scale").c_str());
+    scaleLayer->setPrecision(DataType::kFLOAT);
+
+    return scaleLayer->getOutput(0);
+  }
+
+  // Linear: input [N, ..., inDim] @ weight [inDim, outDim] → [N, ..., outDim]
+  ITensor* buildLinear(ITensor* input, const vector<float>& weight, int inDim, int outDim,
+                       const string& name, bool forceFP32 = false) {
+    auto& network = model->network;
+    auto weightLayer = network->addConstant({2, {inDim, outDim}}, makeWeights(weight));
+    weightLayer->setName((name + "/weight").c_str());
+
+    auto matmulLayer = network->addMatrixMultiply(*input, MatrixOperation::kNONE, *weightLayer->getOutput(0), MatrixOperation::kNONE);
+    matmulLayer->setName(name.c_str());
+    if(forceFP32) {
+      matmulLayer->setPrecision(DataType::kFLOAT);
+      matmulLayer->setOutputType(0, DataType::kFLOAT);
+    }
+    return matmulLayer->getOutput(0);
+  }
+
+  ITensor* buildLinearWithBias(ITensor* input, const vector<float>& weight, const vector<float>& bias,
+                               int inDim, int outDim, int ndim, const string& name, bool forceFP32 = false) {
+    auto& network = model->network;
+    ITensor* out = buildLinear(input, weight, inDim, outDim, name, forceFP32);
+
+    if(!bias.empty()) {
+      // Create bias constant with appropriate shape for broadcasting
+      // For 3D input [N, L, outDim]: bias shape [1, 1, outDim]
+      // For 2D input [N, outDim]: bias shape [1, outDim]
+      Dims biasDims;
+      if(ndim == 3) {
+        biasDims = Dims3(1, 1, outDim);
+      } else {
+        biasDims = Dims2(1, outDim);
+      }
+      auto biasLayer = network->addConstant(biasDims, makeWeights(bias));
+      biasLayer->setName((name + "/bias").c_str());
+
+      auto addLayer = network->addElementWise(*out, *biasLayer->getOutput(0), ElementWiseOperation::kSUM);
+      addLayer->setName((name + "/addBias").c_str());
+      if(forceFP32) {
+        addLayer->setPrecision(DataType::kFLOAT);
+        addLayer->setOutputType(0, DataType::kFLOAT);
+      }
+      out = addLayer->getOutput(0);
+    }
+
+    return out;
+  }
+
+  // Apply RoPE to Q and K tensors
+  // q, k: [N, L, numHeads, headDim]
+  // Returns pair of rotated (q, k)
+  pair<ITensor*, ITensor*> buildRoPE(ITensor* q, ITensor* k,
+    const vector<float>& ropeCos, const vector<float>& ropeSin,
+    int seqLen, int numHeads, int headDim, const string& name) {
+    auto& network = model->network;
+    int halfDim = headDim / 2;
+
+    // cos/sin constants: [1, seqLen, 1, headDim]
+    auto cosLayer = network->addConstant({4, {1, seqLen, 1, headDim}}, makeWeights(ropeCos));
+    cosLayer->setName((name + "/cos").c_str());
+    auto sinLayer = network->addConstant({4, {1, seqLen, 1, headDim}}, makeWeights(ropeSin));
+    sinLayer->setName((name + "/sin").c_str());
+
+    auto applyRoPEToOne = [&](ITensor* x, const string& prefix) -> ITensor* {
+      // x: [N, L, H, D]
+      // Split into two halves along last dim
+      auto x1 = network->addSlice(*x, {4, {0, 0, 0, 0}}, {4, {0, 0, 0, halfDim}}, {4, {1, 1, 1, 1}});
+      x1->setName((prefix + "/x1").c_str());
+      x1->setMode(SampleMode::kSTRICT_BOUNDS);
+      // Use -1 for batch dim, 0 for seq and heads to copy from input
+      x1->setInput(1, *network->addConstant({4, {4}}, Weights{DataType::kINT32, nullptr, 0})->getOutput(0));
+
+      auto x2 = network->addSlice(*x, {4, {0, 0, 0, halfDim}}, {4, {0, 0, 0, halfDim}}, {4, {1, 1, 1, 1}});
+      x2->setName((prefix + "/x2").c_str());
+      x2->setMode(SampleMode::kSTRICT_BOUNDS);
+
+      // Actually, we need dynamic slicing. Let's use a simpler approach with Shuffle + Split
+      // Alternative: Use elementwise with pre-built rotation matrices
+      // Simpler approach: x_rot = concat(-x2, x1, axis=3)
+      // Then output = x * cos + x_rot * sin
+
+      // neg_x2
+      auto negLayer = network->addUnary(*x2->getOutput(0), UnaryOperation::kNEG);
+      negLayer->setName((prefix + "/neg_x2").c_str());
+
+      // rotated = concat(-x2, x1, axis=3)
+      ITensor* concatInputs[2] = {negLayer->getOutput(0), x1->getOutput(0)};
+      auto concatLayer = network->addConcatenation(concatInputs, 2);
+      concatLayer->setAxis(3);
+      concatLayer->setName((prefix + "/rotated").c_str());
+
+      // x * cos
+      auto xCosLayer = network->addElementWise(*x, *cosLayer->getOutput(0), ElementWiseOperation::kPROD);
+      xCosLayer->setName((prefix + "/xCos").c_str());
+
+      // rotated * sin
+      auto rotSinLayer = network->addElementWise(*concatLayer->getOutput(0), *sinLayer->getOutput(0), ElementWiseOperation::kPROD);
+      rotSinLayer->setName((prefix + "/rotSin").c_str());
+
+      // output = x*cos + rotated*sin
+      auto addLayer = network->addElementWise(*xCosLayer->getOutput(0), *rotSinLayer->getOutput(0), ElementWiseOperation::kSUM);
+      addLayer->setName((prefix + "/add").c_str());
+
+      return addLayer->getOutput(0);
+    };
+
+    // Problem: Slice with dynamic batch won't work well with fixed start/size.
+    // Better approach: reshape to [..., 2, halfDim], use gather/shuffle to swap, then reshape back.
+    // Actually, the simplest correct approach for TRT:
+    // Since the last dim is static (headDim), we can use Slice with static params but dynamic batch.
+    // TRT Slice supports dynamic first dims when the slice is on a static dim.
+    // Let's fix the slice - we need to set the size correctly for dynamic dims.
+
+    // Actually, let me reconsider. With TRT, for Slice on static dims, we can use:
+    // start = {0, 0, 0, 0}, size = {-1, -1, -1, halfDim} where -1 means "copy from input"
+    // But TRT Slice doesn't support -1 in size directly. We need to use setInput for dynamic sizes.
+
+    // Simpler approach: use Shuffle to reshape [N, L, H, D] → [N, L, H, 2, halfDim]
+    // then use Slice/Gather to split, and reshape back.
+
+    // Even simpler: just build the rotation using elementwise operations on the full tensor.
+    // x_rot[..., i] = -x[..., i + halfDim] for i < halfDim
+    // x_rot[..., i] = x[..., i - halfDim] for i >= halfDim
+    // This can be done with a shuffle permutation on the reshaped tensor.
+
+    // Let me use a different approach that avoids slicing:
+    // Reshape [N, L, H, D] → [N, L, H, 2, halfDim]
+    // Flip the '2' dimension and negate one half
+
+    // Actually, the cleanest TRT approach:
+    // Build a constant permutation/sign tensor of shape [1, 1, 1, D]:
+    // sign = [-1, -1, ..., -1, 1, 1, ..., 1] (first halfDim are -1, last halfDim are 1)
+    // perm_indices to roll by halfDim
+
+    // Let me just use the reshape + transpose approach.
+
+    // Reset - implement properly without Slice (which has dynamic dim issues):
+
+    auto buildRotation = [&](ITensor* x, const string& prefix) -> ITensor* {
+      // x: [N, L, H, D] where D = headDim
+      // We want: rotated[..., :halfDim] = -x[..., halfDim:]
+      //          rotated[..., halfDim:] = x[..., :halfDim]
+
+      // Reshape to [N, L, H, 2, halfDim]
+      auto reshapeLayer = network->addShuffle(*x);
+      reshapeLayer->setReshapeDimensions({5, {0, 0, 0, 2, halfDim}});
+      reshapeLayer->setName((prefix + "/reshape5d").c_str());
+
+      // Flip along axis 3 (the '2' dimension): [0,1] → [1,0]
+      // Use Slice with start=[0,0,0,1,0], size=[0,0,0,1,0] for second half, then concat
+      // Actually, even simpler: we can build the sign vector and multiply.
+
+      // Alternative clean approach:
+      // Reshape back to [N, L, H, D]
+      // Build sign tensor [1, 1, 1, D]: [-1]*halfDim + [1]*halfDim
+      // Build index-shifted version via reshape + roll
+
+      // The clearest approach for TRT: Reshape [N,L,H,2,halfDim] → transpose(3,4) won't help.
+      // Let me use: gather along dim3 with indices [1, 0] to swap the two halves.
+      auto indicesData = make_unique<int32_t[]>(2);
+      indicesData[0] = 1;
+      indicesData[1] = 0;
+      auto indicesLayer = network->addConstant({1, {2}}, Weights{DataType::kINT32, indicesData.get(), 2});
+      indicesLayer->setName((prefix + "/swapIdx").c_str());
+      model->extraIntWeights.push_back(move(indicesData));
+
+      auto gatherLayer = network->addGather(*reshapeLayer->getOutput(0), *indicesLayer->getOutput(0), 3);
+      gatherLayer->setName((prefix + "/swap").c_str());
+      // gatherLayer output: [N, L, H, 2, halfDim] with the two halves swapped
+
+      // Reshape back to [N, L, H, D]
+      auto reshapeBackLayer = network->addShuffle(*gatherLayer->getOutput(0));
+      reshapeBackLayer->setReshapeDimensions({4, {0, 0, 0, headDim}});
+      reshapeBackLayer->setName((prefix + "/reshape4d").c_str());
+
+      // Build sign tensor: [1, 1, 1, D] with [-1]*halfDim + [1]*halfDim
+      // After swap, the layout is [second_half, first_half].
+      // We want [-second_half, first_half], so sign = [-1]*halfDim + [1]*halfDim
+      auto signData = make_unique<float[]>(headDim);
+      for(int i = 0; i < halfDim; i++) signData[i] = -1.0f;
+      for(int i = halfDim; i < headDim; i++) signData[i] = 1.0f;
+      auto signLayer = network->addConstant({4, {1, 1, 1, headDim}}, makeWeights(signData.get(), headDim));
+      signLayer->setName((prefix + "/sign").c_str());
+      model->extraWeights.push_back(move(signData));
+
+      // rotated = swapped * sign
+      auto mulSignLayer = network->addElementWise(*reshapeBackLayer->getOutput(0), *signLayer->getOutput(0), ElementWiseOperation::kPROD);
+      mulSignLayer->setName((prefix + "/mulSign").c_str());
+
+      return mulSignLayer->getOutput(0);
+    };
+
+    auto applyRoPE = [&](ITensor* x, const string& prefix) -> ITensor* {
+      ITensor* rotated = buildRotation(x, prefix);
+
+      // x * cos
+      auto xCosLayer = network->addElementWise(*x, *cosLayer->getOutput(0), ElementWiseOperation::kPROD);
+      xCosLayer->setName((prefix + "/xCos").c_str());
+
+      // rotated * sin
+      auto rotSinLayer = network->addElementWise(*rotated, *sinLayer->getOutput(0), ElementWiseOperation::kPROD);
+      rotSinLayer->setName((prefix + "/rotSin").c_str());
+
+      // output = x*cos + rotated*sin
+      auto addLayer = network->addElementWise(*xCosLayer->getOutput(0), *rotSinLayer->getOutput(0), ElementWiseOperation::kSUM);
+      addLayer->setName((prefix + "/rope").c_str());
+
+      return addLayer->getOutput(0);
+    };
+
+    ITensor* qOut = applyRoPE(q, name + "/q");
+    ITensor* kOut = applyRoPE(k, name + "/k");
+    return {qOut, kOut};
+  }
+
+  // Multi-head attention using manual MatMul + Softmax
+  // Q, K, V: [N, numHeads, seqLen, headDim] (already transposed)
+  ITensor* buildAttention(ITensor* Q, ITensor* K, ITensor* V,
+    int numHeads, int headDim, int seqLen, const string& name) {
+    auto& network = model->network;
+
+    // scores = Q @ K^T → [N, H, L, L]
+    auto scoresLayer = network->addMatrixMultiply(*Q, MatrixOperation::kNONE, *K, MatrixOperation::kTRANSPOSE);
+    scoresLayer->setName((name + "/scores").c_str());
+
+    // scale = 1/sqrt(headDim)
+    float scaleVal = 1.0f / sqrtf((float)headDim);
+    auto scaleData = make_unique<float[]>(1);
+    scaleData[0] = scaleVal;
+    auto scaleLayer = network->addConstant({4, {1, 1, 1, 1}}, makeWeights(scaleData.get(), 1));
+    scaleLayer->setName((name + "/scaleConst").c_str());
+    model->extraWeights.push_back(move(scaleData));
+
+    auto scaledLayer = network->addElementWise(*scoresLayer->getOutput(0), *scaleLayer->getOutput(0), ElementWiseOperation::kPROD);
+    scaledLayer->setName((name + "/scaled").c_str());
+
+    // softmax over last dim (axis=3)
+    auto softmaxLayer = network->addSoftMax(*scaledLayer->getOutput(0));
+    softmaxLayer->setAxes(1U << 3);
+    softmaxLayer->setName((name + "/softmax").c_str());
+
+    // attn = weights @ V → [N, H, L, D]
+    auto attnLayer = network->addMatrixMultiply(*softmaxLayer->getOutput(0), MatrixOperation::kNONE, *V, MatrixOperation::kNONE);
+    attnLayer->setName((name + "/attn").c_str());
+
+    return attnLayer->getOutput(0);
+  }
+
+  // Build stem: spatial conv + global linear + NCHW→NLC + position embedding
+  ITensor* buildStem(const TransformerModelDesc* desc, int seqLen) {
+    auto& network = model->network;
+    int hiddenSize = desc->hiddenSize;
+    int numInputChannels = desc->numInputChannels;
+    int numInputGlobalChannels = desc->numInputGlobalChannels;
+    int posLen = desc->posLen;
+    int kernelSize = desc->stemKernelSize;
+    int padding = kernelSize / 2;
+
+    // Stem conv: [N, numInputChannels, H, W] → [N, hiddenSize, H, W]
+    // stemConvWeight is in PyTorch format [OC, IC, kH, kW] which matches TRT expectation
+    auto stemConvLayer = network->addConvolutionNd(
+      *inputSpatial, hiddenSize, {2, {kernelSize, kernelSize}}, makeWeights(desc->stemConvWeight),
+      Weights{DataType::kFLOAT, nullptr, 0});
+    stemConvLayer->setName("stem/conv");
+    stemConvLayer->setPaddingNd({2, {padding, padding}});
+
+    // Reshape NCHW → NLC: [N, C, H, W] → [N, C, L] → [N, L, C]
+    auto reshapeLayer = network->addShuffle(*stemConvLayer->getOutput(0));
+    reshapeLayer->setReshapeDimensions({3, {0, hiddenSize, seqLen}});
+    reshapeLayer->setSecondTranspose({0, 2, 1});
+    reshapeLayer->setName("stem/nchw_to_nlc");
+
+    // Global linear: [N, G, 1, 1] → [N, G] → matmul → [N, C]
+    auto globalReshapeLayer = network->addShuffle(*inputGlobal);
+    globalReshapeLayer->setReshapeDimensions({2, {0, numInputGlobalChannels}});
+    globalReshapeLayer->setName("stem/global_reshape");
+
+    auto globalWeightLayer = network->addConstant({2, {numInputGlobalChannels, hiddenSize}}, makeWeights(desc->stemGlobalWeight));
+    globalWeightLayer->setName("stem/global_weight");
+
+    auto globalMatmulLayer = network->addMatrixMultiply(
+      *globalReshapeLayer->getOutput(0), MatrixOperation::kNONE,
+      *globalWeightLayer->getOutput(0), MatrixOperation::kNONE);
+    globalMatmulLayer->setName("stem/global_matmul");
+
+    // Reshape [N, C] → [N, 1, C] for broadcast addition
+    auto globalExpandLayer = network->addShuffle(*globalMatmulLayer->getOutput(0));
+    globalExpandLayer->setReshapeDimensions({3, {0, 1, hiddenSize}});
+    globalExpandLayer->setName("stem/global_expand");
+
+    // Add global bias to spatial: [N, L, C] + [N, 1, C]
+    auto addGlobalLayer = network->addElementWise(
+      *reshapeLayer->getOutput(0), *globalExpandLayer->getOutput(0), ElementWiseOperation::kSUM);
+    addGlobalLayer->setName("stem/add_global");
+
+    ITensor* output = addGlobalLayer->getOutput(0);
+
+    // Add position embedding if present
+    if(desc->hasPosEmbed) {
+      auto posEmbedLayer = network->addConstant({3, {1, seqLen, hiddenSize}}, makeWeights(desc->posEmbed));
+      posEmbedLayer->setName("stem/pos_embed");
+
+      auto addPosLayer = network->addElementWise(*output, *posEmbedLayer->getOutput(0), ElementWiseOperation::kSUM);
+      addPosLayer->setName("stem/add_pos");
+      output = addPosLayer->getOutput(0);
+    }
+
+    return output;
+  }
+
+  // Build all transformer blocks
+  ITensor* buildTransformerBlocks(ITensor* input, const TransformerModelDesc* desc, int seqLen) {
+    auto& network = model->network;
+    int hiddenSize = desc->hiddenSize;
+    int numHeads = desc->numHeads;
+    int headDim = desc->headDim;
+    int ffnDim = desc->ffnDim;
+
+    ITensor* x = input;
+
+    for(int i = 0; i < desc->numLayers; i++) {
+      const TransformerBlockDesc& block = desc->blocks[i];
+      string prefix = "block" + to_string(i);
+
+      // --- Self-Attention sub-block ---
+      ITensor* normed = buildRMSNorm(x, block.norm1Weight, hiddenSize, prefix + "/norm1");
+
+      // Q, K, V projections: [N, L, C] → [N, L, C]
+      ITensor* q = buildLinear(normed, block.qWeight, hiddenSize, hiddenSize, prefix + "/q_proj");
+      ITensor* k = buildLinear(normed, block.kWeight, hiddenSize, hiddenSize, prefix + "/k_proj");
+      ITensor* v = buildLinear(normed, block.vWeight, hiddenSize, hiddenSize, prefix + "/v_proj");
+
+      // Reshape to [N, L, numHeads, headDim]
+      auto qReshape = network->addShuffle(*q);
+      qReshape->setReshapeDimensions({4, {0, seqLen, numHeads, headDim}});
+      qReshape->setName((prefix + "/q_reshape").c_str());
+
+      auto kReshape = network->addShuffle(*k);
+      kReshape->setReshapeDimensions({4, {0, seqLen, numHeads, headDim}});
+      kReshape->setName((prefix + "/k_reshape").c_str());
+
+      // Apply RoPE on [N, L, H, D]
+      auto [qRoped, kRoped] = buildRoPE(
+        qReshape->getOutput(0), kReshape->getOutput(0),
+        desc->ropeCos, desc->ropeSin,
+        seqLen, numHeads, headDim, prefix + "/rope");
+
+      // Transpose Q, K to [N, H, L, D]
+      auto qTranspose = network->addShuffle(*qRoped);
+      qTranspose->setFirstTranspose({0, 2, 1, 3});
+      qTranspose->setName((prefix + "/q_transpose").c_str());
+
+      auto kTranspose = network->addShuffle(*kRoped);
+      kTranspose->setFirstTranspose({0, 2, 1, 3});
+      kTranspose->setName((prefix + "/k_transpose").c_str());
+
+      // V: reshape [N, L, C] → [N, L, H, D] → transpose [N, H, L, D]
+      auto vReshape = network->addShuffle(*v);
+      vReshape->setReshapeDimensions({4, {0, seqLen, numHeads, headDim}});
+      vReshape->setName((prefix + "/v_reshape").c_str());
+
+      auto vTranspose = network->addShuffle(*vReshape->getOutput(0));
+      vTranspose->setFirstTranspose({0, 2, 1, 3});
+      vTranspose->setName((prefix + "/v_transpose").c_str());
+
+      // Attention: [N, H, L, D] → [N, H, L, D]
+      ITensor* attnOut = buildAttention(
+        qTranspose->getOutput(0), kTranspose->getOutput(0), vTranspose->getOutput(0),
+        numHeads, headDim, seqLen, prefix + "/attn");
+
+      // Transpose back [N, H, L, D] → [N, L, H, D] → reshape [N, L, C]
+      auto attnTranspose = network->addShuffle(*attnOut);
+      attnTranspose->setFirstTranspose({0, 2, 1, 3});
+      attnTranspose->setReshapeDimensions({3, {0, seqLen, hiddenSize}});
+      attnTranspose->setName((prefix + "/attn_transpose").c_str());
+
+      // Output projection: [N, L, C] → [N, L, C]
+      ITensor* outProj = buildLinear(attnTranspose->getOutput(0), block.outWeight, hiddenSize, hiddenSize, prefix + "/out_proj");
+
+      // Residual connection
+      auto residual1 = network->addElementWise(*x, *outProj, ElementWiseOperation::kSUM);
+      residual1->setName((prefix + "/residual1").c_str());
+      x = residual1->getOutput(0);
+
+      // --- FFN sub-block (SwiGLU) ---
+      ITensor* normed2 = buildRMSNorm(x, block.norm2Weight, hiddenSize, prefix + "/norm2");
+
+      // w1: [N, L, C] → [N, L, ffnDim]
+      ITensor* w1Out = buildLinear(normed2, block.ffnW1Weight, hiddenSize, ffnDim, prefix + "/ffn_w1");
+      // gate: [N, L, C] → [N, L, ffnDim]
+      ITensor* gateOut = buildLinear(normed2, block.ffnWGateWeight, hiddenSize, ffnDim, prefix + "/ffn_wgate");
+
+      // SiLU(w1) = w1 * sigmoid(w1)
+      auto sigmoidLayer = network->addActivation(*w1Out, ActivationType::kSIGMOID);
+      sigmoidLayer->setName((prefix + "/ffn_sigmoid").c_str());
+
+      auto siluLayer = network->addElementWise(*w1Out, *sigmoidLayer->getOutput(0), ElementWiseOperation::kPROD);
+      siluLayer->setName((prefix + "/ffn_silu").c_str());
+
+      // gated = SiLU(w1) * gate
+      auto gatedLayer = network->addElementWise(*siluLayer->getOutput(0), *gateOut, ElementWiseOperation::kPROD);
+      gatedLayer->setName((prefix + "/ffn_gated").c_str());
+
+      // w2: [N, L, ffnDim] → [N, L, C]
+      ITensor* ffnOut = buildLinear(gatedLayer->getOutput(0), block.ffnW2Weight, ffnDim, hiddenSize, prefix + "/ffn_w2");
+
+      // Residual connection
+      auto residual2 = network->addElementWise(*x, *ffnOut, ElementWiseOperation::kSUM);
+      residual2->setName((prefix + "/residual2").c_str());
+      x = residual2->getOutput(0);
+    }
+
+    return x;
+  }
+
+  void buildTransformerPolicyHead(ITensor* seqOutput, ITensor* pooled,
+    const TransformerModelDesc* desc, int seqLen) {
+    auto& network = model->network;
+    int hiddenSize = desc->hiddenSize;
+    int nnXLen = model->nnXLen;
+    int nnYLen = model->nnYLen;
+
+    // Policy board: seqOutput [N, L, C] → [N, L, 2]
+    ITensor* policyBoard = buildLinearWithBias(seqOutput, desc->policyBoardWeight, desc->policyBoardBias,
+      hiddenSize, 2, 3, "policy_board", true);
+
+    // NLC → NCHW: [N, L, 2] → transpose [N, 2, L] → reshape [N, 2, H, W]
+    auto policyBoardShuffle = network->addShuffle(*policyBoard);
+    policyBoardShuffle->setFirstTranspose({0, 2, 1});
+    policyBoardShuffle->setReshapeDimensions({4, {0, 2, nnYLen, nnXLen}});
+    policyBoardShuffle->setName("policy_board/to_nchw");
+
+    auto policyBoardOutput = policyBoardShuffle->getOutput(0);
+    network->markOutput(*policyBoardOutput);
+    policyBoardOutput->setName("OutputPolicy");
+    policyBoardOutput->setType(DataType::kFLOAT);
+    policyBoardOutput->setAllowedFormats(1U << static_cast<int>(TensorFormat::kLINEAR));
+
+    // Policy pass: pooled [N, C] → [N, 2]
+    ITensor* policyPass = buildLinearWithBias(pooled, desc->policyPassWeight, desc->policyPassBias,
+      hiddenSize, 2, 2, "policy_pass", true);
+
+    auto policyPassShuffle = network->addShuffle(*policyPass);
+    policyPassShuffle->setReshapeDimensions({4, {0, 2, 1, 1}});
+    policyPassShuffle->setName("policy_pass/reshape");
+
+    auto policyPassOutput = policyPassShuffle->getOutput(0);
+    network->markOutput(*policyPassOutput);
+    policyPassOutput->setName("OutputPolicyPass");
+    policyPassOutput->setType(DataType::kFLOAT);
+    policyPassOutput->setAllowedFormats(1U << static_cast<int>(TensorFormat::kLINEAR));
+  }
+
+  void buildTransformerValueHead(ITensor* seqOutput, ITensor* pooled,
+    const TransformerModelDesc* desc, int seqLen) {
+    auto& network = model->network;
+    int hiddenSize = desc->hiddenSize;
+    int nnXLen = model->nnXLen;
+    int nnYLen = model->nnYLen;
+
+    // Value: pooled [N, C] → [N, 3]
+    ITensor* value = buildLinearWithBias(pooled, desc->valueWeight, desc->valueBias,
+      hiddenSize, 3, 2, "value", true);
+
+    auto valueShuffle = network->addShuffle(*value);
+    valueShuffle->setReshapeDimensions({4, {0, 3, 1, 1}});
+    valueShuffle->setName("value/reshape");
+
+    auto valueOutput = valueShuffle->getOutput(0);
+    network->markOutput(*valueOutput);
+    valueOutput->setName("OutputValue");
+    valueOutput->setType(DataType::kFLOAT);
+    valueOutput->setAllowedFormats(1U << static_cast<int>(TensorFormat::kLINEAR));
+
+    // ScoreValue: pooled [N, C] → [N, 6]
+    ITensor* scoreValue = buildLinearWithBias(pooled, desc->scoreValueWeight, desc->scoreValueBias,
+      hiddenSize, 6, 2, "scorevalue", true);
+
+    auto scoreValueShuffle = network->addShuffle(*scoreValue);
+    scoreValueShuffle->setReshapeDimensions({4, {0, 6, 1, 1}});
+    scoreValueShuffle->setName("scorevalue/reshape");
+
+    auto scoreValueOutput = scoreValueShuffle->getOutput(0);
+    network->markOutput(*scoreValueOutput);
+    scoreValueOutput->setName("OutputScoreValue");
+    scoreValueOutput->setType(DataType::kFLOAT);
+    scoreValueOutput->setAllowedFormats(1U << static_cast<int>(TensorFormat::kLINEAR));
+
+    // Ownership: seqOutput [N, L, C] → [N, L, 1]
+    ITensor* ownership = buildLinearWithBias(seqOutput, desc->ownershipWeight, desc->ownershipBias,
+      hiddenSize, 1, 3, "ownership", true);
+
+    // NLC → NCHW: [N, L, 1] → transpose [N, 1, L] → reshape [N, 1, H, W]
+    auto ownershipShuffle = network->addShuffle(*ownership);
+    ownershipShuffle->setFirstTranspose({0, 2, 1});
+    ownershipShuffle->setReshapeDimensions({4, {0, 1, nnYLen, nnXLen}});
+    ownershipShuffle->setName("ownership/to_nchw");
+
+    auto ownershipOutput = ownershipShuffle->getOutput(0);
+    network->markOutput(*ownershipOutput);
+    ownershipOutput->setName("OutputOwnership");
+    ownershipOutput->setType(DataType::kFLOAT);
+    ownershipOutput->setAllowedFormats(1U << static_cast<int>(TensorFormat::kLINEAR));
+  }
+
+  // Helper to mark an NLC spatial output: [N, L, C] → [N, C, H, W]
+  void markSpatialOutput(ITensor* nlcTensor, int channels, const string& name) {
+    auto& network = model->network;
+    int nnXLen = model->nnXLen;
+    int nnYLen = model->nnYLen;
+    auto shuffle = network->addShuffle(*nlcTensor);
+    shuffle->setFirstTranspose({0, 2, 1});
+    shuffle->setReshapeDimensions({4, {0, channels, nnYLen, nnXLen}});
+    shuffle->setName((name + "/to_nchw").c_str());
+    auto out = shuffle->getOutput(0);
+    network->markOutput(*out);
+    out->setName(name.c_str());
+    out->setType(DataType::kFLOAT);
+    out->setAllowedFormats(1U << static_cast<int>(TensorFormat::kLINEAR));
+  }
+
+  // Helper to mark a pooled (global) output: [N, C] → [N, C, 1, 1]
+  void markGlobalOutput(ITensor* tensor, int channels, const string& name) {
+    auto& network = model->network;
+    auto shuffle = network->addShuffle(*tensor);
+    shuffle->setReshapeDimensions({4, {0, channels, 1, 1}});
+    shuffle->setName((name + "/reshape").c_str());
+    auto out = shuffle->getOutput(0);
+    network->markOutput(*out);
+    out->setName(name.c_str());
+    out->setType(DataType::kFLOAT);
+    out->setAllowedFormats(1U << static_cast<int>(TensorFormat::kLINEAR));
+  }
+
+  void buildTransformerFullHeads(ITensor* seqOutput, ITensor* pooled,
+    const TransformerModelDesc* desc, int seqLen) {
+    int hiddenSize = desc->hiddenSize;
+
+    // Full policy board: [N, L, 6]
+    ITensor* fullPolicyBoard = buildLinearWithBias(seqOutput, desc->policyBoardFullWeight, desc->policyBoardFullBias,
+      hiddenSize, 6, 3, "full_policy_board", true);
+    markSpatialOutput(fullPolicyBoard, 6, "OutputFullPolicyBoard");
+
+    // Full policy pass: [N, 6]
+    ITensor* fullPolicyPass = buildLinearWithBias(pooled, desc->policyPassFullWeight, desc->policyPassFullBias,
+      hiddenSize, 6, 2, "full_policy_pass", true);
+    markGlobalOutput(fullPolicyPass, 6, "OutputFullPolicyPass");
+
+    // Misc: [N, 10]
+    ITensor* misc = buildLinearWithBias(pooled, desc->miscWeight, desc->miscBias,
+      hiddenSize, 10, 2, "misc", true);
+    markGlobalOutput(misc, 10, "OutputMisc");
+
+    // MoreMisc: [N, 8]
+    ITensor* moreMisc = buildLinearWithBias(pooled, desc->moreMiscWeight, desc->moreMiscBias,
+      hiddenSize, 8, 2, "moremisc", true);
+    markGlobalOutput(moreMisc, 8, "OutputMoreMisc");
+
+    // Scoring: [N, L, 1]
+    ITensor* scoring = buildLinearWithBias(seqOutput, desc->scoringWeight, desc->scoringBias,
+      hiddenSize, 1, 3, "scoring", true);
+    markSpatialOutput(scoring, 1, "OutputScoring");
+
+    // FuturePos: [N, L, 2]
+    ITensor* futurePos = buildLinearWithBias(seqOutput, desc->futurePosWeight, desc->futurePosBias,
+      hiddenSize, 2, 3, "futurepos", true);
+    markSpatialOutput(futurePos, 2, "OutputFuturePos");
+
+    // Seki: [N, L, 4]
+    ITensor* seki = buildLinearWithBias(seqOutput, desc->sekiWeight, desc->sekiBias,
+      hiddenSize, 4, 3, "seki", true);
+    markSpatialOutput(seki, 4, "OutputSeki");
+
+    // ScoreBelief: depends on scoreMode
+    if(desc->scoreMode == 0 && !desc->scoreBeliefSimpleWeight.empty()) {
+      ITensor* scoreBelief = buildLinearWithBias(pooled, desc->scoreBeliefSimpleWeight, desc->scoreBeliefSimpleBias,
+        hiddenSize, desc->scoreBeliefLen, 2, "scorebelief", true);
+      markGlobalOutput(scoreBelief, desc->scoreBeliefLen, "OutputScoreBelief");
+    }
+    else if(!desc->scoreBeliefMixWeight.empty()) {
+      int mixOutDim = desc->scoreBeliefLen * desc->numScoreBeliefs + desc->numScoreBeliefs;
+      ITensor* scoreBelief = buildLinearWithBias(pooled, desc->scoreBeliefMixWeight, desc->scoreBeliefMixBias,
+        hiddenSize, mixOutDim, 2, "scorebelief", true);
+      markGlobalOutput(scoreBelief, mixOutDim, "OutputScoreBelief");
+    }
+  }
+};
+
 struct TRTLogger : ILogger {
   Logger* logger;
   Severity level;
@@ -1090,6 +1897,8 @@ struct TRTErrorRecorder : IErrorRecorder {
 struct ComputeHandle {
   ComputeContext* ctx;
 
+  bool isTransformer;
+  const TransformerModelDesc* transformerDesc;  // non-owning, valid while LoadedModel lives
   bool usingFP16;
   int maxBatchSize;
   int modelVersion;
@@ -1111,6 +1920,8 @@ struct ComputeHandle {
     bool requireExactNNLen) {
     ctx = context;
 
+    isTransformer = loadedModel->isTransformer;
+    transformerDesc = isTransformer ? loadedModel->transformerDesc.get() : nullptr;
     maxBatchSize = maxBatchSz;
     modelVersion = loadedModel->modelDesc.modelVersion;
 
@@ -1152,9 +1963,18 @@ struct ComputeHandle {
     if(!profile) {
       throw StringError("TensorRT backend: failed to create optimization profile");
     }
-    auto modelParser = make_unique<ModelParser>();
-    auto model = modelParser->build(
-      move(network), profile, loadedModel, ctx->nnXLen, ctx->nnYLen, maxBatchSize, requireExactNNLen);
+
+    unique_ptr<TRTModel> model;
+    if(isTransformer) {
+      auto transformerParser = make_unique<TransformerModelParser>();
+      model = transformerParser->build(
+        move(network), profile, loadedModel, ctx->nnXLen, ctx->nnYLen, maxBatchSize, requireExactNNLen);
+    }
+    else {
+      auto modelParser = make_unique<ModelParser>();
+      model = modelParser->build(
+        move(network), profile, loadedModel, ctx->nnXLen, ctx->nnYLen, maxBatchSize, requireExactNNLen);
+    }
     debugOutputs = model->debugOutputs;
     config->addOptimizationProfile(profile);
 
@@ -1659,6 +2479,13 @@ void NeuralNet::getOutput(
   assert(numGlobalFeatures == inputBuffers->singleInputGlobalElts);
 
   for(int nIdx = 0; nIdx < batchSize; nIdx++) {
+    if(gpuHandle->isTransformer) {
+      if(inputBufs[nIdx]->boardXSizeForServer != nnXLen ||
+         inputBufs[nIdx]->boardYSizeForServer != nnYLen) {
+        throw StringError("TensorRT Transformer backend requires board size to exactly match model posLen");
+      }
+    }
+
     float* rowMaskInput = &inputBuffers->maskInputs[inputBuffers->singleMaskElts * nIdx];
     float* rowSpatialInput = &inputBuffers->spatialInputs[inputBuffers->singleInputElts * nIdx];
     float* rowGlobalInput = &inputBuffers->globalInputs[inputBuffers->singleInputGlobalElts * nIdx];
@@ -1668,8 +2495,7 @@ void NeuralNet::getOutput(
     const float* rowSpatial = inputBufs[nIdx]->rowSpatialBuf.data();
     const float* rowMeta = inputBufs[nIdx]->rowMetaBuf.data();
     const bool hasRowMeta = inputBufs[nIdx]->hasRowMeta;
-    copy(rowGlobal, rowGlobal + numGlobalFeatures, rowGlobalInput);
-    std::copy(rowGlobal,rowGlobal+numGlobalFeatures,rowGlobalInput);
+    std::copy(rowGlobal, rowGlobal + numGlobalFeatures, rowGlobalInput);
     if(numMetaFeatures > 0) {
       testAssert(rowMeta != NULL);
       testAssert(hasRowMeta);
@@ -1885,6 +2711,82 @@ void NeuralNet::getOutput(
   }
 }
 
+static void logSoftmax1DInplace(vector<float>& values) {
+  if(values.empty()) return;
+  float maxVal = values[0];
+  for(size_t i = 1; i < values.size(); i++)
+    maxVal = std::max(maxVal, values[i]);
+  double sum = 0.0;
+  for(size_t i = 0; i < values.size(); i++)
+    sum += std::exp((double)values[i] - (double)maxVal);
+  float logSum = (float)((double)maxVal + std::log(sum));
+  for(size_t i = 0; i < values.size(); i++)
+    values[i] -= logSum;
+}
+
+static void finalizeTransformerScoreBelief(
+  const TransformerModelDesc& desc,
+  const float* globalInput,
+  const vector<float>& scoreBeliefProject,
+  float* scoreBeliefOut
+) {
+  if(desc.scoreMode == 0) {
+    vector<float> logits = scoreBeliefProject;
+    logSoftmax1DInplace(logits);
+    std::copy(logits.begin(), logits.end(), scoreBeliefOut);
+    return;
+  }
+
+  const int len = desc.scoreBeliefLen;
+  const int numBeliefs = desc.numScoreBeliefs;
+  vector<float> belief(scoreBeliefProject.begin(), scoreBeliefProject.begin() + (size_t)len * numBeliefs);
+  vector<float> mixLogits(scoreBeliefProject.begin() + (size_t)len * numBeliefs, scoreBeliefProject.end());
+
+  if(desc.scoreMode == 2) {
+    const int mid = len / 2;
+    const float scoreParity = globalInput[desc.numInputGlobalChannels - 1];
+    const bool hasS2Bias = !desc.scoreBeliefS2OffBias.empty();
+    for(int i = 0; i < len; i++) {
+      int diff = i - mid;
+      int parityBit = ((diff % 2) + 2) % 2;
+      float offsetTerm = 0.05f * ((float)diff + 0.5f);
+      float parityTerm = (0.5f - (float)parityBit) * scoreParity;
+      for(int j = 0; j < numBeliefs; j++) {
+        float s2offVal = offsetTerm * desc.scoreBeliefS2OffWeight[j];
+        float s2parVal = parityTerm * desc.scoreBeliefS2ParWeight[j];
+        if(hasS2Bias) {
+          s2offVal += desc.scoreBeliefS2OffBias[j];
+          s2parVal += desc.scoreBeliefS2ParBias[j];
+        }
+        belief[(size_t)i * numBeliefs + j] += s2offVal + s2parVal;
+      }
+    }
+  }
+
+  for(int j = 0; j < numBeliefs; j++) {
+    float maxVal = belief[j];
+    for(int i = 1; i < len; i++)
+      maxVal = std::max(maxVal, belief[(size_t)i * numBeliefs + j]);
+    double sum = 0.0;
+    for(int i = 0; i < len; i++)
+      sum += std::exp((double)belief[(size_t)i * numBeliefs + j] - (double)maxVal);
+    float logSum = (float)((double)maxVal + std::log(sum));
+    for(int i = 0; i < len; i++)
+      belief[(size_t)i * numBeliefs + j] -= logSum;
+  }
+
+  logSoftmax1DInplace(mixLogits);
+  for(int i = 0; i < len; i++) {
+    float maxVal = belief[(size_t)i * numBeliefs] + mixLogits[0];
+    for(int j = 1; j < numBeliefs; j++)
+      maxVal = std::max(maxVal, belief[(size_t)i * numBeliefs + j] + mixLogits[j]);
+    double sum = 0.0;
+    for(int j = 0; j < numBeliefs; j++)
+      sum += std::exp((double)belief[(size_t)i * numBeliefs + j] + (double)mixLogits[j] - (double)maxVal);
+    scoreBeliefOut[i] = (float)((double)maxVal + std::log(sum));
+  }
+}
+
 bool NeuralNet::getTransformerRawOutputs(
   ComputeHandle* gpuHandle,
   InputBuffers* inputBuffers,
@@ -1892,12 +2794,181 @@ bool NeuralNet::getTransformerRawOutputs(
   NNResultBuf** inputBufs,
   TransformerRawOutputs& outputs
 ) {
-  (void)gpuHandle;
-  (void)inputBuffers;
-  (void)numBatchEltsFilled;
-  (void)inputBufs;
-  (void)outputs;
-  return false;
+  if(!gpuHandle->isTransformer)
+    return false;
+
+  assert(numBatchEltsFilled <= inputBuffers->maxBatchSize);
+  assert(numBatchEltsFilled > 0);
+  const int batchSize = numBatchEltsFilled;
+  const int nnXLen = gpuHandle->ctx->nnXLen;
+  const int nnYLen = gpuHandle->ctx->nnYLen;
+  const int modelVersion = gpuHandle->modelVersion;
+  const int numSpatialFeatures = NNModelVersion::getNumSpatialFeatures(modelVersion);
+  const int numGlobalFeatures = NNModelVersion::getNumGlobalFeatures(modelVersion);
+  const int numPolicyChannels = inputBuffers->singlePolicyPassResultElts;
+
+  // Prepare inputs
+  for(int nIdx = 0; nIdx < batchSize; nIdx++) {
+    if(inputBufs[nIdx]->boardXSizeForServer != nnXLen ||
+       inputBufs[nIdx]->boardYSizeForServer != nnYLen) {
+      throw StringError("TensorRT Transformer backend requires board size to exactly match model posLen");
+    }
+
+    float* rowMaskInput = &inputBuffers->maskInputs[inputBuffers->singleMaskElts * nIdx];
+    float* rowSpatialInput = &inputBuffers->spatialInputs[inputBuffers->singleInputElts * nIdx];
+    float* rowGlobalInput = &inputBuffers->globalInputs[inputBuffers->singleInputGlobalElts * nIdx];
+    const float* rowGlobal = inputBufs[nIdx]->rowGlobalBuf.data();
+    const float* rowSpatial = inputBufs[nIdx]->rowSpatialBuf.data();
+    std::copy(rowGlobal, rowGlobal + numGlobalFeatures, rowGlobalInput);
+    SymmetryHelpers::copyInputsWithSymmetry(
+      rowSpatial, rowSpatialInput, 1, nnYLen, nnXLen, numSpatialFeatures, false, inputBufs[nIdx]->symmetry);
+    std::copy(rowSpatialInput, rowSpatialInput + inputBuffers->singleMaskElts, rowMaskInput);
+  }
+
+  // Upload and run TRT inference
+  CUDA_ERR("getTransformerRawOutputs", cudaMemcpyAsync(gpuHandle->getBuffer("InputMask"), inputBuffers->maskInputs.get(), inputBuffers->singleMaskBytes * batchSize, cudaMemcpyHostToDevice));
+  CUDA_ERR("getTransformerRawOutputs", cudaMemcpyAsync(gpuHandle->getBuffer("InputSpatial"), inputBuffers->spatialInputs.get(), inputBuffers->singleInputBytes * batchSize, cudaMemcpyHostToDevice));
+  CUDA_ERR("getTransformerRawOutputs", cudaMemcpyAsync(gpuHandle->getBuffer("InputGlobal"), inputBuffers->globalInputs.get(), inputBuffers->singleInputGlobalBytes * batchSize, cudaMemcpyHostToDevice));
+
+  gpuHandle->exec->setInputShape("InputMask", gpuHandle->getBufferDynamicShape("InputMask", batchSize));
+  gpuHandle->exec->setInputShape("InputSpatial", gpuHandle->getBufferDynamicShape("InputSpatial", batchSize));
+  gpuHandle->exec->setInputShape("InputGlobal", gpuHandle->getBufferDynamicShape("InputGlobal", batchSize));
+  gpuHandle->exec->enqueueV3(cudaStreamPerThread);
+
+  // Download results
+  CUDA_ERR("getTransformerRawOutputs", cudaMemcpy(inputBuffers->policyPassResults.get(), gpuHandle->getBuffer("OutputPolicyPass"), inputBuffers->singlePolicyPassResultBytes * batchSize, cudaMemcpyDeviceToHost));
+  CUDA_ERR("getTransformerRawOutputs", cudaMemcpy(inputBuffers->policyResults.get(), gpuHandle->getBuffer("OutputPolicy"), inputBuffers->singlePolicyResultBytes * batchSize, cudaMemcpyDeviceToHost));
+  CUDA_ERR("getTransformerRawOutputs", cudaMemcpy(inputBuffers->valueResults.get(), gpuHandle->getBuffer("OutputValue"), inputBuffers->singleValueResultBytes * batchSize, cudaMemcpyDeviceToHost));
+  CUDA_ERR("getTransformerRawOutputs", cudaMemcpy(inputBuffers->scoreValueResults.get(), gpuHandle->getBuffer("OutputScoreValue"), inputBuffers->singleScoreValueResultBytes * batchSize, cudaMemcpyDeviceToHost));
+  CUDA_ERR("getTransformerRawOutputs", cudaMemcpy(inputBuffers->ownershipResults.get(), gpuHandle->getBuffer("OutputOwnership"), inputBuffers->singleOwnershipResultBytes * batchSize, cudaMemcpyDeviceToHost));
+
+  gpuHandle->trtErrorRecorder.clear();
+
+  // Fill basic raw outputs
+  const int seqLen = nnXLen * nnYLen;
+  outputs.batchSize = batchSize;
+  outputs.nnXLen = nnXLen;
+  outputs.nnYLen = nnYLen;
+  outputs.numPolicyChannels = numPolicyChannels;
+
+  outputs.policyPass.resize((size_t)batchSize * numPolicyChannels);
+  outputs.policy.resize((size_t)batchSize * numPolicyChannels * seqLen);
+  outputs.value.resize((size_t)batchSize * 3);
+  outputs.scoreValue.resize((size_t)batchSize * 6);
+  outputs.ownership.resize((size_t)batchSize * seqLen);
+
+  // Policy pass: [N, 2] in memory — matches expected layout
+  std::copy(inputBuffers->policyPassResults.get(), inputBuffers->policyPassResults.get() + outputs.policyPass.size(), outputs.policyPass.data());
+
+  // Policy board: TRT outputs NCHW [N, 2, H, W], raw expects NLC token-major [N, L, 2]
+  {
+    const float* src = inputBuffers->policyResults.get();
+    float* dst = outputs.policy.data();
+    for(int n = 0; n < batchSize; n++) {
+      for(int l = 0; l < seqLen; l++) {
+        for(int c = 0; c < numPolicyChannels; c++) {
+          dst[(size_t)n * seqLen * numPolicyChannels + l * numPolicyChannels + c] =
+            src[(size_t)n * numPolicyChannels * seqLen + c * seqLen + l];
+        }
+      }
+    }
+  }
+
+  std::copy(inputBuffers->valueResults.get(), inputBuffers->valueResults.get() + outputs.value.size(), outputs.value.data());
+  std::copy(inputBuffers->scoreValueResults.get(), inputBuffers->scoreValueResults.get() + outputs.scoreValue.size(), outputs.scoreValue.data());
+  std::copy(inputBuffers->ownershipResults.get(), inputBuffers->ownershipResults.get() + outputs.ownership.size(), outputs.ownership.data());
+
+  // Fill full head outputs if the engine has them
+  auto hasBuffer = [&](const char* name) -> bool {
+    return gpuHandle->buffers.find(name) != gpuHandle->buffers.end();
+  };
+
+  // Helper to read a NCHW spatial tensor from TRT and convert to NLC token-major
+  auto readSpatialNCHWtoNLC = [&](const char* bufName, int channels, vector<float>& dst) {
+    size_t totalElts = (size_t)batchSize * channels * seqLen;
+    vector<float> nchw(totalElts);
+    CUDA_ERR("getTransformerRawOutputs", cudaMemcpy(nchw.data(), gpuHandle->getBuffer(bufName), totalElts * sizeof(float), cudaMemcpyDeviceToHost));
+    dst.resize(totalElts);
+    for(int n = 0; n < batchSize; n++) {
+      for(int l = 0; l < seqLen; l++) {
+        for(int c = 0; c < channels; c++) {
+          dst[(size_t)n * seqLen * channels + l * channels + c] =
+            nchw[(size_t)n * channels * seqLen + c * seqLen + l];
+        }
+      }
+    }
+  };
+
+  // Helper to read a global tensor [N, C, 1, 1] → [N, C]
+  auto readGlobal = [&](const char* bufName, int channels, vector<float>& dst) {
+    dst.resize((size_t)batchSize * channels);
+    CUDA_ERR("getTransformerRawOutputs", cudaMemcpy(dst.data(), gpuHandle->getBuffer(bufName), dst.size() * sizeof(float), cudaMemcpyDeviceToHost));
+  };
+
+  if(hasBuffer("OutputFullPolicyBoard")) {
+    outputs.numFullPolicyChannels = 6;
+    outputs.numMiscChannels = 10;
+    outputs.numMoreMiscChannels = 8;
+    outputs.numScoringChannels = 1;
+    outputs.numFuturePosChannels = 2;
+    outputs.numSekiChannels = 4;
+
+    readSpatialNCHWtoNLC("OutputFullPolicyBoard", 6, outputs.fullPolicy);
+    readGlobal("OutputFullPolicyPass", 6, outputs.fullPolicyPass);
+    readGlobal("OutputMisc", 10, outputs.misc);
+    readGlobal("OutputMoreMisc", 8, outputs.moreMisc);
+    readSpatialNCHWtoNLC("OutputScoring", 1, outputs.scoring);
+    readSpatialNCHWtoNLC("OutputFuturePos", 2, outputs.futurePos);
+    readSpatialNCHWtoNLC("OutputSeki", 4, outputs.seki);
+
+    if(hasBuffer("OutputScoreBelief") && gpuHandle->transformerDesc != nullptr) {
+      const TransformerModelDesc& tdesc = *gpuHandle->transformerDesc;
+      // Read the raw score belief projection from the engine
+      auto dims = gpuHandle->engine->getTensorShape("OutputScoreBelief");
+      int projDim = 1;
+      for(int d = 1; d < dims.nbDims; d++) projDim *= dims.d[d];
+      vector<float> projBuf;
+      readGlobal("OutputScoreBelief", projDim, projBuf);
+
+      // Post-process per sample: logSoftmax (mode 0) or mix finalization (mode 1/2)
+      outputs.scoreBeliefLen = tdesc.scoreBeliefLen;
+      outputs.scoreBelief.resize((size_t)batchSize * tdesc.scoreBeliefLen);
+      for(int row = 0; row < batchSize; row++) {
+        vector<float> proj(projBuf.begin() + (size_t)row * projDim,
+                           projBuf.begin() + (size_t)(row + 1) * projDim);
+        const float* rowGlobalInput = &inputBuffers->globalInputs[inputBuffers->singleInputGlobalElts * row];
+        finalizeTransformerScoreBelief(
+          tdesc,
+          rowGlobalInput,
+          proj,
+          outputs.scoreBelief.data() + (size_t)row * tdesc.scoreBeliefLen
+        );
+      }
+    }
+    else {
+      outputs.scoreBeliefLen = 0;
+      outputs.scoreBelief.clear();
+    }
+  }
+  else {
+    outputs.numFullPolicyChannels = 0;
+    outputs.numMiscChannels = 0;
+    outputs.numMoreMiscChannels = 0;
+    outputs.numScoringChannels = 0;
+    outputs.numFuturePosChannels = 0;
+    outputs.numSekiChannels = 0;
+    outputs.scoreBeliefLen = 0;
+    outputs.fullPolicyPass.clear();
+    outputs.fullPolicy.clear();
+    outputs.misc.clear();
+    outputs.moreMisc.clear();
+    outputs.scoring.clear();
+    outputs.futurePos.clear();
+    outputs.seki.clear();
+    outputs.scoreBelief.clear();
+  }
+
+  return true;
 }
 
 bool NeuralNet::testEvaluateConv(

@@ -3692,6 +3692,8 @@ struct TransformerModel {
   {
     if(desc->modelVersion != 15)
       throw StringError("Transformer CUDA backend 当前只支持 model version 15");
+    if(desc->hasBias())
+      throw StringError("Transformer CUDA backend does not yet support models with head bias terms (format version >= 3)");
     if(nnXLen != posLen || nnYLen != posLen)
       throw StringError("Transformer CUDA backend 仅支持与导出 pos_len 完全一致的棋盘尺寸");
 

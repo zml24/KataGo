@@ -125,6 +125,9 @@ swift::Array<SWTransformerBlockDesc> MetalProcess::transformerBlocksToSwift(
 }
 
 SWTransformerModelDesc MetalProcess::transformerModelDescToSwift(const TransformerModelDesc* desc) {
+  if(desc->hasBias())
+    throw StringError("Metal Transformer backend does not yet support models with head bias terms (format version >= 3)");
+
   SWConvLayerDesc stemConv = createSWConvLayerDesc(
     desc->stemKernelSize,
     desc->stemKernelSize,

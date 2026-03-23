@@ -408,6 +408,8 @@ TransformerInferenceEngine::TransformerInferenceEngine(const TransformerModelDes
     throw StringError("TransformerInferenceEngine received a null model desc");
   if(desc->headDim % 2 != 0)
     throw StringError("TransformerInferenceEngine requires an even head dimension for RoPE");
+  if(desc->hasBias())
+    throw StringError("TransformerInferenceEngine does not yet support models with head bias terms (format version >= 3)");
 }
 
 TransformerInferenceEngine::~TransformerInferenceEngine() {}

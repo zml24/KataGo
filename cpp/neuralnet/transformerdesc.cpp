@@ -106,6 +106,20 @@ static ParsedTensor takeTensor(
   return tensor;
 }
 
+static vector<float> takeBiasTensor(
+  unordered_map<string, ParsedTensor>& tensors,
+  const string& name,
+  const vector<int32_t>& expectedShape
+) {
+  auto iter = tensors.find(name);
+  if(iter == tensors.end())
+    throw StringError("Missing transformer tensor: " + name);
+  ParsedTensor tensor = std::move(iter->second);
+  tensors.erase(iter);
+  checkTensorShape(tensor, expectedShape, name);
+  return std::move(tensor.values);
+}
+
 }
 
 TransformerModelDesc::TransformerModelDesc()
@@ -147,7 +161,7 @@ bool TransformerModelDesc::tryLoadFromFileMaybeGZipped(
   reader.pos += sizeof(TRANSFORMER_MAGIC) - 1;
 
   uint32_t formatVersion = reader.readPrimitive<uint32_t>("format version");
-  if(formatVersion != 1 && formatVersion != 2)
+  if(formatVersion < 1 || formatVersion > 3)
     throw StringError("Unsupported transformer model format version: " + Global::uint64ToString(formatVersion));
 
   descBuf = TransformerModelDesc();
@@ -277,83 +291,116 @@ bool TransformerModelDesc::tryLoadFromFileMaybeGZipped(
     ParsedTensor tensor = takeTensor(tensors, "policy.board.weight");
     checkTensorShape(tensor, {(int32_t)descBuf.hiddenSize, 2}, "policy.board.weight");
     descBuf.policyBoardWeight = std::move(tensor.values);
+    if(formatVersion >= 3)
+      descBuf.policyBoardBias = takeBiasTensor(tensors, "policy.board.bias", {2});
   }
   {
     ParsedTensor tensor = takeTensor(tensors, "policy.pass.weight");
     checkTensorShape(tensor, {(int32_t)descBuf.hiddenSize, 2}, "policy.pass.weight");
     descBuf.policyPassWeight = std::move(tensor.values);
+    if(formatVersion >= 3)
+      descBuf.policyPassBias = takeBiasTensor(tensors, "policy.pass.bias", {2});
   }
   {
     ParsedTensor tensor = takeTensor(tensors, "value.value.weight");
     checkTensorShape(tensor, {(int32_t)descBuf.hiddenSize, 3}, "value.value.weight");
     descBuf.valueWeight = std::move(tensor.values);
+    if(formatVersion >= 3)
+      descBuf.valueBias = takeBiasTensor(tensors, "value.value.bias", {3});
   }
   {
     ParsedTensor tensor = takeTensor(tensors, "value.score.weight");
     checkTensorShape(tensor, {(int32_t)descBuf.hiddenSize, 6}, "value.score.weight");
     descBuf.scoreValueWeight = std::move(tensor.values);
+    if(formatVersion >= 3)
+      descBuf.scoreValueBias = takeBiasTensor(tensors, "value.score.bias", {6});
   }
   {
     ParsedTensor tensor = takeTensor(tensors, "value.ownership.weight");
     checkTensorShape(tensor, {(int32_t)descBuf.hiddenSize, 1}, "value.ownership.weight");
     descBuf.ownershipWeight = std::move(tensor.values);
+    if(formatVersion >= 3)
+      descBuf.ownershipBias = takeBiasTensor(tensors, "value.ownership.bias", {1});
   }
   if(formatVersion >= 2) {
     {
       ParsedTensor tensor = takeTensor(tensors, "policy.board_full.weight");
       checkTensorShape(tensor, {(int32_t)descBuf.hiddenSize, 6}, "policy.board_full.weight");
       descBuf.policyBoardFullWeight = std::move(tensor.values);
+      if(formatVersion >= 3)
+        descBuf.policyBoardFullBias = takeBiasTensor(tensors, "policy.board_full.bias", {6});
     }
     {
       ParsedTensor tensor = takeTensor(tensors, "policy.pass_full.weight");
       checkTensorShape(tensor, {(int32_t)descBuf.hiddenSize, 6}, "policy.pass_full.weight");
       descBuf.policyPassFullWeight = std::move(tensor.values);
+      if(formatVersion >= 3)
+        descBuf.policyPassFullBias = takeBiasTensor(tensors, "policy.pass_full.bias", {6});
     }
     {
       ParsedTensor tensor = takeTensor(tensors, "value.misc.weight");
       checkTensorShape(tensor, {(int32_t)descBuf.hiddenSize, 10}, "value.misc.weight");
       descBuf.miscWeight = std::move(tensor.values);
+      if(formatVersion >= 3)
+        descBuf.miscBias = takeBiasTensor(tensors, "value.misc.bias", {10});
     }
     {
       ParsedTensor tensor = takeTensor(tensors, "value.moremisc.weight");
       checkTensorShape(tensor, {(int32_t)descBuf.hiddenSize, 8}, "value.moremisc.weight");
       descBuf.moreMiscWeight = std::move(tensor.values);
+      if(formatVersion >= 3)
+        descBuf.moreMiscBias = takeBiasTensor(tensors, "value.moremisc.bias", {8});
     }
     {
       ParsedTensor tensor = takeTensor(tensors, "value.scoring.weight");
       checkTensorShape(tensor, {(int32_t)descBuf.hiddenSize, 1}, "value.scoring.weight");
       descBuf.scoringWeight = std::move(tensor.values);
+      if(formatVersion >= 3)
+        descBuf.scoringBias = takeBiasTensor(tensors, "value.scoring.bias", {1});
     }
     {
       ParsedTensor tensor = takeTensor(tensors, "value.futurepos.weight");
       checkTensorShape(tensor, {(int32_t)descBuf.hiddenSize, 2}, "value.futurepos.weight");
       descBuf.futurePosWeight = std::move(tensor.values);
+      if(formatVersion >= 3)
+        descBuf.futurePosBias = takeBiasTensor(tensors, "value.futurepos.bias", {2});
     }
     {
       ParsedTensor tensor = takeTensor(tensors, "value.seki.weight");
       checkTensorShape(tensor, {(int32_t)descBuf.hiddenSize, 4}, "value.seki.weight");
       descBuf.sekiWeight = std::move(tensor.values);
+      if(formatVersion >= 3)
+        descBuf.sekiBias = takeBiasTensor(tensors, "value.seki.bias", {4});
     }
     if(descBuf.scoreMode == 0) {
       ParsedTensor tensor = takeTensor(tensors, "scorebelief.simple.weight");
       checkTensorShape(tensor, {(int32_t)descBuf.hiddenSize, (int32_t)descBuf.scoreBeliefLen}, "scorebelief.simple.weight");
       descBuf.scoreBeliefSimpleWeight = std::move(tensor.values);
+      if(formatVersion >= 3)
+        descBuf.scoreBeliefSimpleBias = takeBiasTensor(tensors, "scorebelief.simple.bias", {(int32_t)descBuf.scoreBeliefLen});
     }
     else {
       ParsedTensor tensor = takeTensor(tensors, "scorebelief.mix.weight");
+      int32_t mixOutDim = (int32_t)(descBuf.scoreBeliefLen * descBuf.numScoreBeliefs + descBuf.numScoreBeliefs);
       checkTensorShape(
         tensor,
-        {(int32_t)descBuf.hiddenSize, (int32_t)(descBuf.scoreBeliefLen * descBuf.numScoreBeliefs + descBuf.numScoreBeliefs)},
+        {(int32_t)descBuf.hiddenSize, mixOutDim},
         "scorebelief.mix.weight"
       );
       descBuf.scoreBeliefMixWeight = std::move(tensor.values);
+      if(formatVersion >= 3)
+        descBuf.scoreBeliefMixBias = takeBiasTensor(tensors, "scorebelief.mix.bias", {mixOutDim});
       if(descBuf.scoreMode == 2) {
         ParsedTensor s2off = takeTensor(tensors, "scorebelief.s2off.weight");
         checkTensorShape(s2off, {1, (int32_t)descBuf.numScoreBeliefs}, "scorebelief.s2off.weight");
         descBuf.scoreBeliefS2OffWeight = std::move(s2off.values);
+        if(formatVersion >= 3)
+          descBuf.scoreBeliefS2OffBias = takeBiasTensor(tensors, "scorebelief.s2off.bias", {(int32_t)descBuf.numScoreBeliefs});
         ParsedTensor s2par = takeTensor(tensors, "scorebelief.s2par.weight");
         checkTensorShape(s2par, {1, (int32_t)descBuf.numScoreBeliefs}, "scorebelief.s2par.weight");
         descBuf.scoreBeliefS2ParWeight = std::move(s2par.values);
+        if(formatVersion >= 3)
+          descBuf.scoreBeliefS2ParBias = takeBiasTensor(tensors, "scorebelief.s2par.bias", {(int32_t)descBuf.numScoreBeliefs});
       }
     }
   }

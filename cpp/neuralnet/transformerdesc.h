@@ -47,21 +47,41 @@ struct TransformerModelDesc {
   std::vector<TransformerBlockDesc> blocks;
   std::vector<float> finalNormWeight;
   std::vector<float> policyBoardWeight;
+  std::vector<float> policyBoardBias;
   std::vector<float> policyPassWeight;
+  std::vector<float> policyPassBias;
   std::vector<float> policyBoardFullWeight;
+  std::vector<float> policyBoardFullBias;
   std::vector<float> policyPassFullWeight;
+  std::vector<float> policyPassFullBias;
   std::vector<float> valueWeight;
+  std::vector<float> valueBias;
   std::vector<float> miscWeight;
+  std::vector<float> miscBias;
   std::vector<float> moreMiscWeight;
+  std::vector<float> moreMiscBias;
   std::vector<float> scoreValueWeight;
+  std::vector<float> scoreValueBias;
   std::vector<float> ownershipWeight;
+  std::vector<float> ownershipBias;
   std::vector<float> scoringWeight;
+  std::vector<float> scoringBias;
   std::vector<float> futurePosWeight;
+  std::vector<float> futurePosBias;
   std::vector<float> sekiWeight;
+  std::vector<float> sekiBias;
   std::vector<float> scoreBeliefSimpleWeight;
+  std::vector<float> scoreBeliefSimpleBias;
   std::vector<float> scoreBeliefMixWeight;
+  std::vector<float> scoreBeliefMixBias;
   std::vector<float> scoreBeliefS2OffWeight;
+  std::vector<float> scoreBeliefS2OffBias;
   std::vector<float> scoreBeliefS2ParWeight;
+  std::vector<float> scoreBeliefS2ParBias;
+
+  bool hasBias() const {
+    return !policyBoardBias.empty() || !valueBias.empty() || !ownershipBias.empty();
+  }
 
   TransformerModelDesc();
   ~TransformerModelDesc();
