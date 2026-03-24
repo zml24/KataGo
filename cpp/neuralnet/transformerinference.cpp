@@ -171,6 +171,21 @@ static void matmulVec(const vector<float>& vec, const vector<float>& weight, int
   }
 }
 
+static void addBiasToRows(vector<float>& data, int rows, int cols, const vector<float>& bias) {
+  if(bias.empty())
+    return;
+  for(int r = 0; r < rows; r++)
+    for(int c = 0; c < cols; c++)
+      data[idx2(r, c, cols)] += bias[c];
+}
+
+static void addBiasVec(float* out, int size, const vector<float>& bias) {
+  if(bias.empty())
+    return;
+  for(int i = 0; i < size; i++)
+    out[i] += bias[i];
+}
+
 static void computeTrunk(
   const TransformerModelDesc& desc,
   const float* spatialInputNHWC,
@@ -260,6 +275,7 @@ static void computeScoreBelief(
   if(desc.scoreMode == 0) {
     vector<float> logits((size_t)desc.scoreBeliefLen);
     matmulVec(pooled, desc.scoreBeliefSimpleWeight, desc.hiddenSize, desc.scoreBeliefLen, logits.data());
+    addBiasVec(logits.data(), desc.scoreBeliefLen, desc.scoreBeliefSimpleBias);
     logSoftmax1DInplace(logits);
     std::copy(logits.begin(), logits.end(), scoreBeliefOut);
     return;
@@ -267,20 +283,23 @@ static void computeScoreBelief(
 
   const int len = desc.scoreBeliefLen;
   const int numBeliefs = desc.numScoreBeliefs;
-  vector<float> proj((size_t)len * numBeliefs + numBeliefs);
+  const int projSize = len * numBeliefs + numBeliefs;
+  vector<float> proj((size_t)projSize);
   matmulVec(
     pooled,
     desc.scoreBeliefMixWeight,
     desc.hiddenSize,
-    len * numBeliefs + numBeliefs,
+    projSize,
     proj.data()
   );
+  addBiasVec(proj.data(), projSize, desc.scoreBeliefMixBias);
 
   vector<float> belief(proj.begin(), proj.begin() + (size_t)len * numBeliefs);
   vector<float> mixLogits(proj.begin() + (size_t)len * numBeliefs, proj.end());
 
   if(desc.scoreMode == 2) {
     const int mid = len / 2;
+    const bool hasS2Bias = !desc.scoreBeliefS2OffBias.empty();
     for(int i = 0; i < len; i++) {
       int diff = i - mid;
       int parityBit = ((diff % 2) + 2) % 2;
@@ -290,6 +309,10 @@ static void computeScoreBelief(
         belief[(size_t)i * numBeliefs + j] +=
           offsetTerm * desc.scoreBeliefS2OffWeight[j] +
           parityTerm * desc.scoreBeliefS2ParWeight[j];
+        if(hasS2Bias) {
+          belief[(size_t)i * numBeliefs + j] +=
+            desc.scoreBeliefS2OffBias[j] + desc.scoreBeliefS2ParBias[j];
+        }
       }
     }
   }
@@ -336,15 +359,20 @@ static void runSingle(
   vector<float> boardPolicy;
   vector<float> ownership;
   matmul(xFinal, seqLen, desc.hiddenSize, desc.policyBoardWeight, 2, boardPolicy);
+  addBiasToRows(boardPolicy, seqLen, 2, desc.policyBoardBias);
   matmul(xFinal, seqLen, desc.hiddenSize, desc.ownershipWeight, 1, ownership);
+  addBiasToRows(ownership, seqLen, 1, desc.ownershipBias);
   for(int tokenIdx = 0; tokenIdx < seqLen; tokenIdx++) {
     for(int c = 0; c < 2; c++)
       policyOut[tokenIdx * 2 + c] = boardPolicy[idx2(tokenIdx, c, 2)];
     ownershipOut[tokenIdx] = ownership[tokenIdx];
   }
   matmulVec(pooled, desc.policyPassWeight, desc.hiddenSize, 2, policyPassOut);
+  addBiasVec(policyPassOut, 2, desc.policyPassBias);
   matmulVec(pooled, desc.valueWeight, desc.hiddenSize, 3, valueOut);
+  addBiasVec(valueOut, 3, desc.valueBias);
   matmulVec(pooled, desc.scoreValueWeight, desc.hiddenSize, 6, scoreValueOut);
+  addBiasVec(scoreValueOut, 6, desc.scoreValueBias);
 }
 
 static void runSingleFull(
@@ -376,10 +404,15 @@ static void runSingleFull(
   vector<float> futurePos;
   vector<float> seki;
   matmul(xFinal, seqLen, desc.hiddenSize, desc.policyBoardFullWeight, 6, fullBoardPolicy);
+  addBiasToRows(fullBoardPolicy, seqLen, 6, desc.policyBoardFullBias);
   matmul(xFinal, seqLen, desc.hiddenSize, desc.ownershipWeight, 1, ownership);
+  addBiasToRows(ownership, seqLen, 1, desc.ownershipBias);
   matmul(xFinal, seqLen, desc.hiddenSize, desc.scoringWeight, 1, scoring);
+  addBiasToRows(scoring, seqLen, 1, desc.scoringBias);
   matmul(xFinal, seqLen, desc.hiddenSize, desc.futurePosWeight, 2, futurePos);
+  addBiasToRows(futurePos, seqLen, 2, desc.futurePosBias);
   matmul(xFinal, seqLen, desc.hiddenSize, desc.sekiWeight, 4, seki);
+  addBiasToRows(seki, seqLen, 4, desc.sekiBias);
 
   for(int tokenIdx = 0; tokenIdx < seqLen; tokenIdx++) {
     for(int c = 0; c < 6; c++)
@@ -393,9 +426,13 @@ static void runSingleFull(
   }
 
   matmulVec(pooled, desc.policyPassFullWeight, desc.hiddenSize, 6, policyPassFullOut);
+  addBiasVec(policyPassFullOut, 6, desc.policyPassFullBias);
   matmulVec(pooled, desc.valueWeight, desc.hiddenSize, 3, valueOut);
+  addBiasVec(valueOut, 3, desc.valueBias);
   matmulVec(pooled, desc.miscWeight, desc.hiddenSize, 10, miscOut);
+  addBiasVec(miscOut, 10, desc.miscBias);
   matmulVec(pooled, desc.moreMiscWeight, desc.hiddenSize, 8, moreMiscOut);
+  addBiasVec(moreMiscOut, 8, desc.moreMiscBias);
   computeScoreBelief(desc, pooled, globalInput[desc.numInputGlobalChannels - 1], scoreBeliefOut);
 }
 
@@ -408,8 +445,6 @@ TransformerInferenceEngine::TransformerInferenceEngine(const TransformerModelDes
     throw StringError("TransformerInferenceEngine received a null model desc");
   if(desc->headDim % 2 != 0)
     throw StringError("TransformerInferenceEngine requires an even head dimension for RoPE");
-  if(desc->hasBias())
-    throw StringError("TransformerInferenceEngine does not yet support models with head bias terms (format version >= 3)");
 }
 
 TransformerInferenceEngine::~TransformerInferenceEngine() {}

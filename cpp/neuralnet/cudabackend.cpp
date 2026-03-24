@@ -2864,6 +2864,7 @@ struct TransformerLinear {
   const int outChannels;
   const TransformerPrecision precision;
   void* weightBuf;
+  float* biasBuf;
 
   TransformerLinear(
     CudaHandles* cudaHandles,
@@ -2871,20 +2872,30 @@ struct TransformerLinear {
     int inChannels_,
     int outChannels_,
     const vector<float>& weights,
-    TransformerPrecision precision_
+    TransformerPrecision precision_,
+    const vector<float>& bias = {}
   ) :
     name(name_),
     inChannels(inChannels_),
     outChannels(outChannels_),
     precision(precision_),
-    weightBuf(nullptr)
+    weightBuf(nullptr),
+    biasBuf(nullptr)
   {
     (void)cudaHandles;
     transformerMallocAndCopyWeights(name_, weights, weightBuf, precision);
+    if(!bias.empty()) {
+      assert((int)bias.size() == outChannels);
+      size_t biasBytes = sizeof(float) * bias.size();
+      CUDA_ERR(name_.c_str(), cudaMalloc(&biasBuf, biasBytes));
+      CUDA_ERR(name_.c_str(), cudaMemcpy(biasBuf, bias.data(), biasBytes, cudaMemcpyHostToDevice));
+    }
   }
 
   ~TransformerLinear() {
     cudaFree(weightBuf);
+    if(biasBuf != nullptr)
+      cudaFree(biasBuf);
   }
 
   TransformerLinear() = delete;
@@ -2912,6 +2923,10 @@ struct TransformerLinear {
       &beta,
       outputBuf, outChannels
     ));
+    if(biasBuf != nullptr) {
+      customCudaAddCBiasInplaceNC(outputBuf, biasBuf, batchSize, outChannels, ACTIVATION_IDENTITY);
+      CUDA_ERR(name.c_str(), cudaPeekAtLastError());
+    }
   }
 
 #ifdef KATAGO_CUBLASLT_AVAILABLE
@@ -3094,6 +3109,10 @@ struct TransformerLinear {
     runLowpMatmul(cudaHandles, scratch, batchSize, lowInputBuf.buf, lowOutputBuf.buf);
     transformerCopyPrecisionToFloat(lowOutputBuf.buf, outputFloatBuf, numOutputElts, precision);
     CUDA_ERR(name.c_str(), cudaPeekAtLastError());
+    if(biasBuf != nullptr) {
+      customCudaAddCBiasInplaceNC(outputFloatBuf, biasBuf, batchSize, outChannels, ACTIVATION_IDENTITY);
+      CUDA_ERR(name.c_str(), cudaPeekAtLastError());
+    }
   }
 
   // inputBuf is already in lowp format (or FP32 if precision==Float32).
@@ -3117,6 +3136,10 @@ struct TransformerLinear {
     runLowpMatmul(cudaHandles, scratch, batchSize, lowpInputBuf, lowOutputBuf.buf);
     transformerCopyPrecisionToFloat(lowOutputBuf.buf, outputFloatBuf, numOutputElts, precision);
     CUDA_ERR(name.c_str(), cudaPeekAtLastError());
+    if(biasBuf != nullptr) {
+      customCudaAddCBiasInplaceNC(outputFloatBuf, biasBuf, batchSize, outChannels, ACTIVATION_IDENTITY);
+      CUDA_ERR(name.c_str(), cudaPeekAtLastError());
+    }
   }
 
   // inputBuf is float, outputBuf is lowp (or FP32 if precision==Float32).
@@ -3641,6 +3664,8 @@ struct TransformerModel {
   std::unique_ptr<TransformerLinear> scoreBeliefHead;
   vector<float> scoreBeliefS2OffWeight;
   vector<float> scoreBeliefS2ParWeight;
+  vector<float> scoreBeliefS2OffBias;
+  vector<float> scoreBeliefS2ParBias;
 
   TransformerModel() = delete;
   TransformerModel(const TransformerModel&) = delete;
@@ -3692,8 +3717,6 @@ struct TransformerModel {
   {
     if(desc->modelVersion != 15)
       throw StringError("Transformer CUDA backend 当前只支持 model version 15");
-    if(desc->hasBias())
-      throw StringError("Transformer CUDA backend does not yet support models with head bias terms (format version >= 3)");
     if(nnXLen != posLen || nnYLen != posLen)
       throw StringError("Transformer CUDA backend 仅支持与导出 pos_len 完全一致的棋盘尺寸");
 
@@ -3756,28 +3779,30 @@ struct TransformerModel {
     finalNorm = std::make_unique<TransformerRMSNorm>(name + "_final_norm", desc->finalNormWeight, precision);
 
     // All head linear layers use FP32 precision for numerical accuracy (matching training behavior).
-    policyBoard = std::make_unique<TransformerLinear>(cudaHandles, name + "_policy_board", hiddenSize, 2, desc->policyBoardWeight, TransformerPrecision::Float32);
-    policyPass = std::make_unique<TransformerLinear>(cudaHandles, name + "_policy_pass", hiddenSize, 2, desc->policyPassWeight, TransformerPrecision::Float32);
+    policyBoard = std::make_unique<TransformerLinear>(cudaHandles, name + "_policy_board", hiddenSize, 2, desc->policyBoardWeight, TransformerPrecision::Float32, desc->policyBoardBias);
+    policyPass = std::make_unique<TransformerLinear>(cudaHandles, name + "_policy_pass", hiddenSize, 2, desc->policyPassWeight, TransformerPrecision::Float32, desc->policyPassBias);
     if(!desc->policyBoardFullWeight.empty()) {
-      policyBoardFull = std::make_unique<TransformerLinear>(cudaHandles, name + "_policy_board_full", hiddenSize, numFullPolicyChannels, desc->policyBoardFullWeight, TransformerPrecision::Float32);
-      policyPassFull = std::make_unique<TransformerLinear>(cudaHandles, name + "_policy_pass_full", hiddenSize, numFullPolicyChannels, desc->policyPassFullWeight, TransformerPrecision::Float32);
-      miscHead = std::make_unique<TransformerLinear>(cudaHandles, name + "_misc", hiddenSize, numMiscChannels, desc->miscWeight, TransformerPrecision::Float32);
-      moreMiscHead = std::make_unique<TransformerLinear>(cudaHandles, name + "_moremisc", hiddenSize, numMoreMiscChannels, desc->moreMiscWeight, TransformerPrecision::Float32);
-      scoringHead = std::make_unique<TransformerLinear>(cudaHandles, name + "_scoring", hiddenSize, numScoringChannels, desc->scoringWeight, TransformerPrecision::Float32);
-      futurePosHead = std::make_unique<TransformerLinear>(cudaHandles, name + "_futurepos", hiddenSize, numFuturePosChannels, desc->futurePosWeight, TransformerPrecision::Float32);
-      sekiHead = std::make_unique<TransformerLinear>(cudaHandles, name + "_seki", hiddenSize, numSekiChannels, desc->sekiWeight, TransformerPrecision::Float32);
+      policyBoardFull = std::make_unique<TransformerLinear>(cudaHandles, name + "_policy_board_full", hiddenSize, numFullPolicyChannels, desc->policyBoardFullWeight, TransformerPrecision::Float32, desc->policyBoardFullBias);
+      policyPassFull = std::make_unique<TransformerLinear>(cudaHandles, name + "_policy_pass_full", hiddenSize, numFullPolicyChannels, desc->policyPassFullWeight, TransformerPrecision::Float32, desc->policyPassFullBias);
+      miscHead = std::make_unique<TransformerLinear>(cudaHandles, name + "_misc", hiddenSize, numMiscChannels, desc->miscWeight, TransformerPrecision::Float32, desc->miscBias);
+      moreMiscHead = std::make_unique<TransformerLinear>(cudaHandles, name + "_moremisc", hiddenSize, numMoreMiscChannels, desc->moreMiscWeight, TransformerPrecision::Float32, desc->moreMiscBias);
+      scoringHead = std::make_unique<TransformerLinear>(cudaHandles, name + "_scoring", hiddenSize, numScoringChannels, desc->scoringWeight, TransformerPrecision::Float32, desc->scoringBias);
+      futurePosHead = std::make_unique<TransformerLinear>(cudaHandles, name + "_futurepos", hiddenSize, numFuturePosChannels, desc->futurePosWeight, TransformerPrecision::Float32, desc->futurePosBias);
+      sekiHead = std::make_unique<TransformerLinear>(cudaHandles, name + "_seki", hiddenSize, numSekiChannels, desc->sekiWeight, TransformerPrecision::Float32, desc->sekiBias);
       if(scoreBeliefProjectSize > 0) {
         if(scoreMode == 0)
-          scoreBeliefHead = std::make_unique<TransformerLinear>(cudaHandles, name + "_scorebelief_simple", hiddenSize, scoreBeliefProjectSize, desc->scoreBeliefSimpleWeight, TransformerPrecision::Float32);
+          scoreBeliefHead = std::make_unique<TransformerLinear>(cudaHandles, name + "_scorebelief_simple", hiddenSize, scoreBeliefProjectSize, desc->scoreBeliefSimpleWeight, TransformerPrecision::Float32, desc->scoreBeliefSimpleBias);
         else
-          scoreBeliefHead = std::make_unique<TransformerLinear>(cudaHandles, name + "_scorebelief_mix", hiddenSize, scoreBeliefProjectSize, desc->scoreBeliefMixWeight, TransformerPrecision::Float32);
+          scoreBeliefHead = std::make_unique<TransformerLinear>(cudaHandles, name + "_scorebelief_mix", hiddenSize, scoreBeliefProjectSize, desc->scoreBeliefMixWeight, TransformerPrecision::Float32, desc->scoreBeliefMixBias);
       }
       scoreBeliefS2OffWeight = desc->scoreBeliefS2OffWeight;
       scoreBeliefS2ParWeight = desc->scoreBeliefS2ParWeight;
+      scoreBeliefS2OffBias = desc->scoreBeliefS2OffBias;
+      scoreBeliefS2ParBias = desc->scoreBeliefS2ParBias;
     }
-    valueHead = std::make_unique<TransformerLinear>(cudaHandles, name + "_value", hiddenSize, 3, desc->valueWeight, TransformerPrecision::Float32);
-    scoreValueHead = std::make_unique<TransformerLinear>(cudaHandles, name + "_scorevalue", hiddenSize, 6, desc->scoreValueWeight, TransformerPrecision::Float32);
-    ownershipHead = std::make_unique<TransformerLinear>(cudaHandles, name + "_ownership", hiddenSize, 1, desc->ownershipWeight, TransformerPrecision::Float32);
+    valueHead = std::make_unique<TransformerLinear>(cudaHandles, name + "_value", hiddenSize, 3, desc->valueWeight, TransformerPrecision::Float32, desc->valueBias);
+    scoreValueHead = std::make_unique<TransformerLinear>(cudaHandles, name + "_scorevalue", hiddenSize, 6, desc->scoreValueWeight, TransformerPrecision::Float32, desc->scoreValueBias);
+    ownershipHead = std::make_unique<TransformerLinear>(cudaHandles, name + "_ownership", hiddenSize, 1, desc->ownershipWeight, TransformerPrecision::Float32, desc->ownershipBias);
   }
 
   ~TransformerModel() {
@@ -4019,6 +4044,7 @@ static void finalizeTransformerScoreBelief(
   if(model.scoreMode == 2) {
     const int mid = len / 2;
     const float scoreParity = globalInput[model.numInputGlobalChannels - 1];
+    const bool hasS2Bias = !model.scoreBeliefS2OffBias.empty();
     for(int i = 0; i < len; i++) {
       int diff = i - mid;
       int parityBit = ((diff % 2) + 2) % 2;
@@ -4028,6 +4054,10 @@ static void finalizeTransformerScoreBelief(
         belief[(size_t)i * numBeliefs + j] +=
           offsetTerm * model.scoreBeliefS2OffWeight[j] +
           parityTerm * model.scoreBeliefS2ParWeight[j];
+        if(hasS2Bias) {
+          belief[(size_t)i * numBeliefs + j] +=
+            model.scoreBeliefS2OffBias[j] + model.scoreBeliefS2ParBias[j];
+        }
       }
     }
   }
