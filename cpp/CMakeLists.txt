@@ -94,6 +94,7 @@ elseif(USE_BACKEND STREQUAL "TENSORRT")
   message(STATUS "-DUSE_BACKEND=TENSORRT, using TensorRT backend.")
   set(NEURALNET_BACKEND_SOURCES
     neuralnet/trtbackend.cpp
+    neuralnet/transformerdesc.cpp
     )
   if(USE_CACHE_TENSORRT_PLAN AND (NOT BUILD_DISTRIBUTED))
     message(STATUS "-DUSE_CACHE_TENSORRT_PLAN is set, using TENSORRT plan cache.")
