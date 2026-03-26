@@ -238,29 +238,225 @@ template struct NumpyBuffer<int64_t>;
 
 #ifdef NO_LIBZIP
 
-static void throwZipError() {
-  throw StringError("KataGo was built without libzip library, unable to create zip file or write training data");
+// Built-in zip writer using store mode (no compression), no external dependencies.
+// Produces valid .npz files readable by numpy.
+// Limitations: ZIP32 only, maximum total file size < 4 GiB.
+
+#include <fstream>
+#include <mutex>
+#include <vector>
+
+static const uint64_t ZIP32_MAX = 0xFFFFFFFFULL;
+
+// CRC32 slice-by-8 lookup tables (standard polynomial 0xEDB88320).
+// Thread-safe: initialized exactly once via std::call_once.
+static uint32_t crc32Tables[8][256];
+static std::once_flag crc32TablesOnce;
+
+static void initCrc32Tables() {
+  for(uint32_t i = 0; i < 256; i++) {
+    uint32_t c = i;
+    for(int j = 0; j < 8; j++) {
+      if(c & 1)
+        c = 0xEDB88320u ^ (c >> 1);
+      else
+        c >>= 1;
+    }
+    crc32Tables[0][i] = c;
+  }
+  for(uint32_t i = 0; i < 256; i++) {
+    uint32_t c = crc32Tables[0][i];
+    for(int t = 1; t < 8; t++) {
+      c = crc32Tables[0][c & 0xFF] ^ (c >> 8);
+      crc32Tables[t][i] = c;
+    }
+  }
+}
+
+static uint32_t computeCrc32(const void* data, uint64_t len) {
+  std::call_once(crc32TablesOnce, initCrc32Tables);
+  const uint8_t* buf = (const uint8_t*)data;
+  uint32_t crc = 0xFFFFFFFFu;
+  while(len >= 8) {
+    uint32_t a = crc ^ ((uint32_t)buf[0] | ((uint32_t)buf[1] << 8) |
+                         ((uint32_t)buf[2] << 16) | ((uint32_t)buf[3] << 24));
+    uint32_t b = (uint32_t)buf[4] | ((uint32_t)buf[5] << 8) |
+                 ((uint32_t)buf[6] << 16) | ((uint32_t)buf[7] << 24);
+    crc = crc32Tables[7][a & 0xFF] ^
+          crc32Tables[6][(a >> 8) & 0xFF] ^
+          crc32Tables[5][(a >> 16) & 0xFF] ^
+          crc32Tables[4][(a >> 24) & 0xFF] ^
+          crc32Tables[3][b & 0xFF] ^
+          crc32Tables[2][(b >> 8) & 0xFF] ^
+          crc32Tables[1][(b >> 16) & 0xFF] ^
+          crc32Tables[0][(b >> 24) & 0xFF];
+    buf += 8;
+    len -= 8;
+  }
+  while(len--) {
+    crc = crc32Tables[0][(crc ^ *buf++) & 0xFF] ^ (crc >> 8);
+  }
+  return crc ^ 0xFFFFFFFFu;
+}
+
+struct BuiltinZipEntry {
+  string name;
+  uint32_t crc;
+  uint64_t size;
+  uint64_t localHeaderOffset;
+};
+
+struct BuiltinZipState {
+  ofstream out;
+  vector<BuiltinZipEntry> entries;
+  bool closed;
+};
+
+static void zipWriteU16(ofstream& out, uint16_t v) {
+  char buf[2];
+  buf[0] = (char)(v & 0xFF);
+  buf[1] = (char)(v >> 8);
+  out.write(buf, 2);
+}
+
+static void zipWriteU32(ofstream& out, uint32_t v) {
+  char buf[4];
+  buf[0] = (char)(v & 0xFF);
+  buf[1] = (char)((v >> 8) & 0xFF);
+  buf[2] = (char)((v >> 16) & 0xFF);
+  buf[3] = (char)(v >> 24);
+  out.write(buf, 4);
+}
+
+static void checkStream(ofstream& out, const string& fileName, const char* context) {
+  if(!out.good())
+    throw StringError(string("I/O error ") + context + " zip file " + fileName);
 }
 
 ZipFile::ZipFile(const string& fName)
   :fileName(fName),file(NULL)
 {
-  (void)file;
-  throwZipError();
+  BuiltinZipState* state = new BuiltinZipState();
+  state->closed = false;
+  state->out.open(fileName, std::ios::binary | std::ios::trunc);
+  if(!state->out.is_open()) {
+    delete state;
+    throw StringError("Could not open zip file for writing: " + fileName);
+  }
+  file = state;
 }
 
 ZipFile::~ZipFile() {
+  BuiltinZipState* state = (BuiltinZipState*)file;
+  if(state != NULL) {
+    if(state->out.is_open())
+      state->out.close();
+    delete state;
+  }
 }
 
 void ZipFile::writeBuffer(const char* nameWithinZip, void* data, uint64_t numBytes) {
-  (void)nameWithinZip;
-  (void)data;
-  (void)numBytes;
-  throwZipError();
+  BuiltinZipState* state = (BuiltinZipState*)file;
+
+  if(numBytes > ZIP32_MAX)
+    throw StringError(
+      "Built-in zip writer only supports ZIP32 (< 4 GiB per entry). Entry " +
+      string(nameWithinZip) + " is " + to_string(numBytes) + " bytes in " + fileName
+    );
+
+  BuiltinZipEntry entry;
+  entry.name = nameWithinZip;
+  entry.crc = computeCrc32(data, numBytes);
+  entry.size = numBytes;
+  entry.localHeaderOffset = (uint64_t)state->out.tellp();
+
+  if(entry.localHeaderOffset > ZIP32_MAX)
+    throw StringError(
+      "Built-in zip writer only supports ZIP32 (< 4 GiB total). File offset exceeded limit writing " +
+      string(nameWithinZip) + " in " + fileName
+    );
+
+  uint16_t nameLen = (uint16_t)entry.name.size();
+
+  // Local file header (30 fixed bytes + name)
+  ofstream& out = state->out;
+  zipWriteU32(out, 0x04034b50);  // local file header signature
+  zipWriteU16(out, 20);          // version needed to extract (2.0)
+  zipWriteU16(out, 0);           // general purpose bit flag
+  zipWriteU16(out, 0);           // compression method: store
+  zipWriteU16(out, 0);           // last mod file time
+  zipWriteU16(out, 0);           // last mod file date
+  zipWriteU32(out, entry.crc);
+  zipWriteU32(out, (uint32_t)entry.size);   // compressed size
+  zipWriteU32(out, (uint32_t)entry.size);   // uncompressed size
+  zipWriteU16(out, nameLen);
+  zipWriteU16(out, 0);           // extra field length
+  out.write(entry.name.c_str(), nameLen);
+  out.write((const char*)data, numBytes);
+
+  checkStream(out, fileName, "writing entry to");
+
+  state->entries.push_back(entry);
 }
 
 void ZipFile::close() {
-  throwZipError();
+  BuiltinZipState* state = (BuiltinZipState*)file;
+  if(state->closed) return;
+
+  ofstream& out = state->out;
+  uint64_t centralDirOffset = (uint64_t)out.tellp();
+
+  if(centralDirOffset > ZIP32_MAX)
+    throw StringError(
+      "Built-in zip writer only supports ZIP32 (< 4 GiB total). Central directory offset exceeded limit in " + fileName
+    );
+
+  // Central directory
+  for(const auto& entry : state->entries) {
+    uint16_t nameLen = (uint16_t)entry.name.size();
+    zipWriteU32(out, 0x02014b50);  // central directory file header signature
+    zipWriteU16(out, 20);          // version made by
+    zipWriteU16(out, 20);          // version needed to extract
+    zipWriteU16(out, 0);           // general purpose bit flag
+    zipWriteU16(out, 0);           // compression method: store
+    zipWriteU16(out, 0);           // last mod file time
+    zipWriteU16(out, 0);           // last mod file date
+    zipWriteU32(out, entry.crc);
+    zipWriteU32(out, (uint32_t)entry.size);   // compressed size
+    zipWriteU32(out, (uint32_t)entry.size);   // uncompressed size
+    zipWriteU16(out, nameLen);
+    zipWriteU16(out, 0);           // extra field length
+    zipWriteU16(out, 0);           // file comment length
+    zipWriteU16(out, 0);           // disk number start
+    zipWriteU16(out, 0);           // internal file attributes
+    zipWriteU32(out, 0);           // external file attributes
+    zipWriteU32(out, (uint32_t)entry.localHeaderOffset);
+    out.write(entry.name.c_str(), nameLen);
+  }
+
+  checkStream(out, fileName, "writing central directory to");
+
+  uint64_t centralDirEnd = (uint64_t)out.tellp();
+  uint64_t centralDirSize = centralDirEnd - centralDirOffset;
+
+  // End of central directory record
+  zipWriteU32(out, 0x06054b50);
+  zipWriteU16(out, 0);           // number of this disk
+  zipWriteU16(out, 0);           // disk where central directory starts
+  zipWriteU16(out, (uint16_t)state->entries.size());
+  zipWriteU16(out, (uint16_t)state->entries.size());
+  zipWriteU32(out, (uint32_t)centralDirSize);
+  zipWriteU32(out, (uint32_t)centralDirOffset);
+  zipWriteU16(out, 0);           // comment length
+
+  out.flush();
+  checkStream(out, fileName, "flushing");
+
+  out.close();
+  if(out.fail())
+    throw StringError("I/O error closing zip file " + fileName);
+
+  state->closed = true;
 }
 
 #else
