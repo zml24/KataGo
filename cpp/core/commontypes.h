@@ -32,7 +32,7 @@ struct enabled_t {
 };
 
 struct compute_precision_t {
-  enum value { FP32, FP16, BF16, Auto };
+  enum value { FP32, FP16, BF16, FP8, Auto };
   value x;
 
   compute_precision_t() = default;
@@ -42,7 +42,7 @@ struct compute_precision_t {
   constexpr bool operator!=(compute_precision_t a) const { return x != a.x; }
 
   std::string toString() const {
-    return x == FP32 ? "fp32" : x == FP16 ? "fp16" : x == BF16 ? "bf16" : "auto";
+    return x == FP32 ? "fp32" : x == FP16 ? "fp16" : x == BF16 ? "bf16" : x == FP8 ? "fp8" : "auto";
   }
 
   bool isExplicit() const {
@@ -56,6 +56,8 @@ struct compute_precision_t {
       buf = FP16;
     else if(v == "bf16" || v == "bfloat16")
       buf = BF16;
+    else if(v == "fp8" || v == "float8")
+      buf = FP8;
     else if(v == "auto")
       buf = Auto;
     else

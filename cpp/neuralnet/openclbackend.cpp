@@ -468,6 +468,8 @@ ComputeContext* NeuralNet::createComputeContext(
   enabled_t useNHWCMode,
   const LoadedModel* loadedModel
 ) {
+  if(precisionMode == compute_precision_t::FP8)
+    throw StringError("OpenCL backend: fp8 precision unsupported");
   if(precisionMode == compute_precision_t::BF16)
     throw StringError("OpenCL backend: bf16 precision unsupported");
   if(precisionMode == compute_precision_t::FP16)

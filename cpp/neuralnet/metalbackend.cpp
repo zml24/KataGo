@@ -561,6 +561,8 @@ bool NeuralNet::isTransformerModel(const LoadedModel* loadedModel) {
 //------------------------------------------------------------------------------
 
 static int32_t transformerPrecisionModeToRaw(compute_precision_t precisionMode) {
+  if(precisionMode == compute_precision_t::FP8)
+    throw StringError("Metal backend: fp8 precision unsupported");
   return
     precisionMode == compute_precision_t::FP32 ? 0 :
     precisionMode == compute_precision_t::FP16 ? 1 :
@@ -623,6 +625,8 @@ ComputeContext* NeuralNet::createComputeContext(
   (void)homeDataDirOverride;
   (void)openCLReTunePerBoardSize;
   if(loadedModel != nullptr && loadedModel->isTransformer) {
+    if(precisionMode == compute_precision_t::FP8)
+      throw StringError("Metal backend: fp8 precision unsupported");
     if(precisionMode == compute_precision_t::Auto) {
       if(useFP16Mode == enabled_t::False)
         precisionMode = compute_precision_t::FP32;
@@ -639,6 +643,8 @@ ComputeContext* NeuralNet::createComputeContext(
       useFP16Mode = enabled_t::False;
   }
   else {
+    if(precisionMode == compute_precision_t::FP8)
+      throw StringError("Metal backend: fp8 precision unsupported");
     if(precisionMode == compute_precision_t::BF16)
       throw StringError("Metal backend: cnn 模型不支持显式 bf16 precision");
     if(precisionMode == compute_precision_t::FP16)

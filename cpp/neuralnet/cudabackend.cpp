@@ -2260,6 +2260,16 @@ static bool cudaDeviceSupportsTransformerBFloat16(int majorComputeCapability, in
 #endif
 }
 
+static bool cudaDeviceSupportsTransformerFP8(int majorComputeCapability, int minorComputeCapability) {
+#ifdef KATAGO_CUDA_TRANSFORMER_FP8_AVAILABLE
+  return (majorComputeCapability == 8 && minorComputeCapability >= 9) || majorComputeCapability >= 9;
+#else
+  (void)majorComputeCapability;
+  (void)minorComputeCapability;
+  return false;
+#endif
+}
+
 static bool cudaDeviceSupportsOfficialTransformerAttention(
   const CudaHandles* cudaHandles,
   TransformerPrecision precision,
@@ -2300,6 +2310,10 @@ static TransformerPrecision chooseTransformerPrecision(
     if(!cudaDeviceSupportsTransformerBFloat16(majorComputeCapability, minorComputeCapability))
       throw StringError("Transformer CUDA backend bf16 需要 CUDA compute capability >= 8.0");
     return TransformerPrecision::BFloat16;
+  }
+  if(requestedMode == compute_precision_t::FP8) {
+    // FP8 is handled separately in createComputeHandle; should not reach here.
+    throw StringError("chooseTransformerPrecision should not be called with FP8; FP8 is handled in createComputeHandle");
   }
   if(requestedMode == compute_precision_t::Auto) {
     if(cudaDeviceSupportsTransformerBFloat16(majorComputeCapability, minorComputeCapability))
@@ -2388,6 +2402,54 @@ static void transformerMallocAndCopyWeights(
   throw StringError("当前 CUDA 编译环境不支持 Transformer bf16 权重");
 #endif
 }
+
+#ifdef KATAGO_CUDA_TRANSFORMER_FP8_AVAILABLE
+// Load weights for FP8: transpose from [in][out] to [out][in], quantize to FP8 E4M3 on CPU, upload.
+// All work is done on CPU to avoid per-layer GPU synchronization during model loading.
+static void transformerMallocAndCopyWeightsFP8(
+  const string& name,
+  const vector<float>& weights,
+  int inChannels,
+  int outChannels,
+  void*& fp8DeviceBuf,
+  float*& scaleDeviceBuf
+) {
+  size_t n = (size_t)inChannels * outChannels;
+  assert(weights.size() == n);
+
+  // CPU-side transpose: src[i * outCh + o] -> dst[o * inCh + i]
+  // and compute amax in one pass.
+  float amax = 0.0f;
+  vector<float> transposed(n);
+  for(int i = 0; i < inChannels; i++) {
+    for(int o = 0; o < outChannels; o++) {
+      float v = weights[(size_t)i * outChannels + o];
+      transposed[(size_t)o * inChannels + i] = v;
+      float av = fabsf(v);
+      if(av > amax) amax = av;
+    }
+  }
+
+  // Compute scale and quantize on CPU.
+  float scale = (amax == 0.0f) ? 1.0f : amax / 448.0f;
+  vector<uint8_t> fp8Bytes(n);
+  for(size_t idx = 0; idx < n; idx++) {
+    float val = transposed[idx] / scale;
+    // Clamp to FP8 E4M3 range [-448, 448] (already within range due to scale derivation,
+    // but saturate for safety against rounding).
+    __nv_fp8_e4m3 fp8val(val);
+    fp8Bytes[idx] = *reinterpret_cast<const uint8_t*>(&fp8val);
+  }
+
+  // Upload FP8 weights to GPU (single async-friendly memcpy, no temp buffer, no sync).
+  CUDA_ERR(name.c_str(), cudaMalloc(&fp8DeviceBuf, n));
+  CUDA_ERR(name.c_str(), cudaMemcpy(fp8DeviceBuf, fp8Bytes.data(), n, cudaMemcpyHostToDevice));
+
+  // Upload scale scalar to GPU.
+  CUDA_ERR(name.c_str(), cudaMalloc(&scaleDeviceBuf, sizeof(float)));
+  CUDA_ERR(name.c_str(), cudaMemcpy(scaleDeviceBuf, &scale, sizeof(float), cudaMemcpyHostToDevice));
+}
+#endif
 
 static vector<float> transformerConcatLinearWeightsByOutput(
   const vector<const vector<float>*>& weightSets,
@@ -2863,8 +2925,10 @@ struct TransformerLinear {
   const int inChannels;
   const int outChannels;
   const TransformerPrecision precision;
+  const bool useFP8;
   void* weightBuf;
   float* biasBuf;
+  float* weightScaleBuf; // FP8 weight scale (device scalar), null when !useFP8
 
   TransformerLinear(
     CudaHandles* cudaHandles,
@@ -2873,17 +2937,29 @@ struct TransformerLinear {
     int outChannels_,
     const vector<float>& weights,
     TransformerPrecision precision_,
-    const vector<float>& bias = {}
+    const vector<float>& bias = {},
+    bool useFP8_ = false
   ) :
     name(name_),
     inChannels(inChannels_),
     outChannels(outChannels_),
     precision(precision_),
+    useFP8(useFP8_),
     weightBuf(nullptr),
-    biasBuf(nullptr)
+    biasBuf(nullptr),
+    weightScaleBuf(nullptr)
   {
     (void)cudaHandles;
-    transformerMallocAndCopyWeights(name_, weights, weightBuf, precision);
+    if(useFP8) {
+      assert(bias.empty()); // FP8 only for block-internal linear layers which have no bias
+#ifdef KATAGO_CUDA_TRANSFORMER_FP8_AVAILABLE
+      transformerMallocAndCopyWeightsFP8(name_, weights, inChannels, outChannels, weightBuf, weightScaleBuf);
+#else
+      throw StringError("FP8 not available in this build");
+#endif
+    } else {
+      transformerMallocAndCopyWeights(name_, weights, weightBuf, precision);
+    }
     if(!bias.empty()) {
       assert((int)bias.size() == outChannels);
       size_t biasBytes = sizeof(float) * bias.size();
@@ -2896,6 +2972,8 @@ struct TransformerLinear {
     cudaFree(weightBuf);
     if(biasBuf != nullptr)
       cudaFree(biasBuf);
+    if(weightScaleBuf != nullptr)
+      cudaFree(weightScaleBuf);
   }
 
   TransformerLinear() = delete;
@@ -3084,6 +3162,102 @@ struct TransformerLinear {
     ));
   }
 
+#ifdef KATAGO_CUDA_TRANSFORMER_FP8_AVAILABLE
+  // FP8 matmul: dynamically quantize activation to FP8, run TN cublasLtMatmul, output in activation precision.
+  // Throws on heuristic failure (no cublasGemmEx fallback for FP8).
+  void runFP8Matmul(
+    CudaHandles* cudaHandles,
+    ScratchBuffers* scratch,
+    int batchSize,
+    const void* lowpInputBuf,
+    void* lowpOutputBuf
+  ) const {
+    assert(useFP8);
+    assert(weightScaleBuf != nullptr);
+    int numInputElts = batchSize * inChannels;
+    cudaDataType_t activDtype = transformerPrecisionToCudaType(precision);
+
+    // 1. Dynamic quantize activation to FP8
+    SizedBuf<void*> fp8InputBuf(scratch->allocator, (size_t)numInputElts);
+    SizedBuf<void*> inputScaleBuf(scratch->allocator, sizeof(float));
+
+    if(precision == TransformerPrecision::Float16)
+      customCudaDynamicQuantizeToFP8E4M3(reinterpret_cast<const half*>(lowpInputBuf), fp8InputBuf.buf, reinterpret_cast<float*>(inputScaleBuf.buf), numInputElts);
+#ifdef KATAGO_CUDA_BFLOAT16_AVAILABLE
+    else if(precision == TransformerPrecision::BFloat16)
+      customCudaDynamicQuantizeToFP8E4M3(reinterpret_cast<const bfloat16_t*>(lowpInputBuf), fp8InputBuf.buf, reinterpret_cast<float*>(inputScaleBuf.buf), numInputElts);
+#endif
+    else
+      ASSERT_UNREACHABLE;
+    CUDA_ERR(name.c_str(), cudaPeekAtLastError());
+
+    // 2. cublasLtMatmul with TN layout
+    cublasLtMatmulDesc_t operationDesc = nullptr;
+    cublasLtMatrixLayout_t wLayout = nullptr;
+    cublasLtMatrixLayout_t inLayout = nullptr;
+    cublasLtMatrixLayout_t outLayout = nullptr;
+    cublasLtMatmulPreference_t preference = nullptr;
+
+    cublasOperation_t transA = CUBLAS_OP_T;
+    cublasOperation_t transB = CUBLAS_OP_N;
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+    size_t maxWorkspaceBytes = TRANSFORMER_CUBLASLT_WORKSPACE_BYTES;
+    cublasLtMatmulHeuristicResult_t heuristicResult;
+    int returnedResults = 0;
+    float* wScalePtr = weightScaleBuf;
+    float* inScalePtr = reinterpret_cast<float*>(inputScaleBuf.buf);
+
+    CUBLAS_ERR(name.c_str(), cublasLtMatmulDescCreate(&operationDesc, CUBLAS_COMPUTE_32F, CUDA_R_32F));
+    CUBLAS_ERR(name.c_str(), cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_TRANSA, &transA, sizeof(transA)));
+    CUBLAS_ERR(name.c_str(), cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_TRANSB, &transB, sizeof(transB)));
+    CUBLAS_ERR(name.c_str(), cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_A_SCALE_POINTER, &wScalePtr, sizeof(wScalePtr)));
+    CUBLAS_ERR(name.c_str(), cublasLtMatmulDescSetAttribute(operationDesc, CUBLASLT_MATMUL_DESC_B_SCALE_POINTER, &inScalePtr, sizeof(inScalePtr)));
+
+    // A (weight): stored [inChannels, outChannels] col-major, LD=inChannels, transA=T -> logical [outChannels, inChannels]
+    CUBLAS_ERR(name.c_str(), cublasLtMatrixLayoutCreate(&wLayout, CUDA_R_8F_E4M3, inChannels, outChannels, inChannels));
+    CUBLAS_ERR(name.c_str(), cublasLtMatrixLayoutCreate(&inLayout, CUDA_R_8F_E4M3, inChannels, batchSize, inChannels));
+    CUBLAS_ERR(name.c_str(), cublasLtMatrixLayoutCreate(&outLayout, activDtype, outChannels, batchSize, outChannels));
+
+    CUBLAS_ERR(name.c_str(), cublasLtMatmulPreferenceCreate(&preference));
+    CUBLAS_ERR(name.c_str(), cublasLtMatmulPreferenceSetAttribute(
+      preference, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &maxWorkspaceBytes, sizeof(maxWorkspaceBytes)));
+
+    cublasStatus_t heuristicStatus = cublasLtMatmulAlgoGetHeuristic(
+      cudaHandles->cublasLt, operationDesc, wLayout, inLayout, outLayout, outLayout,
+      preference, 1, &heuristicResult, &returnedResults);
+
+    if(heuristicStatus != CUBLAS_STATUS_SUCCESS || returnedResults == 0) {
+      if(preference) cublasLtMatmulPreferenceDestroy(preference);
+      if(outLayout) cublasLtMatrixLayoutDestroy(outLayout);
+      if(inLayout) cublasLtMatrixLayoutDestroy(inLayout);
+      if(wLayout) cublasLtMatrixLayoutDestroy(wLayout);
+      if(operationDesc) cublasLtMatmulDescDestroy(operationDesc);
+      throw StringError("FP8 cublasLtMatmul: no algorithm found for " + name);
+    }
+
+    void* workspacePtr = nullptr;
+    SizedBuf<void*> workspaceBuf(scratch->allocator, heuristicResult.workspaceSize > 0 ? heuristicResult.workspaceSize : 1);
+    if(heuristicResult.workspaceSize > 0)
+      workspacePtr = workspaceBuf.buf;
+
+    CUBLAS_ERR(name.c_str(), cublasLtMatmul(
+      cudaHandles->cublasLt, operationDesc, &alpha,
+      weightBuf, wLayout,
+      fp8InputBuf.buf, inLayout,
+      &beta,
+      lowpOutputBuf, outLayout,
+      lowpOutputBuf, outLayout,
+      &heuristicResult.algo, workspacePtr, heuristicResult.workspaceSize, 0));
+
+    cublasLtMatmulPreferenceDestroy(preference);
+    cublasLtMatrixLayoutDestroy(outLayout);
+    cublasLtMatrixLayoutDestroy(inLayout);
+    cublasLtMatrixLayoutDestroy(wLayout);
+    cublasLtMatmulDescDestroy(operationDesc);
+  }
+#endif
+
   void apply(
     CudaHandles* cudaHandles,
     ScratchBuffers* scratch,
@@ -3091,6 +3265,7 @@ struct TransformerLinear {
     const void* inputBuf,
     void* outputBuf
   ) const {
+    assert(!useFP8); // FP8 layers should not use this method (stemGlobal uses it, but never with FP8)
     const float* inputFloatBuf = reinterpret_cast<const float*>(inputBuf);
     float* outputFloatBuf = reinterpret_cast<float*>(outputBuf);
     if(precision == TransformerPrecision::Float32) {
@@ -3117,6 +3292,8 @@ struct TransformerLinear {
 
   // inputBuf is already in lowp format (or FP32 if precision==Float32).
   // outputBuf is always FP32.
+  // inputBuf is already in lowp format (or FP32 if precision==Float32).
+  // outputBuf is always FP32. Used by head layers only, which never have useFP8.
   void applyWithLowpInput(
     CudaHandles* cudaHandles,
     ScratchBuffers* scratch,
@@ -3124,6 +3301,7 @@ struct TransformerLinear {
     const void* lowpInputBuf,
     void* outputBuf
   ) const {
+    assert(!useFP8); // Head layers only; FP8 layers should use applyWithLowpInputToLowp
     float* outputFloatBuf = reinterpret_cast<float*>(outputBuf);
     if(precision == TransformerPrecision::Float32) {
       runFloatMatmul(cudaHandles, batchSize, reinterpret_cast<const float*>(lowpInputBuf), outputFloatBuf);
@@ -3175,6 +3353,13 @@ struct TransformerLinear {
       return;
     }
 
+#ifdef KATAGO_CUDA_TRANSFORMER_FP8_AVAILABLE
+    if(useFP8) {
+      runFP8Matmul(cudaHandles, scratch, batchSize, lowpInputBuf, lowpOutputBuf);
+      return;
+    }
+#endif
+
     runLowpMatmul(cudaHandles, scratch, batchSize, lowpInputBuf, lowpOutputBuf);
   }
 };
@@ -3214,7 +3399,8 @@ struct TransformerBlock {
     int seqLen_,
     int maxBatchSize,
     int blockIdx,
-    TransformerPrecision precision_
+    TransformerPrecision precision_,
+    bool useFP8Weights = false
   ) :
     name("transformer_block_" + Global::intToString(blockIdx)),
     hiddenSize(hiddenSize_),
@@ -3239,9 +3425,11 @@ struct TransformerBlock {
         hiddenSize,
         vector<int>{hiddenSize, hiddenSize, hiddenSize}
       ),
-      precision_
+      precision_,
+      {},
+      useFP8Weights
     ),
-    outProj(cudaHandles, name + "_out", hiddenSize, hiddenSize, desc.outWeight, precision_),
+    outProj(cudaHandles, name + "_out", hiddenSize, hiddenSize, desc.outWeight, precision_, {}, useFP8Weights),
     norm2(name + "_norm2", desc.norm2Weight, precision_),
     ffnInProj(
       cudaHandles,
@@ -3253,9 +3441,11 @@ struct TransformerBlock {
         hiddenSize,
         vector<int>{ffnDim, ffnDim}
       ),
-      precision_
+      precision_,
+      {},
+      useFP8Weights
     ),
-    ffnW2(cudaHandles, name + "_ff2", ffnDim, hiddenSize, desc.ffnW2Weight, precision_)
+    ffnW2(cudaHandles, name + "_ff2", ffnDim, hiddenSize, desc.ffnW2Weight, precision_, {}, useFP8Weights)
   {
 #ifdef KATAGO_CUDNN_SDPA_AVAILABLE
     if(cudaDeviceSupportsOfficialTransformerAttention(cudaHandles, precision, headDim)) {
@@ -3640,6 +3830,7 @@ struct TransformerModel {
   const int scoreBeliefProjectSize;
   const bool inputsUsingNHWC;
   const TransformerPrecision precision;
+  const bool useFP8Weights;
 
   std::unique_ptr<CudnnManager> manager;
   std::unique_ptr<TransformerStemConv> stemConv;
@@ -3678,7 +3869,8 @@ struct TransformerModel {
     int nnX,
     int nnY,
     bool inputsUseNHWC,
-    TransformerPrecision precision_
+    TransformerPrecision precision_,
+    bool useFP8Weights_ = false
   ) :
     name(desc->name),
     modelVersion(desc->modelVersion),
@@ -3711,6 +3903,7 @@ struct TransformerModel {
     ),
     inputsUsingNHWC(inputsUseNHWC),
     precision(precision_),
+    useFP8Weights(useFP8Weights_),
     posBuf(nullptr),
     ropeCosBuf(nullptr),
     ropeSinBuf(nullptr)
@@ -3772,7 +3965,8 @@ struct TransformerModel {
         posLen * posLen,
         maxBatchSize,
         i,
-        precision
+        precision,
+        useFP8Weights
       ));
     }
 
@@ -4392,6 +4586,7 @@ struct ComputeHandle {
   std::unique_ptr<TransformerBuffers> transformerBuffers;
   const bool usingFP16;
   const TransformerPrecision transformerPrecision;
+  const bool useFP8Weights;
   const int nnXLen;
   const int nnYLen;
   const bool requireExactNNLen;
@@ -4408,11 +4603,13 @@ struct ComputeHandle {
     bool inputsUseNHWC_,
     bool useFP16,
     bool useNHWC,
-    TransformerPrecision transformerPrecision_
+    TransformerPrecision transformerPrecision_,
+    bool useFP8Weights_ = false
   ) :
     isTransformer(loadedModel->isTransformer),
     usingFP16(isTransformer ? transformerPrecision_ == TransformerPrecision::Float16 : useFP16),
     transformerPrecision(transformerPrecision_),
+    useFP8Weights(useFP8Weights_),
     nnXLen(context->nnXLen),
     nnYLen(context->nnYLen),
     requireExactNNLen(requireExactNNLen_),
@@ -4431,7 +4628,7 @@ struct ComputeHandle {
     else {
       transformerModel = std::make_unique<TransformerModel>(
         cudaHandles.get(), loadedModel->transformerDesc.get(), maxBatchSize,
-        nnXLen, nnYLen, inputsUseNHWC, transformerPrecision
+        nnXLen, nnYLen, inputsUseNHWC, transformerPrecision, useFP8Weights
       );
       scratch = std::make_unique<ScratchBuffers>(maxBatchSize, nnXLen, nnYLen, false);
       transformerBuffers = std::make_unique<TransformerBuffers>(cudaHandles.get(), *transformerModel, maxBatchSize);
@@ -4469,9 +4666,20 @@ ComputeHandle* NeuralNet::createComputeHandle(
 
   bool useFP16 = false;
   bool useNHWC = false;
+  bool fp8Weights = false;
   TransformerPrecision transformerPrecision = TransformerPrecision::Float32;
   if(loadedModel->isTransformer) {
-    transformerPrecision = chooseTransformerPrecision(context->precisionMode, prop.major, prop.minor);
+    if(context->precisionMode == compute_precision_t::FP8) {
+#ifndef KATAGO_CUDA_TRANSFORMER_FP8_AVAILABLE
+      throw StringError("FP8 not available in this build: requires CUDA >= 11.8, cublasLt, and BF16 Transformer support");
+#endif
+      if(!cudaDeviceSupportsTransformerFP8(prop.major, prop.minor))
+        throw StringError("FP8 requires compute capability >= 8.9 (Ada Lovelace / Hopper)");
+      fp8Weights = true;
+      transformerPrecision = TransformerPrecision::BFloat16;
+    } else {
+      transformerPrecision = chooseTransformerPrecision(context->precisionMode, prop.major, prop.minor);
+    }
     useFP16 = (transformerPrecision == TransformerPrecision::Float16);
     useNHWC = false;
     if(!requireExactNNLen) {
@@ -4479,6 +4687,8 @@ ComputeHandle* NeuralNet::createComputeHandle(
     }
   }
   else {
+    if(context->precisionMode == compute_precision_t::FP8)
+      throw StringError("Cuda CNN backend does not support fp8 precision");
     if(context->precisionMode == compute_precision_t::BF16)
       throw StringError("Cuda CNN backend 暂不支持 bf16 precision");
 
@@ -4535,7 +4745,7 @@ ComputeHandle* NeuralNet::createComputeHandle(
   }
 
   ComputeHandle* gpuHandle = new ComputeHandle(
-    context,loadedModel,prop.major,prop.minor,maxBatchSize,requireExactNNLen,inputsUseNHWC,useFP16,useNHWC,transformerPrecision
+    context,loadedModel,prop.major,prop.minor,maxBatchSize,requireExactNNLen,inputsUseNHWC,useFP16,useNHWC,transformerPrecision,fp8Weights
   );
   if(logger != NULL) {
     logger->write(
@@ -4551,6 +4761,7 @@ ComputeHandle* NeuralNet::createComputeHandle(
       " modelType = " + string(loadedModel->isTransformer ? "transformer" : "cnn") +
       (loadedModel->isTransformer ?
         " transformerPrecision = " + string(transformerPrecisionName(transformerPrecision)) +
+        " useFP8Weights = " + Global::boolToString(fp8Weights) +
         " transformerAttention = " + string(gpuHandle->transformerModel->attentionPathName())
         : "")
     );

@@ -1748,6 +1748,8 @@ ComputeContext* NeuralNet::createComputeContext(
     useFP16 = false;
   else if(precisionMode == compute_precision_t::BF16)
     throw StringError("Eigen backend: bf16 precision unsupported");
+  else if(precisionMode == compute_precision_t::FP8)
+    throw StringError("Eigen backend: fp8 precision unsupported");
   bool useNHWC = useNHWCMode == enabled_t::False ? false : true;
 
   if(useFP16)

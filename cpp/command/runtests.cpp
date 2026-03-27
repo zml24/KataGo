@@ -293,7 +293,7 @@ int MainCmds::runtransformerdump(const vector<string>& args) {
   size_t idx = 3;
   auto isPrecision = [](const string& arg) {
     string value = Global::toLower(arg);
-    return value == "fp32" || value == "fp16" || value == "bf16";
+    return value == "fp32" || value == "fp16" || value == "bf16" || value == "fp8";
   };
 
   if(idx < args.size() && !isPrecision(args[idx])) {
@@ -307,11 +307,11 @@ int MainCmds::runtransformerdump(const vector<string>& args) {
   if(idx < args.size()) {
     string value = Global::toLower(args[idx]);
     if(!compute_precision_t::tryParse(value, precisionMode)) {
-      cerr << "Transformer dump precision must be fp32 / fp16 / bf16" << endl;
+      cerr << "Transformer dump precision must be fp32 / fp16 / bf16 / fp8" << endl;
       return 1;
     }
     if(precisionMode == compute_precision_t::Auto) {
-      cerr << "Transformer dump precision must be fp32 / fp16 / bf16" << endl;
+      cerr << "Transformer dump precision must be fp32 / fp16 / bf16 / fp8" << endl;
       return 1;
     }
     precisionLabel = precisionMode.toString();

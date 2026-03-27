@@ -2291,3 +2291,110 @@ void customCudaMeanPoolNLC(const __nv_bfloat16* in, __nv_bfloat16* out, int batc
   launchMeanPoolNLC<__nv_bfloat16>(in, out, batchSize, seqLen, cSize);
 }
 #endif
+
+//--------------------------------------------------------------------------------------------------------------
+// FP8 E4M3 quantization kernels
+//--------------------------------------------------------------------------------------------------------------
+
+#ifdef KATAGO_CUDA_FP8_AVAILABLE
+
+// Pass 1: parallel reduction to find amax = max(|x[i]|), then compute scale = amax / 448.
+// Uses a single block for simplicity (sufficient for model-loading and per-layer activation sizes).
+__global__
+void fp8AmaxKernel(const float* __restrict__ in, float* __restrict__ scaleOut, int n) {
+  extern __shared__ float sdata[];
+  int tid = threadIdx.x;
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  float val = 0.0f;
+  // Grid-stride loop to handle n > blockDim
+  for(int i = idx; i < n; i += blockDim.x * gridDim.x)
+    val = fmaxf(val, fabsf(in[i]));
+  sdata[tid] = val;
+  __syncthreads();
+  // Shared-memory reduction
+  for(int s = blockDim.x / 2; s > 0; s >>= 1) {
+    if(tid < s)
+      sdata[tid] = fmaxf(sdata[tid], sdata[tid + s]);
+    __syncthreads();
+  }
+  if(tid == 0) {
+    float amax = sdata[0];
+    scaleOut[0] = (amax == 0.0f) ? 1.0f : amax / 448.0f;
+  }
+}
+
+// Pass 2: element-wise quantize float -> FP8 E4M3 using the precomputed scale.
+__global__
+void fp8QuantizeKernel(const float* __restrict__ in, __nv_fp8_e4m3* __restrict__ out,
+                       const float* __restrict__ scale, int n) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if(idx < n) {
+    float s = scale[0];
+    float val = in[idx] / s;
+    out[idx] = __nv_fp8_e4m3(val);
+  }
+}
+
+void customCudaQuantizeToFP8E4M3(const float* in, void* fp8Out, float* scaleOut, int n) {
+  int blockSize = 256;
+  // Pass 1: single block amax reduction
+  fp8AmaxKernel<<<1, blockSize, blockSize * sizeof(float)>>>(in, scaleOut, n);
+  // Pass 2: quantize
+  int numBlocks = (n + blockSize - 1) / blockSize;
+  fp8QuantizeKernel<<<numBlocks, blockSize>>>(in, reinterpret_cast<__nv_fp8_e4m3*>(fp8Out), scaleOut, n);
+}
+
+// Template for dynamic quantization from lowp (half / bfloat16) activation.
+// Pass 1: convert to float and find amax in one kernel.
+template<typename T>
+__global__
+void fp8DynAmaxKernel(const T* __restrict__ in, float* __restrict__ scaleOut, int n) {
+  extern __shared__ float sdata[];
+  int tid = threadIdx.x;
+  float val = 0.0f;
+  for(int i = tid; i < n; i += blockDim.x)
+    val = fmaxf(val, fabsf((float)in[i]));
+  sdata[tid] = val;
+  __syncthreads();
+  for(int s = blockDim.x / 2; s > 0; s >>= 1) {
+    if(tid < s)
+      sdata[tid] = fmaxf(sdata[tid], sdata[tid + s]);
+    __syncthreads();
+  }
+  if(tid == 0) {
+    float amax = sdata[0];
+    scaleOut[0] = (amax == 0.0f) ? 1.0f : amax / 448.0f;
+  }
+}
+
+// Pass 2: convert lowp to float, divide by scale, cast to FP8.
+template<typename T>
+__global__
+void fp8DynQuantizeKernel(const T* __restrict__ in, __nv_fp8_e4m3* __restrict__ out,
+                          const float* __restrict__ scale, int n) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if(idx < n) {
+    float s = scale[0];
+    float val = (float)in[idx] / s;
+    out[idx] = __nv_fp8_e4m3(val);
+  }
+}
+
+template<typename T>
+static void launchDynamicQuantizeFP8(const T* in, void* fp8Out, float* scaleOut, int n) {
+  int blockSize = 256;
+  fp8DynAmaxKernel<T><<<1, blockSize, blockSize * sizeof(float)>>>(in, scaleOut, n);
+  int numBlocks = (n + blockSize - 1) / blockSize;
+  fp8DynQuantizeKernel<T><<<numBlocks, blockSize>>>(in, reinterpret_cast<__nv_fp8_e4m3*>(fp8Out), scaleOut, n);
+}
+
+void customCudaDynamicQuantizeToFP8E4M3(const half* in, void* fp8Out, float* scaleOut, int n) {
+  launchDynamicQuantizeFP8<half>(in, fp8Out, scaleOut, n);
+}
+#ifdef KATAGO_CUDA_BFLOAT16_AVAILABLE
+void customCudaDynamicQuantizeToFP8E4M3(const __nv_bfloat16* in, void* fp8Out, float* scaleOut, int n) {
+  launchDynamicQuantizeFP8<__nv_bfloat16>(in, fp8Out, scaleOut, n);
+}
+#endif
+
+#endif // KATAGO_CUDA_FP8_AVAILABLE

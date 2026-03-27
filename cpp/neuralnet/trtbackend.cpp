@@ -63,6 +63,9 @@ ComputeContext* NeuralNet::createComputeContext(
   (void)openCLTunerFile;
   (void)openCLReTunePerBoardSize;
   (void)loadedModel;
+  if(precisionMode == compute_precision_t::FP8) {
+    throw StringError("TensorRT backend: fp8 precision unsupported");
+  }
   if(precisionMode == compute_precision_t::BF16) {
     throw StringError("TensorRT backend: bf16 precision unsupported");
   }

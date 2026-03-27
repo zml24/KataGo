@@ -102,4 +102,14 @@ void customCudaMeanPoolNLC(const __nv_bfloat16* in, __nv_bfloat16* out, int batc
 #endif
 
 
+#ifdef KATAGO_CUDA_FP8_AVAILABLE
+// Compute amax of FP32 tensor and quantize to FP8 E4M3. Writes scale = amax/448 to scaleOut (device).
+void customCudaQuantizeToFP8E4M3(const float* in, void* fp8Out, float* scaleOut, int n);
+// Dynamic quantize lowp activation to FP8 E4M3 with per-tensor scale.
+void customCudaDynamicQuantizeToFP8E4M3(const half* in, void* fp8Out, float* scaleOut, int n);
+#ifdef KATAGO_CUDA_BFLOAT16_AVAILABLE
+void customCudaDynamicQuantizeToFP8E4M3(const __nv_bfloat16* in, void* fp8Out, float* scaleOut, int n);
+#endif
+#endif
+
 #endif  // NEURALNET_CUDAHELPERS_H_

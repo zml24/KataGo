@@ -305,13 +305,15 @@ vector<NNEvaluator*> Setup::initializeNNEvaluators(
       if(!hasExplicitPrecision)
         precisionMode = compute_precision_t::FP32;
       else if(precisionMode == compute_precision_t::Auto)
-        throw StringError("nnModelType=tf 时，nnPrecision 只能是 fp32 / fp16 / bf16，不能是 auto");
+        throw StringError("nnModelType=tf 时，nnPrecision 只能是 fp32 / fp16 / bf16 / fp8，不能是 auto");
     }
     if(modelType == nn_model_type_t::TF) {
       if(backendPrefix != "cuda" && backendPrefix != "metal" && backendPrefix != "eigen")
         throw StringError("nnModelType=tf 仅支持 cuda / metal / eigen backend，当前 backend 为: " + backendPrefix);
       if(backendPrefix == "eigen" && precisionMode != compute_precision_t::FP32)
         throw StringError("Eigen backend 的 nnModelType=tf 仅支持 nnPrecision=fp32");
+      if(precisionMode == compute_precision_t::FP8 && backendPrefix != "cuda")
+        throw StringError("fp8 precision 仅支持 cuda backend，当前 backend 为: " + backendPrefix);
     }
 
     enabled_t useNHWCMode = enabled_t::Auto;

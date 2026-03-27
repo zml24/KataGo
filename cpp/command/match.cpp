@@ -173,7 +173,7 @@ static MatchNNConfig getMatchNNConfigForBot(
     if(!hasExplicitPrecision)
       config.precisionMode = compute_precision_t::FP32;
     else if(config.precisionMode == compute_precision_t::Auto)
-      throw StringError("nnModelType=tf 时，nnPrecision 只能是 fp32 / fp16 / bf16，不能是 auto");
+      throw StringError("nnModelType=tf 时，nnPrecision 只能是 fp32 / fp16 / bf16 / fp8，不能是 auto");
   }
   config.useNHWCMode = getEnabledWithFallback(
     cfg,
