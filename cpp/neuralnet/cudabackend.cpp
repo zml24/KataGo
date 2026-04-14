@@ -9,6 +9,7 @@
 #include "../neuralnet/nninputs.h"
 #include "../neuralnet/sgfmetadata.h"
 #include "../neuralnet/nneval.h"
+#include "../neuralnet/serve_profiler.h"
 #include "../neuralnet/desc.h"
 
 #include "../core/simpleallocator.h"
@@ -2584,6 +2585,9 @@ void NeuralNet::getOutput(
   assert(numBatchEltsFilled <= inputBuffers->maxBatchSize);
   assert(numBatchEltsFilled > 0);
   const int batchSize = numBatchEltsFilled;
+  const bool _profEnabled = g_serveProfileEnabled.load(std::memory_order_relaxed);
+  std::chrono::steady_clock::time_point _goT0, _goT1, _goT2, _goT3, _goT4, _goT5;
+  if(_profEnabled) _goT0 = std::chrono::steady_clock::now();
   const int nnXLen = gpuHandle->nnXLen;
   const int nnYLen = gpuHandle->nnYLen;
   const int modelVersion = gpuHandle->model->modelVersion;
@@ -2617,6 +2621,7 @@ void NeuralNet::getOutput(
     SymmetryHelpers::copyInputsWithSymmetry(rowSpatial, rowSpatialInput, 1, nnYLen, nnXLen, numSpatialFeatures, gpuHandle->inputsUseNHWC, inputBufs[nIdx]->symmetry);
   }
 
+  if(_profEnabled) _goT1 = std::chrono::steady_clock::now();
   Buffers* buffers = gpuHandle->buffers.get();
   ScratchBuffers* scratch = gpuHandle->scratch.get();
 
@@ -2682,6 +2687,7 @@ void NeuralNet::getOutput(
     }
   }
 
+  if(_profEnabled) _goT2 = std::chrono::steady_clock::now();
   gpuHandle->model->apply(
     gpuHandle->cudaHandles.get(),
     scratch,
@@ -2703,12 +2709,14 @@ void NeuralNet::getOutput(
     buffers->workspaceBytes
   );
 
+  if(_profEnabled) _goT3 = std::chrono::steady_clock::now();
   CUDA_ERR("getOutput",cudaMemcpy(inputBuffers->policyPassResults, buffers->policyPassBuf, inputBuffers->singlePolicyPassResultBytes*batchSize, cudaMemcpyDeviceToHost));
   CUDA_ERR("getOutput",cudaMemcpy(inputBuffers->policyResults, buffers->policyBuf, inputBuffers->singlePolicyResultBytes*batchSize, cudaMemcpyDeviceToHost));
   CUDA_ERR("getOutput",cudaMemcpy(inputBuffers->valueResults, buffers->valueBuf, inputBuffers->singleValueResultBytes*batchSize, cudaMemcpyDeviceToHost));
   CUDA_ERR("getOutput",cudaMemcpy(inputBuffers->scoreValueResults, buffers->scoreValueBuf, inputBuffers->singleScoreValueResultBytes*batchSize, cudaMemcpyDeviceToHost));
   CUDA_ERR("getOutput",cudaMemcpy(inputBuffers->ownershipResults, buffers->ownershipBuf, inputBuffers->singleOwnershipResultBytes*batchSize, cudaMemcpyDeviceToHost));
 
+  if(_profEnabled) _goT4 = std::chrono::steady_clock::now();
   assert(outputs.size() == batchSize);
 
   float policyProbsTmp[NNPos::MAX_NN_POLICY_SIZE];
@@ -2813,6 +2821,14 @@ void NeuralNet::getOutput(
     }
   }
 
+  if(_profEnabled) {
+    _goT5 = std::chrono::steady_clock::now();
+    g_goTimings.input_asm_us   = std::chrono::duration<double,std::micro>(_goT1 - _goT0).count();
+    g_goTimings.h2d_us         = std::chrono::duration<double,std::micro>(_goT2 - _goT1).count();
+    g_goTimings.gpu_compute_us = std::chrono::duration<double,std::micro>(_goT3 - _goT2).count();
+    g_goTimings.d2h_us         = std::chrono::duration<double,std::micro>(_goT4 - _goT3).count();
+    g_goTimings.output_post_us = std::chrono::duration<double,std::micro>(_goT5 - _goT4).count();
+  }
 }
 
 //TESTING ----------------------------------------------------------------------------------
