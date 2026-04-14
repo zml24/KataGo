@@ -1,6 +1,7 @@
 #include "../neuralnet/nneval.h"
 #include "../neuralnet/modelversion.h"
 #include "../core/test.h"
+#include "../neuralnet/serve_profiler.h"
 
 using namespace std;
 
@@ -433,7 +434,8 @@ void NNEvaluator::serve(
   int64_t numRowsHandledThisThread = 0;
 
   ComputeHandle* gpuHandle = NULL;
-  if(loadedModel != NULL)
+  if(loadedModel != NULL) {
+    auto tCreateHandle = std::chrono::steady_clock::now();
     gpuHandle = NeuralNet::createComputeHandle(
       computeContext,
       loadedModel,
@@ -444,6 +446,9 @@ void NNEvaluator::serve(
       gpuIdxForThisThread,
       serverThreadIdx
     );
+    double chMs = std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now() - tCreateHandle).count();
+    if(logger) logger->write("TIMING: createComputeHandle = " + Global::doubleToString(chMs) + " ms on GPU " + Global::intToString(gpuIdxForThisThread));
+  }
 
   {
     lock_guard<std::mutex> lock(bufferMutex);
@@ -459,15 +464,39 @@ void NNEvaluator::serve(
 
   vector<NNOutput*> outputBuf;
 
+  // Overlap notify: previous batch's results notified during next batch's GPU computation
+  vector<NNResultBuf*> prevOverlapResultBufs;
+  vector<NNOutput*> prevOverlapOutputBuf;
+  int prevOverlapNumRows = 0;
+
   unique_lock<std::mutex> lock(bufferMutex,std::defer_lock);
+  initServeProfiler();
+  const bool _profEnabled = g_serveProfileEnabled.load(std::memory_order_relaxed);
+  ServeProfileStats _prof;
   while(true) {
+    ServeProfileStats::TP _tCycleStart{}, _tAfterPop{}, _tAfterAlloc{};
+    ServeProfileStats::TP _tBeforeGO{}, _tAfterGO{}, _tBeforeNotify{}, _tAfterNotify{};
+    if(_profEnabled) _tCycleStart = ServeProfileStats::Clock::now();
     resultBufs.clear();
     int desiredBatchSize = std::min(maxBatchSize, currentBatchSize.load(std::memory_order_acquire));
     bool gotAnything = queryQueue.waitPopUpToN(resultBufs,desiredBatchSize);
     //Queue being closed is a signal that we're done.
-    if(!gotAnything)
+    if(!gotAnything) {
+      // Flush last batch's deferred notify before exiting
+      if(prevOverlapNumRows > 0) {
+        NNOutputPool* pool = &nnOutputPool;
+        for(int row = 0; row < prevOverlapNumRows; row++) {
+          NNResultBuf* rb = prevOverlapResultBufs[row];
+          auto rp = std::shared_ptr<NNOutput>(prevOverlapOutputBuf[row], [pool](NNOutput* p) { pool->release(p); });
+          { lock_guard<std::mutex> rl(rb->resultMutex); rb->result = std::move(rp); rb->hasResult = true; }
+          rb->clientWaitingForResult.notify_one();
+        }
+        prevOverlapNumRows = 0;
+      }
       break;
+    }
 
+    if(_profEnabled) _tAfterPop = ServeProfileStats::Clock::now();
     int numRows = (int)resultBufs.size();
     testAssert(numRows > 0);
 
@@ -541,11 +570,12 @@ void NNEvaluator::serve(
         resultBuf->clientWaitingForResult.notify_all();
         resultLock.unlock();
       }
+      continue; // debug path: skip profiling
     }
     else {
       outputBuf.clear();
       for(int row = 0; row<numRows; row++) {
-        NNOutput* emptyOutput = new NNOutput();
+        NNOutput* emptyOutput = nnOutputPool.acquire();
         testAssert(resultBufs[row] != NULL);
         emptyOutput->nnXLen = nnXLen;
         emptyOutput->nnYLen = nnYLen;
@@ -556,6 +586,7 @@ void NNEvaluator::serve(
         outputBuf.push_back(emptyOutput);
       }
 
+      if(_profEnabled) _tAfterAlloc = ServeProfileStats::Clock::now();
       for(int row = 0; row<numRows; row++) {
         if(resultBufs[row]->symmetry == NNInputs::SYMMETRY_NOTSPECIFIED) {
           if(doRandomize)
@@ -567,28 +598,56 @@ void NNEvaluator::serve(
         }
       }
 
+      // Set up overlap callback: notify previous batch during GPU computation
+      NNOutputPool* pool = &nnOutputPool;
+      if(prevOverlapNumRows > 0) {
+        auto pBufs = std::move(prevOverlapResultBufs);
+        auto pOuts = std::move(prevOverlapOutputBuf);
+        int pN = prevOverlapNumRows;
+        prevOverlapNumRows = 0;
+        g_gpuOverlapCallback = [pBufs = std::move(pBufs), pOuts = std::move(pOuts), pN, pool]() mutable {
+          for(int row = 0; row < pN; row++) {
+            NNResultBuf* rb = pBufs[row];
+            auto rp = std::shared_ptr<NNOutput>(pOuts[row], [pool](NNOutput* p) { pool->release(p); });
+            {
+              lock_guard<std::mutex> rl(rb->resultMutex);
+              rb->result = std::move(rp);
+              rb->hasResult = true;
+            }
+            rb->clientWaitingForResult.notify_one();
+          }
+        };
+      }
+
+      if(_profEnabled) _tBeforeGO = ServeProfileStats::Clock::now();
       NeuralNet::getOutput(gpuHandle, buf.inputBuffers, numRows, resultBufs.data(), outputBuf);
+      if(_profEnabled) _tAfterGO = ServeProfileStats::Clock::now();
       testAssert(outputBuf.size() == numRows);
+
+      // If backend didn't execute overlap callback (CUDA, or profiling mode), do it now
+      if(g_gpuOverlapCallback) {
+        g_gpuOverlapCallback();
+        g_gpuOverlapCallback = nullptr;
+      }
 
       m_numRowsProcessed.fetch_add(numRows, std::memory_order_relaxed);
       m_numBatchesProcessed.fetch_add(1, std::memory_order_relaxed);
       numRowsHandledThisThread += numRows;
       numBatchesHandledThisThread += 1;
 
+      // Save current batch for overlap notify in next iteration
+      if(_profEnabled) _tBeforeNotify = ServeProfileStats::Clock::now();
+      prevOverlapResultBufs.resize(numRows);
+      prevOverlapOutputBuf.resize(numRows);
       for(int row = 0; row < numRows; row++) {
-        testAssert(resultBufs[row] != NULL);
-        NNResultBuf* resultBuf = resultBufs[row];
+        prevOverlapResultBufs[row] = resultBufs[row];
+        prevOverlapOutputBuf[row] = outputBuf[row];
         resultBufs[row] = NULL;
-
-        unique_lock<std::mutex> resultLock(resultBuf->resultMutex);
-        testAssert(resultBuf->hasResult == false);
-        resultBuf->result = std::shared_ptr<NNOutput>(outputBuf[row]);
-        resultBuf->hasResult = true;
-        resultBuf->clientWaitingForResult.notify_all();
-        resultLock.unlock();
       }
+      prevOverlapNumRows = numRows;
     }
 
+    if(_profEnabled) _tAfterNotify = ServeProfileStats::Clock::now();
     //Lock and update stats before looping again
     lock.lock();
     numOngoingEvals -= numRows;
@@ -599,6 +658,17 @@ void NNEvaluator::serve(
       waitingForFinish.notify_all();
     }
     lock.unlock();
+    if(_profEnabled) {
+      auto _tEnd = ServeProfileStats::Clock::now();
+      _prof.queue_pop_us  += ServeProfileStats::us(_tCycleStart, _tAfterPop);
+      _prof.alloc_us      += ServeProfileStats::us(_tAfterPop, _tAfterAlloc);
+      _prof.sym_us        += ServeProfileStats::us(_tAfterAlloc, _tBeforeGO);
+      _prof.get_output_us += ServeProfileStats::us(_tBeforeGO, _tAfterGO);
+      _prof.notify_us     += ServeProfileStats::us(_tBeforeNotify, _tAfterNotify);
+      _prof.bufupd_us     += ServeProfileStats::us(_tAfterNotify, _tEnd);
+      _prof.addBatch(numRows);
+      if(_prof.due()) _prof.report(gpuIdxForThisThread);
+    }
     continue;
   }
 

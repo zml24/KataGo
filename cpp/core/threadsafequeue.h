@@ -188,6 +188,24 @@ class ThreadSafeContainer
     return true;
   }
 
+  // Non-blocking batch pop. Appends up to n elements to buf.
+  // Returns the number of elements actually popped. Returns 0 if queue is empty or closed.
+  inline size_t tryPopUpToN(std::vector<T>& buf, size_t n)
+  {
+    std::lock_guard<std::mutex> lock(mutex);
+    if(closed)
+      return 0;
+    size_t size = sizeUnsynchronized();
+    if(size <= 0)
+      return 0;
+    size_t numToPop = std::min(size, n);
+    for(size_t i = 0; i < numToPop; i++)
+      buf.push_back(popUnsynchronized());
+    if(size >= maxSize && size < maxSize + n)
+      notFullCondVar.notify_all();
+    return numToPop;
+  }
+
 };
 
 

@@ -266,6 +266,34 @@ class NNEvaluator {
   //Modifiable batch size smaller than maxBatchSize
   std::atomic<int> currentBatchSize;
 
+  // Object pool for NNOutput to reduce heap allocation overhead in serve().
+  // Each serve() batch allocates ~192 NNOutput objects; pooling avoids malloc/free syscalls.
+  struct NNOutputPool {
+    std::vector<NNOutput*> freeList;
+    std::mutex mu;
+    ~NNOutputPool() { for(auto* p : freeList) delete p; }
+    NNOutput* acquire() {
+      {
+        std::lock_guard<std::mutex> lock(mu);
+        if(!freeList.empty()) {
+          NNOutput* p = freeList.back();
+          freeList.pop_back();
+          return p;
+        }
+      }
+      return new NNOutput();
+    }
+    void release(NNOutput* p) {
+      delete[] p->whiteOwnerMap;
+      p->whiteOwnerMap = nullptr;
+      delete[] p->noisedPolicyProbs;
+      p->noisedPolicyProbs = nullptr;
+      std::lock_guard<std::mutex> lock(mu);
+      freeList.push_back(p);
+    }
+  };
+  NNOutputPool nnOutputPool;
+
   //Queued up requests
   ThreadSafeQueue<NNResultBuf*> queryQueue;
 

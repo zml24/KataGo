@@ -15,6 +15,10 @@
 #include "../neuralnet/nninputs.h"
 #include "../neuralnet/nninterface.h"
 
+#include <chrono>
+
+#include "../neuralnet/serve_profiler.h"
+
 using namespace std;
 using namespace nvinfer1;
 
@@ -1074,6 +1078,322 @@ struct TRTErrorRecorder : IErrorRecorder {
   }
 };
 
+// ============================================================
+// TensorRT Engine Refit support
+// Enabled at runtime via KATAGO_TRT_REFIT=1
+// ============================================================
+
+struct RefitEngineCache {
+  mutex mu;
+  string plan;                 // serialized kREFIT engine (base for refit, NOT current weights)
+  bool valid = false;
+  int maxBatchSize = 0;
+  int nnXLen = 0, nnYLen = 0;
+  bool usingFP16 = false;
+  bool requireExactNNLen = false;
+  uint8_t tuneHash[32] = {};   // architecture signature (descHash from ModelDesc)
+  string deviceName;           // device compatibility class (prop->name), aligned with disk cache
+
+  // Per-GPU standby engines: keep a live (pre-deserialized) engine per GPU device
+  // to skip the ~12s deserializeCudaEngine step on subsequent model switches.
+  // Keyed by CUDA device index to prevent cross-device engine reuse (TRT engines
+  // are bound to the CUDA context they were deserialized on).
+  // Each entry is tagged with the architecture hash it was built from; a mismatch
+  // (e.g. architecture switch) causes the stale engine to be discarded.
+  struct StandbyEntry {
+    unique_ptr<ICudaEngine> engine;
+    uint8_t tuneHash[32] = {};
+  };
+  map<int, StandbyEntry> standbyEngines;
+
+  // Persistent logger for standby engine creation. Standby engines outlive the
+  // ComputeHandle that creates them, so they must NOT reference handle-scoped
+  // TRTLogger/TRTErrorRecorder (which would be use-after-free).
+  TRTLogger cacheLogger;
+
+  bool matches(const uint8_t newTuneHash[32], const string& devName, int bs, int x, int y, bool fp16, bool exact) const {
+    return valid && deviceName == devName && maxBatchSize == bs && nnXLen == x && nnYLen == y
+      && usingFP16 == fp16 && requireExactNNLen == exact
+      && memcmp(tuneHash, newTuneHash, 32) == 0;
+  }
+
+  static RefitEngineCache& get() {
+    static RefitEngineCache c;
+    return c;
+  }
+};
+
+static bool refitConv(IRefitter* refitter, const ConvLayerDesc& desc) {
+  Weights w{DataType::kFLOAT, desc.weights.data(), static_cast<int64_t>(desc.weights.size())};
+  return refitter->setWeights(desc.name.c_str(), WeightsRole::kKERNEL, w);
+}
+
+static bool refitMatMul(IRefitter* refitter, const MatMulLayerDesc& desc,
+                        vector<unique_ptr<float[]>>& tmpBuf) {
+  int inC = desc.inChannels;
+  int outC = desc.outChannels;
+  auto transposed = make_unique<float[]>(desc.weights.size());
+  for(int ic = 0; ic < inC; ic++) {
+    for(int oc = 0; oc < outC; oc++) {
+      transposed[oc * inC + ic] = desc.weights[ic * outC + oc];
+    }
+  }
+  Weights w{DataType::kFLOAT, transposed.get(), static_cast<int64_t>(desc.weights.size())};
+  bool ok = refitter->setWeights(desc.name.c_str(), WeightsRole::kKERNEL, w);
+  tmpBuf.push_back(move(transposed));
+  return ok;
+}
+
+static bool refitBatchNorm(IRefitter* refitter, const BatchNormLayerDesc& desc) {
+  int n = desc.numChannels;
+  Weights scaleW{DataType::kFLOAT, desc.mergedScale.data(), static_cast<int64_t>(n)};
+  Weights shiftW{DataType::kFLOAT, desc.mergedBias.data(), static_cast<int64_t>(n)};
+  bool ok1 = refitter->setWeights(desc.name.c_str(), WeightsRole::kSCALE, scaleW);
+  bool ok2 = refitter->setWeights(desc.name.c_str(), WeightsRole::kSHIFT, shiftW);
+  return ok1 && ok2;
+}
+
+static bool refitMatBias(IRefitter* refitter, const MatBiasLayerDesc& desc) {
+  Weights w{DataType::kFLOAT, desc.weights.data(), static_cast<int64_t>(desc.weights.size())};
+  return refitter->setWeights(desc.name.c_str(), WeightsRole::kSHIFT, w);
+}
+
+static bool refitBlockStack(IRefitter* refitter,
+                            const vector<pair<int, unique_ptr_void>>& blocks,
+                            vector<unique_ptr<float[]>>& tmpBuf) {
+  bool ok = true;
+  for(size_t i = 0; i < blocks.size(); i++) {
+    if(blocks[i].first == ORDINARY_BLOCK_KIND) {
+      auto d = static_cast<const ResidualBlockDesc*>(blocks[i].second.get());
+      ok &= refitBatchNorm(refitter, d->preBN);
+      ok &= refitConv(refitter, d->regularConv);
+      ok &= refitBatchNorm(refitter, d->midBN);
+      ok &= refitConv(refitter, d->finalConv);
+    } else if(blocks[i].first == GLOBAL_POOLING_BLOCK_KIND) {
+      auto d = static_cast<const GlobalPoolingResidualBlockDesc*>(blocks[i].second.get());
+      ok &= refitBatchNorm(refitter, d->preBN);
+      ok &= refitConv(refitter, d->regularConv);
+      ok &= refitConv(refitter, d->gpoolConv);
+      ok &= refitBatchNorm(refitter, d->gpoolBN);
+      ok &= refitMatMul(refitter, d->gpoolToBiasMul, tmpBuf);
+      ok &= refitBatchNorm(refitter, d->midBN);
+      ok &= refitConv(refitter, d->finalConv);
+    } else if(blocks[i].first == NESTED_BOTTLENECK_BLOCK_KIND) {
+      auto d = static_cast<const NestedBottleneckResidualBlockDesc*>(blocks[i].second.get());
+      ok &= refitBatchNorm(refitter, d->preBN);
+      ok &= refitConv(refitter, d->preConv);
+      ok &= refitBlockStack(refitter, d->blocks, tmpBuf);
+      ok &= refitBatchNorm(refitter, d->postBN);
+      ok &= refitConv(refitter, d->postConv);
+    }
+  }
+  return ok;
+}
+
+static bool tryRefitEngine(
+  ICudaEngine* engine,
+  const LoadedModel* loadedModel,
+  vector<unique_ptr<float[]>>& tmpBuf,
+  Logger* logger,
+  TRTLogger& trtLogger)
+{
+  auto refitter = unique_ptr<IRefitter>(createInferRefitter(*engine, trtLogger));
+  if(!refitter) {
+    if(logger) logger->write("TensorRT refit: failed to create refitter");
+    return false;
+  }
+
+  const ModelDesc& md = loadedModel->modelDesc;
+  bool ok = true;
+
+  // Trunk
+  ok &= refitConv(refitter.get(), md.trunk.initialConv);
+  ok &= refitMatMul(refitter.get(), md.trunk.initialMatMul, tmpBuf);
+  if(md.trunk.metaEncoderVersion > 0) {
+    const auto& enc = md.trunk.sgfMetadataEncoder;
+    ok &= refitMatMul(refitter.get(), enc.mul1, tmpBuf);
+    ok &= refitMatBias(refitter.get(), enc.bias1);
+    ok &= refitMatMul(refitter.get(), enc.mul2, tmpBuf);
+    ok &= refitMatBias(refitter.get(), enc.bias2);
+    ok &= refitMatMul(refitter.get(), enc.mul3, tmpBuf);
+  }
+  ok &= refitBlockStack(refitter.get(), md.trunk.blocks, tmpBuf);
+  ok &= refitBatchNorm(refitter.get(), md.trunk.trunkTipBN);
+
+  // Policy head
+  ok &= refitConv(refitter.get(), md.policyHead.p1Conv);
+  ok &= refitConv(refitter.get(), md.policyHead.g1Conv);
+  ok &= refitBatchNorm(refitter.get(), md.policyHead.g1BN);
+  ok &= refitMatMul(refitter.get(), md.policyHead.gpoolToBiasMul, tmpBuf);
+  ok &= refitBatchNorm(refitter.get(), md.policyHead.p1BN);
+  ok &= refitConv(refitter.get(), md.policyHead.p2Conv);
+  ok &= refitMatMul(refitter.get(), md.policyHead.gpoolToPassMul, tmpBuf);
+  if(md.modelVersion >= 15) {
+    ok &= refitMatBias(refitter.get(), md.policyHead.gpoolToPassBias);
+    ok &= refitMatMul(refitter.get(), md.policyHead.gpoolToPassMul2, tmpBuf);
+  }
+
+  // Value head
+  ok &= refitConv(refitter.get(), md.valueHead.v1Conv);
+  ok &= refitBatchNorm(refitter.get(), md.valueHead.v1BN);
+  ok &= refitMatMul(refitter.get(), md.valueHead.v2Mul, tmpBuf);
+  ok &= refitMatBias(refitter.get(), md.valueHead.v2Bias);
+  ok &= refitMatMul(refitter.get(), md.valueHead.v3Mul, tmpBuf);
+  ok &= refitMatBias(refitter.get(), md.valueHead.v3Bias);
+  ok &= refitMatMul(refitter.get(), md.valueHead.sv3Mul, tmpBuf);
+  ok &= refitMatBias(refitter.get(), md.valueHead.sv3Bias);
+  ok &= refitConv(refitter.get(), md.valueHead.vOwnershipConv);
+
+  if(!ok) {
+    if(logger) logger->write("TensorRT refit: some setWeights calls failed");
+    return false;
+  }
+
+  bool success = refitter->refitCudaEngine();
+  if(!success && logger)
+    logger->write("TensorRT refit: refitCudaEngine() failed");
+  return success;
+}
+
+// ---------- tuneDesc helpers for computeTuneHashFromDesc ----------
+// These replicate the exact tuneDesc strings appended by the corresponding
+// build*Layer functions in ModelParser, without constructing the TRT graph.
+static void appendConvTune(string& s, const ConvLayerDesc& d) {
+  s += Global::strprintf(R"|("%s"(%d,%d,%d,%d,%d,%d))|",
+    d.name.c_str(), d.convXSize, d.convYSize, d.inChannels, d.outChannels, d.dilationX, d.dilationY);
+}
+static void appendMatMulTune(string& s, const MatMulLayerDesc& d) {
+  s += Global::strprintf(R"|("%s"(%d,%d))|", d.name.c_str(), d.inChannels, d.outChannels);
+}
+static void appendMatBiasTune(string& s, const MatBiasLayerDesc& d) {
+  s += Global::strprintf(R"|("%s"(%d))|", d.name.c_str(), d.numChannels);
+}
+static void appendBNTune(string& s, const BatchNormLayerDesc& d) {
+  s += Global::strprintf(R"|("%s"(%d))|", d.name.c_str(), d.numChannels);
+}
+static void appendActTune(string& s, const ActivationLayerDesc& d) {
+  s += Global::strprintf(R"|("%s"(%d))|", d.name.c_str(), d.activation);
+}
+
+static void appendBlockStackTune(string& s, const vector<pair<int, unique_ptr_void>>& blocks) {
+  for(size_t i = 0; i < blocks.size(); i++) {
+    if(blocks[i].first == ORDINARY_BLOCK_KIND) {
+      auto d = static_cast<const ResidualBlockDesc*>(blocks[i].second.get());
+      appendBNTune(s, d->preBN); appendActTune(s, d->preActivation);
+      appendConvTune(s, d->regularConv);
+      appendBNTune(s, d->midBN); appendActTune(s, d->midActivation);
+      appendConvTune(s, d->finalConv);
+    } else if(blocks[i].first == GLOBAL_POOLING_BLOCK_KIND) {
+      auto d = static_cast<const GlobalPoolingResidualBlockDesc*>(blocks[i].second.get());
+      appendBNTune(s, d->preBN); appendActTune(s, d->preActivation);
+      appendConvTune(s, d->regularConv); appendConvTune(s, d->gpoolConv);
+      appendBNTune(s, d->gpoolBN); appendActTune(s, d->gpoolActivation);
+      appendMatMulTune(s, d->gpoolToBiasMul);
+      appendBNTune(s, d->midBN); appendActTune(s, d->midActivation);
+      appendConvTune(s, d->finalConv);
+    } else if(blocks[i].first == NESTED_BOTTLENECK_BLOCK_KIND) {
+      auto d = static_cast<const NestedBottleneckResidualBlockDesc*>(blocks[i].second.get());
+      appendBNTune(s, d->preBN); appendActTune(s, d->preActivation);
+      appendConvTune(s, d->preConv);
+      appendBlockStackTune(s, d->blocks);
+      appendBNTune(s, d->postBN); appendActTune(s, d->postActivation);
+      appendConvTune(s, d->postConv);
+    }
+  }
+}
+
+// Compute tuneHash directly from ModelDesc without building the TRT network graph.
+// This produces the exact same tuneDesc string as ModelParser::build() by walking
+// the full descriptor tree in the same order as the build*() functions.
+static void computeTuneHashFromDesc(const ModelDesc& modelDesc, uint8_t tuneHash[32]) {
+  string tuneDesc;
+
+  // ---- Model-level (ModelParser::build L177-199) ----
+  if(modelDesc.numInputMetaChannels > 0) {
+    tuneDesc = Global::strprintf(
+      R"|("salt"(%d)"modelwithmeta"(%d,%d,%d,%d,%d,%d,%d))|",
+      ModelParser::tuneSalt,
+      modelDesc.modelVersion, modelDesc.numInputChannels,
+      modelDesc.numInputGlobalChannels, modelDesc.numInputMetaChannels,
+      modelDesc.numValueChannels, modelDesc.numScoreValueChannels,
+      modelDesc.numOwnershipChannels);
+  } else {
+    tuneDesc = Global::strprintf(
+      R"|("salt"(%d)"model"(%d,%d,%d,%d,%d,%d))|",
+      ModelParser::tuneSalt,
+      modelDesc.modelVersion, modelDesc.numInputChannels,
+      modelDesc.numInputGlobalChannels,
+      modelDesc.numValueChannels, modelDesc.numScoreValueChannels,
+      modelDesc.numOwnershipChannels);
+  }
+
+  // ---- Trunk (buildTrunk L401-447) ----
+  const TrunkDesc& trunk = modelDesc.trunk;
+  tuneDesc += Global::strprintf(
+    R"|("%s"(%d,%d,%d,%d,%d))|",
+    trunk.name.c_str(), trunk.numBlocks, trunk.trunkNumChannels,
+    trunk.midNumChannels, trunk.regularNumChannels, trunk.gpoolNumChannels);
+  appendConvTune(tuneDesc, trunk.initialConv);
+  appendMatMulTune(tuneDesc, trunk.initialMatMul);
+  if(trunk.metaEncoderVersion > 0) {
+    const SGFMetadataEncoderDesc& enc = trunk.sgfMetadataEncoder;
+    appendMatMulTune(tuneDesc, enc.mul1); appendMatBiasTune(tuneDesc, enc.bias1);
+    appendActTune(tuneDesc, enc.act1);
+    appendMatMulTune(tuneDesc, enc.mul2); appendMatBiasTune(tuneDesc, enc.bias2);
+    appendActTune(tuneDesc, enc.act2);
+    appendMatMulTune(tuneDesc, enc.mul3);
+  }
+  appendBlockStackTune(tuneDesc, trunk.blocks);
+  appendBNTune(tuneDesc, trunk.trunkTipBN);
+  appendActTune(tuneDesc, trunk.trunkTipActivation);
+
+  // ---- Policy head (buildPolicyHead L484-542) ----
+  const PolicyHeadDesc& ph = modelDesc.policyHead;
+  appendConvTune(tuneDesc, ph.p1Conv); appendConvTune(tuneDesc, ph.g1Conv);
+  appendBNTune(tuneDesc, ph.g1BN); appendActTune(tuneDesc, ph.g1Activation);
+  appendMatMulTune(tuneDesc, ph.gpoolToBiasMul);
+  appendBNTune(tuneDesc, ph.p1BN); appendActTune(tuneDesc, ph.p1Activation);
+  appendConvTune(tuneDesc, ph.p2Conv);
+  if(modelDesc.modelVersion >= 15) {
+    appendMatMulTune(tuneDesc, ph.gpoolToPassMul);
+    appendMatBiasTune(tuneDesc, ph.gpoolToPassBias);
+    appendActTune(tuneDesc, ph.passActivation);
+    appendMatMulTune(tuneDesc, ph.gpoolToPassMul2);
+  } else {
+    appendMatMulTune(tuneDesc, ph.gpoolToPassMul);
+  }
+
+  // ---- Value head (buildValueHead L548-598) ----
+  const ValueHeadDesc& vh = modelDesc.valueHead;
+  appendConvTune(tuneDesc, vh.v1Conv);
+  appendBNTune(tuneDesc, vh.v1BN); appendActTune(tuneDesc, vh.v1Activation);
+  appendMatMulTune(tuneDesc, vh.v2Mul); appendMatBiasTune(tuneDesc, vh.v2Bias);
+  appendActTune(tuneDesc, vh.v2Activation);
+  appendMatMulTune(tuneDesc, vh.v3Mul); appendMatBiasTune(tuneDesc, vh.v3Bias);
+  appendMatMulTune(tuneDesc, vh.sv3Mul); appendMatBiasTune(tuneDesc, vh.sv3Bias);
+  appendConvTune(tuneDesc, vh.vOwnershipConv);
+
+  SHA2::get256(tuneDesc.c_str(), tuneHash);
+}
+
+// Compute the disk path for a refit base plan (keyed by architecture, not model sha256).
+// Same architecture across different checkpoints shares one plan file.
+static string getRefitBasePlanPath(const string& homeDataDirOverride, const char* gpuName,
+    const uint8_t descHash[32], int nnYLen, int nnXLen, int maxBatchSize, bool usingFP16, bool requireExactNNLen) {
+  auto cacheDir = HomeData::getHomeDataDir(true, homeDataDirOverride) + "/trtcache";
+  MakeDir::make(cacheDir);
+  uint8_t deviceHash[32];
+  SHA2::get256(gpuName, deviceHash);
+  char deviceIdent[4*2+1];
+  for(int i=0;i<4;i++) sprintf(deviceIdent+i*2,"%02x",(unsigned char)deviceHash[i]);
+  deviceIdent[8]=0;
+  char descIdent[6*2+1];
+  for(int i=0;i<6;i++) sprintf(descIdent+i*2,"%02x",(unsigned char)descHash[i]);
+  descIdent[12]=0;
+  return Global::strprintf("%s/trt-%d_gpu-%s_refitbase-%s_%s%dx%d_batch%d_fp%d",
+    cacheDir.c_str(), getInferLibVersion(), deviceIdent, descIdent,
+    requireExactNNLen?"exact":"max", nnYLen, nnXLen, maxBatchSize, usingFP16?16:32);
+}
 
 struct ComputeHandle {
   ComputeContext* ctx;
@@ -1081,6 +1401,9 @@ struct ComputeHandle {
   bool usingFP16;
   int maxBatchSize;
   int modelVersion;
+  int lastBatchSize;  // cache for setInputShape optimization
+  int gpuIdx;         // CUDA device index (for per-GPU standby engine isolation)
+  uint8_t descHash[32] = {};  // architecture hash (for standby engine tagging)
   vector<pair<string, string>> debugOutputs;
 
   TRTLogger trtLogger;
@@ -1096,11 +1419,14 @@ struct ComputeHandle {
     ComputeContext* context,
     const LoadedModel* loadedModel,
     int maxBatchSz,
-    bool requireExactNNLen) {
+    bool requireExactNNLen,
+    int gpuIdxForThisThread) {
     ctx = context;
 
     maxBatchSize = maxBatchSz;
     modelVersion = loadedModel->modelDesc.modelVersion;
+    lastBatchSize = 0;
+    gpuIdx = gpuIdxForThisThread;
 
     // Certain minor versions of TensorRT uses a global logger, which is bad.
     // Since TensorRT maintains ABI compatibility between minor versions, a dynamic library mismatch
@@ -1111,6 +1437,128 @@ struct ComputeHandle {
 
     trtLogger.setLogger(logger);
 
+    const char* refitEnv = std::getenv("KATAGO_TRT_REFIT");
+    const bool refitEnabled = (refitEnv != nullptr && string(refitEnv) == "1");
+
+    // ---- Ultra-fast refit path: skip builder+network entirely ----
+    // When KATAGO_TRT_REFIT=1 and a cached engine plan exists, we compute
+    // tuneHash directly from ModelDesc, skipping TRT builder, config, and
+    // network graph construction (~17s savings per model switch).
+    bool refitDone = false;
+    if(refitEnabled) {
+      uint8_t tuneHash[32];
+      computeTuneHashFromDesc(loadedModel->modelDesc, tuneHash);
+      memcpy(descHash, tuneHash, 32);  // store in handle for freeComputeHandle
+
+      // Determine FP16 without builder (prop->major >= 7 covers Volta+ GPUs)
+      bool deviceSupportsFP16 = (prop->major >= 7);
+      if(ctx->useFP16Mode == enabled_t::True && !deviceSupportsFP16)
+        throw StringError("CUDA device does not support useFP16=true");
+      bool candidateFP16 = deviceSupportsFP16 &&
+        (ctx->useFP16Mode == enabled_t::True || ctx->useFP16Mode == enabled_t::Auto);
+
+      auto& cache = RefitEngineCache::get();
+      lock_guard<mutex> lock(cache.mu);
+
+      // If in-memory cache is empty, try loading refit base plan from disk
+      if(!cache.valid) {
+        string planFile = getRefitBasePlanPath(ctx->homeDataDirOverride, prop->name,
+          tuneHash, ctx->nnYLen, ctx->nnXLen, maxBatchSize, candidateFP16, requireExactNNLen);
+        try {
+          string diskPlan = FileUtils::readFileBinary(planFile);
+          if(!diskPlan.empty()) {
+            cache.plan = std::move(diskPlan);
+            memcpy(cache.tuneHash, tuneHash, 32);
+            cache.deviceName = string(prop->name);
+            cache.maxBatchSize = maxBatchSize;
+            cache.nnXLen = ctx->nnXLen;
+            cache.nnYLen = ctx->nnYLen;
+            cache.usingFP16 = candidateFP16;
+            cache.requireExactNNLen = requireExactNNLen;
+            cache.valid = true;
+            if(logger) logger->write("TRT_OPT: loaded refit base plan from disk: " + planFile);
+          }
+        } catch(const StringError&) {}
+      }
+
+      if(cache.matches(tuneHash, string(prop->name), maxBatchSize, ctx->nnXLen, ctx->nnYLen, candidateFP16, requireExactNNLen)) {
+        usingFP16 = candidateFP16;
+        double deserMs = 0, refitMs = 0;
+
+        // Priority 1: Standby engine — reuse per-GPU live engine from cache,
+        // skipping the ~12s deserializeCudaEngine step entirely.
+        // Engine is device-specific, so we only reuse from the same GPU index.
+        {
+          auto it = cache.standbyEngines.find(gpuIdx);
+          if(it != cache.standbyEngines.end() && it->second.engine) {
+            if(memcmp(it->second.tuneHash, tuneHash, 32) == 0) {
+              if(logger) logger->write("TRT_OPT: standby engine path: reusing live engine for GPU " + Global::intToString(gpuIdx) + " (skip deserialize)");
+              engine = std::move(it->second.engine);
+              cache.standbyEngines.erase(it);
+            } else {
+              // Architecture mismatch — discard stale engine from a previous architecture
+              if(logger) logger->write("TRT_OPT: standby engine architecture mismatch for GPU " + Global::intToString(gpuIdx) + ", discarding stale engine");
+              cache.standbyEngines.erase(it);
+            }
+          }
+        }
+
+        // Priority 2: Deserialize from cached plan (no live engine available)
+        if(!engine && !cache.plan.empty()) {
+          if(logger) logger->write("TRT_OPT: ultra-fast refit path: deserializing from cached plan (skip builder+network)");
+          runtime.reset(createInferRuntime(trtLogger));
+          if(runtime) {
+            trtErrorRecorder.setLogger(logger);
+            runtime->setErrorRecorder(&trtErrorRecorder);
+            auto tDeser = chrono::steady_clock::now();
+            engine.reset(runtime->deserializeCudaEngine(cache.plan.data(), cache.plan.size()));
+            deserMs = chrono::duration<double, milli>(chrono::steady_clock::now() - tDeser).count();
+            if(logger) logger->write("TRT_TIMING: deserializeCudaEngine = " + Global::doubleToString(deserMs) + " ms");
+          }
+        }
+
+        // Refit engine with new model weights
+        if(engine) {
+          auto tRefit = chrono::steady_clock::now();
+          vector<unique_ptr<float[]>> tmpBuf;
+          bool ok = tryRefitEngine(engine.get(), loadedModel, tmpBuf, logger, trtLogger);
+          refitMs = chrono::duration<double, milli>(chrono::steady_clock::now() - tRefit).count();
+          if(logger) logger->write("TRT_TIMING: tryRefitEngine = " + Global::doubleToString(refitMs) + " ms");
+          if(ok) {
+            if(logger) logger->write("TRT_OPT: refit SUCCEEDED, total = " + Global::doubleToString(deserMs + refitMs) + " ms");
+            refitDone = true;
+            // Pre-deserialize standby engine for this GPU's next switch.
+            // Use cache.cacheLogger (persistent) instead of handle's trtLogger to avoid UAF
+            // when this handle is later destroyed but the standby engine survives in cache.
+            if(cache.standbyEngines.find(gpuIdx) == cache.standbyEngines.end() && !cache.plan.empty()) {
+              cache.cacheLogger.setLogger(logger);
+              auto standbyRt = unique_ptr<IRuntime>(createInferRuntime(cache.cacheLogger));
+              if(standbyRt) {
+                auto tStandby = chrono::steady_clock::now();
+                auto standbyEng = unique_ptr<ICudaEngine>(
+                  standbyRt->deserializeCudaEngine(cache.plan.data(), cache.plan.size()));
+                double standbyMs = chrono::duration<double, milli>(chrono::steady_clock::now() - tStandby).count();
+                if(standbyEng) {
+                  RefitEngineCache::StandbyEntry entry;
+                  entry.engine = move(standbyEng);
+                  memcpy(entry.tuneHash, tuneHash, 32);
+                  cache.standbyEngines[gpuIdx] = move(entry);
+                  if(logger) logger->write("TRT_OPT: standby engine pre-deserialized for GPU " + Global::intToString(gpuIdx) + " in " + Global::doubleToString(standbyMs) + " ms");
+                }
+              }
+            }
+          } else {
+            if(logger) logger->write("TRT_OPT: refit FAILED (" + Global::doubleToString(deserMs + refitMs) + " ms), falling back to full build");
+            engine.reset();
+            runtime.reset();
+          }
+        }
+      }
+    }
+
+    if(!refitDone) {
+
+    // ---- Full builder path (first load or ultra-fast path missed/failed) ----
     auto builder = unique_ptr<IBuilder>(createInferBuilder(trtLogger));
     if(!builder) {
       throw StringError("TensorRT backend: failed to create builder");
@@ -1131,6 +1579,10 @@ struct ComputeHandle {
     }
     config->setFlag(BuilderFlag::kPREFER_PRECISION_CONSTRAINTS);
 
+    if(refitEnabled)
+      config->setFlag(BuilderFlag::kREFIT);
+
+    // Build the network graph (fast, O(layers), no kernel compilation).
     auto network = unique_ptr<INetworkDefinition>(
       builder->createNetworkV2(1U << static_cast<int>(NetworkDefinitionCreationFlag::kEXPLICIT_BATCH)));
     if(!network) {
@@ -1144,6 +1596,42 @@ struct ComputeHandle {
     auto model = modelParser->build(
       move(network), profile, loadedModel, ctx->nnXLen, ctx->nnYLen, maxBatchSize, requireExactNNLen);
     debugOutputs = model->debugOutputs;
+
+    // ---- Refit path with builder: skip engine compilation if cached engine exists ----
+    // Use descHash (from ModelDesc only) for matching, consistent with ultra-fast path.
+    if(refitEnabled) {
+      uint8_t descHash[32];
+      computeTuneHashFromDesc(loadedModel->modelDesc, descHash);
+      auto& cache = RefitEngineCache::get();
+      lock_guard<mutex> lock(cache.mu);
+      if(cache.matches(descHash, string(prop->name), maxBatchSize, ctx->nnXLen, ctx->nnYLen, usingFP16, requireExactNNLen)) {
+        runtime.reset(createInferRuntime(trtLogger));
+        if(runtime) {
+          trtErrorRecorder.setLogger(logger);
+          runtime->setErrorRecorder(&trtErrorRecorder);
+          engine.reset(runtime->deserializeCudaEngine(cache.plan.data(), cache.plan.size()));
+        }
+        if(engine) {
+          auto t0 = chrono::steady_clock::now();
+          vector<unique_ptr<float[]>> tmpBuf;
+          bool ok = tryRefitEngine(engine.get(), loadedModel, tmpBuf, logger, trtLogger);
+          double ms = chrono::duration<double, milli>(chrono::steady_clock::now() - t0).count();
+          if(ok) {
+            if(logger) logger->write(
+              "TensorRT refit: succeeded in " + Global::doubleToString(ms) + " ms");
+            refitDone = true;
+          } else {
+            if(logger) logger->write(
+              "TensorRT refit: FAILED in " + Global::doubleToString(ms) + " ms, falling back to rebuild");
+            engine.reset();
+            runtime.reset();
+          }
+        }
+      }
+    }
+
+    if(!refitDone) {
+
     config->addOptimizationProfile(profile);
 
 #if NV_TENSORRT_MAJOR == 8 && NV_TENSORRT_MINOR == 5
@@ -1341,6 +1829,67 @@ struct ComputeHandle {
     if(!engine) {
       throw StringError("TensorRT backend: failed to create cuda engine");
     }
+
+    // Cache engine plan as refit base for future model switches
+    if(refitEnabled) {
+      auto& cache = RefitEngineCache::get();
+      lock_guard<mutex> lock(cache.mu);
+      cache.plan = plan;
+      // Store descHash (from ModelDesc only, not full tuneDesc) for consistent
+      // matching with both ultra-fast and builder refit paths.
+      uint8_t descHash[32];
+      computeTuneHashFromDesc(loadedModel->modelDesc, descHash);
+      memcpy(cache.tuneHash, descHash, 32);
+      cache.deviceName = string(prop->name);
+      cache.maxBatchSize = maxBatchSize;
+      cache.nnXLen = ctx->nnXLen;
+      cache.nnYLen = ctx->nnYLen;
+      cache.usingFP16 = usingFP16;
+      cache.requireExactNNLen = requireExactNNLen;
+      cache.valid = true;
+      if(logger) logger->write("TensorRT refit: cached engine for future refit");
+
+      // Persist refit base plan to disk (keyed by architecture, not checkpoint).
+      // All future process starts with same architecture skip the 7-min build.
+      {
+        string planFile = getRefitBasePlanPath(ctx->homeDataDirOverride, prop->name,
+          descHash, ctx->nnYLen, ctx->nnXLen, maxBatchSize, usingFP16, requireExactNNLen);
+        ofstream ofs;
+        FileUtils::open(ofs, planFile, ios::out | ios::binary);
+        ofs.write(plan.data(), plan.size());
+        ofs.close();
+        if(logger) logger->write("TRT_OPT: saved refit base plan to disk: " + planFile);
+      }
+
+      // Pre-deserialize a standby engine for this GPU's next model switch.
+      // This costs ~150ms during cold start (one-time), but lets all subsequent
+      // switches skip deserialize entirely (~12s savings per switch).
+      // Without this, standby never hits because KataGo creates the new
+      // ComputeHandle BEFORE freeing the old one.
+      // Use cache.cacheLogger (persistent) to avoid UAF when handle is destroyed.
+      if(!cache.plan.empty()) {
+        cache.cacheLogger.setLogger(logger);
+        auto standbyRt = unique_ptr<IRuntime>(createInferRuntime(cache.cacheLogger));
+        if(standbyRt) {
+          auto tStandby = chrono::steady_clock::now();
+          auto standbyEng = unique_ptr<ICudaEngine>(
+            standbyRt->deserializeCudaEngine(cache.plan.data(), cache.plan.size()));
+          double standbyMs = chrono::duration<double, milli>(chrono::steady_clock::now() - tStandby).count();
+          if(standbyEng) {
+            RefitEngineCache::StandbyEntry entry;
+            entry.engine = move(standbyEng);
+            memcpy(entry.tuneHash, descHash, 32);
+            cache.standbyEngines[gpuIdx] = move(entry);
+            if(logger) logger->write("TRT_OPT: standby engine pre-deserialized for GPU " + Global::intToString(gpuIdx) + " in " + Global::doubleToString(standbyMs) + " ms");
+          }
+        }
+      }
+    }
+
+    } // end if(!refitDone) -- full engine build
+
+    } // end if(!refitDone) -- full builder path
+
     exec.reset(engine->createExecutionContext());
     if(!exec) {
       throw StringError("TensorRT backend: failed to create execution context");
@@ -1481,7 +2030,7 @@ ComputeHandle* NeuralNet::createComputeHandle(
       "TensorRT backend thread " + Global::intToString(serverThreadIdx) + ": Initializing (may take a long time)");
   }
 
-  auto handle = new ComputeHandle(logger, &prop, context, loadedModel, maxBatchSize, requireExactNNLen);
+  auto handle = new ComputeHandle(logger, &prop, context, loadedModel, maxBatchSize, requireExactNNLen, gpuIdxForThisThread);
 
   if(logger != NULL) {
     logger->write(
@@ -1497,6 +2046,26 @@ ComputeHandle* NeuralNet::createComputeHandle(
 }
 
 void NeuralNet::freeComputeHandle(ComputeHandle* gpuHandle) {
+  // Standby engine: preserve live engine in per-GPU cache slot for next model switch,
+  // avoiding the ~12s deserializeCudaEngine step.
+  // Only the engine is cached (not the runtime). The runtime references the handle's
+  // TRTLogger which is about to be destroyed; TRT engines are self-contained after
+  // deserialization and do not need the runtime to remain alive.
+  const char* refitEnv = std::getenv("KATAGO_TRT_REFIT");
+  if(refitEnv != nullptr && string(refitEnv) == "1" && gpuHandle->engine) {
+    auto& cache = RefitEngineCache::get();
+    lock_guard<mutex> lock(cache.mu);
+    // Release exec context and buffers, but keep engine alive
+    gpuHandle->exec.reset();
+    for(auto& ptr : gpuHandle->buffers)
+      cudaFree(ptr.second);
+    gpuHandle->buffers.clear();
+    RefitEngineCache::StandbyEntry entry;
+    entry.engine = std::move(gpuHandle->engine);
+    memcpy(entry.tuneHash, gpuHandle->descHash, 32);
+    cache.standbyEngines[gpuHandle->gpuIdx] = std::move(entry);
+    // Intentionally NOT storing gpuHandle->runtime — it references handle's trtLogger.
+  }
   delete gpuHandle;
 }
 
@@ -1546,15 +2115,15 @@ struct InputBuffers {
   size_t scoreValueResultBufferBytes;
   size_t ownershipResultBufferBytes;
 
-  unique_ptr<float[]> maskInputs;           // Host pointer
-  unique_ptr<float[]> spatialInputs;        // Host pointer
-  unique_ptr<float[]> globalInputs;  // Host pointer
-  unique_ptr<float[]> metaInputs;  // Host pointer
-  unique_ptr<float[]> policyPassResults;    // Host pointer
-  unique_ptr<float[]> policyResults;        // Host pointer
-  unique_ptr<float[]> valueResults;         // Host pointer
-  unique_ptr<float[]> scoreValueResults;    // Host pointer
-  unique_ptr<float[]> ownershipResults;     // Host pointer
+  float* maskInputs;           // Pinned host pointer (cudaMallocHost)
+  float* spatialInputs;        // Pinned host pointer (cudaMallocHost)
+  float* globalInputs;         // Pinned host pointer (cudaMallocHost)
+  float* metaInputs;           // Pinned host pointer (cudaMallocHost)
+  float* policyPassResults;    // Pinned host pointer (cudaMallocHost)
+  float* policyResults;        // Pinned host pointer (cudaMallocHost)
+  float* valueResults;         // Pinned host pointer (cudaMallocHost)
+  float* scoreValueResults;    // Pinned host pointer (cudaMallocHost)
+  float* ownershipResults;     // Pinned host pointer (cudaMallocHost)
 
   InputBuffers(const LoadedModel* loadedModel, int maxBatchSz, int nnXLen, int nnYLen) {
     const ModelDesc& m = loadedModel->modelDesc;
@@ -1602,15 +2171,27 @@ struct InputBuffers {
     scoreValueResultBufferBytes = maxBatchSize * singleScoreValueResultBytes;
     ownershipResultBufferBytes = maxBatchSize * singleOwnershipResultBytes;
 
-    maskInputs = make_unique<float[]>(maxBatchSize * singleMaskElts);
-    spatialInputs = make_unique<float[]>(maxBatchSize * singleInputElts);
-    globalInputs = make_unique<float[]>(maxBatchSize * singleInputGlobalElts);
-    metaInputs = make_unique<float[]>(maxBatchSize * singleInputMetaElts);
-    policyPassResults = make_unique<float[]>(maxBatchSize * singlePolicyPassResultElts);
-    policyResults = make_unique<float[]>(maxBatchSize * singlePolicyResultElts);
-    valueResults = make_unique<float[]>(maxBatchSize * singleValueResultElts);
-    scoreValueResults = make_unique<float[]>(maxBatchSize * singleScoreValueResultElts);
-    ownershipResults = make_unique<float[]>(maxBatchSize * singleOwnershipResultElts);
+    CUDA_ERR("InputBuffers", cudaMallocHost((void**)&maskInputs, inputMaskBufferBytes));
+    CUDA_ERR("InputBuffers", cudaMallocHost((void**)&spatialInputs, inputSpatialBufferBytes));
+    CUDA_ERR("InputBuffers", cudaMallocHost((void**)&globalInputs, inputGlobalBufferBytes));
+    CUDA_ERR("InputBuffers", cudaMallocHost((void**)&metaInputs, inputMetaBufferBytes));
+    CUDA_ERR("InputBuffers", cudaMallocHost((void**)&policyPassResults, policyPassResultBufferBytes));
+    CUDA_ERR("InputBuffers", cudaMallocHost((void**)&policyResults, policyResultBufferBytes));
+    CUDA_ERR("InputBuffers", cudaMallocHost((void**)&valueResults, valueResultBufferBytes));
+    CUDA_ERR("InputBuffers", cudaMallocHost((void**)&scoreValueResults, scoreValueResultBufferBytes));
+    CUDA_ERR("InputBuffers", cudaMallocHost((void**)&ownershipResults, ownershipResultBufferBytes));
+  }
+
+  ~InputBuffers() {
+    cudaFreeHost(maskInputs);
+    cudaFreeHost(spatialInputs);
+    cudaFreeHost(globalInputs);
+    cudaFreeHost(metaInputs);
+    cudaFreeHost(policyPassResults);
+    cudaFreeHost(policyResults);
+    cudaFreeHost(valueResults);
+    cudaFreeHost(scoreValueResults);
+    cudaFreeHost(ownershipResults);
   }
 
   InputBuffers() = delete;
@@ -1636,6 +2217,9 @@ void NeuralNet::getOutput(
   assert(numBatchEltsFilled > 0);
 
   const int batchSize = numBatchEltsFilled;
+  const bool _profEnabled = g_serveProfileEnabled.load(std::memory_order_relaxed);
+  std::chrono::steady_clock::time_point _goT0, _goT1, _goT2, _goT3, _goT4, _goT5;
+  if(_profEnabled) _goT0 = std::chrono::steady_clock::now();
   const int nnXLen = gpuHandle->ctx->nnXLen;
   const int nnYLen = gpuHandle->ctx->nnYLen;
   const int modelVersion = gpuHandle->modelVersion;
@@ -1656,8 +2240,7 @@ void NeuralNet::getOutput(
     const float* rowSpatial = inputBufs[nIdx]->rowSpatialBuf.data();
     const float* rowMeta = inputBufs[nIdx]->rowMetaBuf.data();
     const bool hasRowMeta = inputBufs[nIdx]->hasRowMeta;
-    copy(rowGlobal, rowGlobal + numGlobalFeatures, rowGlobalInput);
-    std::copy(rowGlobal,rowGlobal+numGlobalFeatures,rowGlobalInput);
+    std::copy(rowGlobal, rowGlobal + numGlobalFeatures, rowGlobalInput);
     if(numMetaFeatures > 0) {
       testAssert(rowMeta != NULL);
       testAssert(hasRowMeta);
@@ -1696,26 +2279,28 @@ void NeuralNet::getOutput(
   const int numPolicyChannels = inputBuffers->singlePolicyPassResultElts;
   assert(inputBuffers->singlePolicyResultElts == numPolicyChannels * nnXLen * nnYLen);
 
+  if(_profEnabled) _goT1 = std::chrono::steady_clock::now();
+
   // Transfers from host memory to device memory are asynchronous with respect to the host
   CUDA_ERR(
     "getOutput",
     cudaMemcpyAsync(
       gpuHandle->getBuffer("InputMask"),
-      inputBuffers->maskInputs.get(),
+      inputBuffers->maskInputs,
       inputBuffers->singleMaskBytes * batchSize,
       cudaMemcpyHostToDevice));
   CUDA_ERR(
     "getOutput",
     cudaMemcpyAsync(
       gpuHandle->getBuffer("InputSpatial"),
-      inputBuffers->spatialInputs.get(),
+      inputBuffers->spatialInputs,
       inputBuffers->singleInputBytes * batchSize,
       cudaMemcpyHostToDevice));
   CUDA_ERR(
     "getOutput",
     cudaMemcpyAsync(
       gpuHandle->getBuffer("InputGlobal"),
-      inputBuffers->globalInputs.get(),
+      inputBuffers->globalInputs,
       inputBuffers->singleInputGlobalBytes * batchSize,
       cudaMemcpyHostToDevice));
   if(numMetaFeatures > 0) {
@@ -1723,61 +2308,81 @@ void NeuralNet::getOutput(
       "getOutput",
       cudaMemcpyAsync(
         gpuHandle->getBuffer("InputMeta"),
-        inputBuffers->metaInputs.get(),
+        inputBuffers->metaInputs,
         inputBuffers->singleInputMetaBytes * batchSize,
         cudaMemcpyHostToDevice));
   }
 
-  auto maskInputDims = gpuHandle->getBufferDynamicShape("InputMask", batchSize);
-  auto spatialInputDims = gpuHandle->getBufferDynamicShape("InputSpatial", batchSize);
-  auto globalInputDims = gpuHandle->getBufferDynamicShape("InputGlobal", batchSize);
+  if(_profEnabled) { cudaStreamSynchronize(cudaStreamPerThread); _goT2 = std::chrono::steady_clock::now(); }
 
-  gpuHandle->exec->setInputShape("InputMask", maskInputDims);
-  gpuHandle->exec->setInputShape("InputSpatial", spatialInputDims);
-  gpuHandle->exec->setInputShape("InputGlobal", globalInputDims);
+  // Only call setInputShape when batch size changes (avoid redundant TRT API calls)
+  if(batchSize != gpuHandle->lastBatchSize) {
+    auto maskInputDims = gpuHandle->getBufferDynamicShape("InputMask", batchSize);
+    auto spatialInputDims = gpuHandle->getBufferDynamicShape("InputSpatial", batchSize);
+    auto globalInputDims = gpuHandle->getBufferDynamicShape("InputGlobal", batchSize);
 
-  if(numMetaFeatures > 0) {
-    auto metaInputDims = gpuHandle->getBufferDynamicShape("InputMeta", batchSize);
-    gpuHandle->exec->setInputShape("InputMeta", metaInputDims);
+    gpuHandle->exec->setInputShape("InputMask", maskInputDims);
+    gpuHandle->exec->setInputShape("InputSpatial", spatialInputDims);
+    gpuHandle->exec->setInputShape("InputGlobal", globalInputDims);
+
+    if(numMetaFeatures > 0) {
+      auto metaInputDims = gpuHandle->getBufferDynamicShape("InputMeta", batchSize);
+      gpuHandle->exec->setInputShape("InputMeta", metaInputDims);
+    }
+    gpuHandle->lastBatchSize = batchSize;
   }
 
   gpuHandle->exec->enqueueV3(cudaStreamPerThread);
 
+  // Execute overlap work while GPU is computing (e.g., notify previous batch results).
+  // Skip in profiling mode to keep gpu_comp timing accurate.
+  if(!_profEnabled && g_gpuOverlapCallback) {
+    g_gpuOverlapCallback();
+    g_gpuOverlapCallback = nullptr;
+  }
+
+  if(_profEnabled) { cudaStreamSynchronize(cudaStreamPerThread); _goT3 = std::chrono::steady_clock::now(); }
+
+  // D2H transfers: async copies with pinned host memory (cudaMallocHost) enable
+  // true DMA transfers without staging through pageable bounce buffers.
   CUDA_ERR(
     "getOutput",
-    cudaMemcpy(
-      inputBuffers->policyPassResults.get(),
+    cudaMemcpyAsync(
+      inputBuffers->policyPassResults,
       gpuHandle->getBuffer("OutputPolicyPass"),
       inputBuffers->singlePolicyPassResultBytes * batchSize,
-      cudaMemcpyDeviceToHost));
+      cudaMemcpyDeviceToHost, cudaStreamPerThread));
   CUDA_ERR(
     "getOutput",
-    cudaMemcpy(
-      inputBuffers->policyResults.get(),
+    cudaMemcpyAsync(
+      inputBuffers->policyResults,
       gpuHandle->getBuffer("OutputPolicy"),
       inputBuffers->singlePolicyResultBytes * batchSize,
-      cudaMemcpyDeviceToHost));
+      cudaMemcpyDeviceToHost, cudaStreamPerThread));
   CUDA_ERR(
     "getOutput",
-    cudaMemcpy(
-      inputBuffers->valueResults.get(),
+    cudaMemcpyAsync(
+      inputBuffers->valueResults,
       gpuHandle->getBuffer("OutputValue"),
       inputBuffers->singleValueResultBytes * batchSize,
-      cudaMemcpyDeviceToHost));
+      cudaMemcpyDeviceToHost, cudaStreamPerThread));
   CUDA_ERR(
     "getOutput",
-    cudaMemcpy(
-      inputBuffers->scoreValueResults.get(),
+    cudaMemcpyAsync(
+      inputBuffers->scoreValueResults,
       gpuHandle->getBuffer("OutputScoreValue"),
       inputBuffers->singleScoreValueResultBytes * batchSize,
-      cudaMemcpyDeviceToHost));
+      cudaMemcpyDeviceToHost, cudaStreamPerThread));
   CUDA_ERR(
     "getOutput",
-    cudaMemcpy(
-      inputBuffers->ownershipResults.get(),
+    cudaMemcpyAsync(
+      inputBuffers->ownershipResults,
       gpuHandle->getBuffer("OutputOwnership"),
       inputBuffers->singleOwnershipResultBytes * batchSize,
-      cudaMemcpyDeviceToHost));
+      cudaMemcpyDeviceToHost, cudaStreamPerThread));
+  CUDA_ERR("getOutput", cudaStreamSynchronize(cudaStreamPerThread));
+
+  if(_profEnabled) _goT4 = std::chrono::steady_clock::now();
 
   gpuHandle->printDebugOutput(batchSize);
   gpuHandle->trtErrorRecorder.clear();
@@ -1870,6 +2475,15 @@ void NeuralNet::getOutput(
     } else {
       ASSERT_UNREACHABLE;
     }
+  }
+
+  if(_profEnabled) {
+    _goT5 = std::chrono::steady_clock::now();
+    g_goTimings.input_asm_us   = std::chrono::duration<double,std::micro>(_goT1 - _goT0).count();
+    g_goTimings.h2d_us         = std::chrono::duration<double,std::micro>(_goT2 - _goT1).count();
+    g_goTimings.gpu_compute_us = std::chrono::duration<double,std::micro>(_goT3 - _goT2).count();
+    g_goTimings.d2h_us         = std::chrono::duration<double,std::micro>(_goT4 - _goT3).count();
+    g_goTimings.output_post_us = std::chrono::duration<double,std::micro>(_goT5 - _goT4).count();
   }
 }
 
