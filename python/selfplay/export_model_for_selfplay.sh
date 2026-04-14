@@ -87,8 +87,6 @@ function exportStuff() {
                 set +x
 
                 rm -r "$SRC"
-                gzip "$TMPDST"/model.bin
-
                 #Make a bunch of the directories that selfplay will need so that there isn't a race on the selfplay
                 #machines to concurrently make it, since sometimes concurrent making of the same directory can corrupt
                 #a filesystem
@@ -101,9 +99,6 @@ function exportStuff() {
                         mkdir -p "$BASEDIR/selfplay/$NAME/tdata"
                     fi
                 fi
-
-                #Sleep a little to allow some tolerance on the filesystem
-                sleep 5
 
                 mv "$TMPDST" "$TARGET"
                 echo "Done exporting:" "$NAME" "to" "$TARGET"

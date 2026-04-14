@@ -25,13 +25,24 @@ from threading import BrokenBarrierError
 
 import torch
 import torch._dynamo
-torch._dynamo.config.recompile_limit = 32
+try:
+    torch._dynamo.config.recompile_limit = 32
+except (AttributeError, TypeError):
+    pass
+
+# Enable Inductor FX graph cache to skip recompilation across train restarts
+try:
+    import torch._inductor.config as _inductor_config
+    _inductor_config.fx_graph_cache = True
+except (AttributeError, ImportError):
+    pass
 import torch.nn
 import torch.optim
 import torch.distributed
 import torch.multiprocessing
 from torch.nn.parallel import DistributedDataParallel
 from torch.optim.swa_utils import AveragedModel
+from torch.utils.tensorboard import SummaryWriter
 from torch.amp import autocast, GradScaler
 
 from muon.muon import MuonWithAuxAdam, SingleDeviceMuonWithAuxAdam
@@ -1180,9 +1191,11 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
     if rank == 0:
         train_metrics_out = open(os.path.join(traindir,"metrics_train.json"),"a")
         val_metrics_out = open(os.path.join(traindir,"metrics_val.json"),"a")
+        tb_writer = SummaryWriter(log_dir=os.path.join(traindir, "tb"))
     else:
         train_metrics_out = open(os.path.join(traindir,f"metrics_train_rank{rank}.json"),"a")
         val_metrics_out = open(os.path.join(traindir,f"metrics_val_rank{rank}.json"),"a")
+        tb_writer = None
 
     # TRAIN! -----------------------------------------------------------------------------------
 
@@ -1230,6 +1243,10 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
         logging.info("torch.compile disabled by -no-compile flag")
     else:
         logging.info("Using torch.compile mode=default")
+        try:
+            logging.info(f"Inductor FX graph cache: {torch._inductor.config.fx_graph_cache}")
+        except (AttributeError, ImportError):
+            pass
 
     if use_tf32_matmul:
         torch.set_float32_matmul_precision('high')
@@ -1508,7 +1525,8 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
                     timediff = t1 - last_train_stats_time
                     last_train_stats_time = t1
                     metrics["time_since_last_print"] = timediff
-                    log_metrics(running_metrics["sums"], running_metrics["weights"], metrics, train_metrics_out)
+                    log_metrics(running_metrics["sums"], running_metrics["weights"], metrics, train_metrics_out,
+                               tb_writer=tb_writer, tb_global_step=train_state["global_step_samples"], tb_prefix="train")
 
                 # Update LR more frequently at the start for smoother warmup ramp and wd adjustment
                 if train_state["global_step_samples"] <= 50000000 and batch_count_this_epoch % 50 == 0:
@@ -1633,7 +1651,8 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
                         val_metric_weights["wsum_train"] = running_metrics["weights"]["wsum"]
                     last_val_metrics["sums"] = dict(val_metric_sums)
                     last_val_metrics["weights"] = dict(val_metric_weights)
-                    log_metrics(val_metric_sums, val_metric_weights, metrics, val_metrics_out)
+                    log_metrics(val_metric_sums, val_metric_weights, metrics, val_metrics_out,
+                               tb_writer=tb_writer, tb_global_step=train_state["global_step_samples"], tb_prefix="val")
                     t1 = time.perf_counter()
                     logging.info(f"Validation took {t1-t0} seconds")
                     ddp_model.train()
@@ -1690,6 +1709,8 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
 
     train_metrics_out.close()
     val_metrics_out.close()
+    if tb_writer is not None:
+        tb_writer.close()
 
     safe_exit(barrier,0)
 

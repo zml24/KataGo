@@ -8,7 +8,10 @@ import numpy as np
 
 import torch
 import torch._dynamo
-torch._dynamo.config.recompile_limit = 32
+try:
+    torch._dynamo.config.recompile_limit = 32
+except (AttributeError, TypeError):
+    pass
 import torch.nn
 
 from katago.train import modelconfigs

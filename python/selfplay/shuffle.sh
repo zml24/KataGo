@@ -100,9 +100,6 @@ else
 fi
 #set +x
 
-#Just in case, give a little time for nfs
-sleep 10
-
 # Shuffle no longer maintains a "current" directory, instead training script searches for latest dir
 # rm -f "$BASEDIR"/shuffleddata/current_tmp
 # ln -s $OUTDIR "$BASEDIR"/shuffleddata/current_tmp
