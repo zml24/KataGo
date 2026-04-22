@@ -38,7 +38,8 @@ NNEvaluator* Setup::initializeNNEvaluator(
   int defaultMaxBatchSize,
   bool defaultRequireExactNNLen,
   bool disableFP16,
-  setup_for_t setupFor
+  setup_for_t setupFor,
+  bool spawnServerThreadsImmediately
 ) {
   vector<NNEvaluator*> nnEvals =
     initializeNNEvaluators(
@@ -54,7 +55,8 @@ NNEvaluator* Setup::initializeNNEvaluator(
       defaultMaxBatchSize,
       defaultRequireExactNNLen,
       disableFP16,
-      setupFor
+      setupFor,
+      spawnServerThreadsImmediately
     );
   testAssert(nnEvals.size() == 1);
   return nnEvals[0];
@@ -73,7 +75,8 @@ vector<NNEvaluator*> Setup::initializeNNEvaluators(
   int defaultMaxBatchSize,
   bool defaultRequireExactNNLen,
   bool disableFP16,
-  setup_for_t setupFor
+  setup_for_t setupFor,
+  bool spawnServerThreadsImmediately
 ) {
   vector<NNEvaluator*> nnEvals;
   testAssert(nnModelNames.size() == nnModelFiles.size());
@@ -328,7 +331,8 @@ vector<NNEvaluator*> Setup::initializeNNEvaluators(
       defaultSymmetry
     );
 
-    nnEval->spawnServerThreads();
+    if(spawnServerThreadsImmediately)
+      nnEval->spawnServerThreads();
 
     nnEvals.push_back(nnEval);
   }

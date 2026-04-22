@@ -133,7 +133,7 @@ class NNEvaluator {
 
   //Return the "nearest" supported ruleset to desiredRules by this model.
   //Fills supported with true if desiredRules itself was exactly supported, false if some modifications had to be made.
-  Rules getSupportedRules(const Rules& desiredRules, bool& supported) const;
+  Rules getSupportedRules(const Rules& desiredRules, bool& supported);
 
   //Clear all entires cached in the table
   void clearCache();
@@ -187,6 +187,39 @@ class NNEvaluator {
   //should have calls to it and spawnServerThreads singlethreaded.
   void killServerThreads();
 
+  //IN-PLACE RELOAD: swap the backing neural net model inside this evaluator without tearing down the
+  //NNEvaluator object, its NNCacheTable, or its ModelData wrapper in SelfplayManager. Drains in-flight
+  //evals by flipping isSuperseded during the swap so new evaluate() calls return a dummy result, then
+  //kills server threads, replaces loadedModel, clears cache, respawns threads. Caller must guarantee
+  //no other thread is concurrently calling spawn/kill server threads on this evaluator.
+  //Returns true on success. Only meaningful for non-debugSkipNeuralNet evaluators.
+  bool reloadLoadedModel(
+    const std::string& newModelFileName,
+    const std::string& newModelName,
+    const std::string& expectedSha256
+  );
+
+  //Retire active eval service for this model but keep TRT/backend/server-thread state alive.
+  //After this, future evaluate() calls fall back to a cheap dummy result so that superseded models can
+  //flush out in-flight selfplay threads without retaining NN cache memory or taking new work.
+  //Safe to call before destructor. Destructor is idempotent with respect to this.
+  void releaseHeavyResources();
+  //Free TRT/server-thread/backend state after all in-flight users are gone.
+  //Safe to call multiple times and before destructor.
+  void releaseRetiredBackendResources();
+  //Free shared backend/model objects after all in-flight users are gone.
+  //Safe to call multiple times and before destructor.
+  void releaseRetiredModelResources();
+
+  //Internal helper: balance one numOngoingEvals slot acquired in evaluate()
+  //and notify killServerThreads()'s drain loop. numOngoingEvals now spans
+  //the entire evaluate() lifetime (input fill + server batch + client
+  //postprocess + cache write), so reloadLoadedModel() blocks on the drain
+  //loop until the cache write completes — preventing an old-model NNOutput
+  //from being inserted into the cache after reload's nnCacheTable->clear().
+  void finishOngoingEval();
+  bool isReleasedOrSuperseded() const;
+
   //Set the number of threads and what gpus they use. Only call this if threads are not spawned yet, or have been killed.
   void setNumThreads(const std::vector<int>& gpuIdxByServerThr);
 
@@ -208,8 +241,8 @@ class NNEvaluator {
   void clearStats();
 
  private:
-  const std::string modelName;
-  const std::string modelFileName;
+  std::string modelName;
+  std::string modelFileName;
   const int nnXLen;
   const int nnYLen;
   const bool requireExactNNLen;
@@ -254,8 +287,9 @@ class NNEvaluator {
   std::vector<int> serverThreadsIsUsingFP16;
 
   int numOngoingEvals; //Current number of ongoing evals.
-  int numWaitingEvals; //Current number of things waiting for finish.
-  int numEvalsToAwaken; //Current number of things waitingForFinish that should be woken up. Used to avoid spurious wakeups.
+  int numWaitingEvals; //Legacy waiter count. Stays at 0 now that waitForNextNNEvalIfAny() is sleep-based; retained as a defensive edge for a future condvar-based throttling revival.
+  int numEvalsToAwaken; //Legacy field retained for killServerThreads()'s post-drain assert. Stays at 0 under the counter-watch wakeup scheme.
+  bool drainPending; //True while killServerThreads() is spinning on numOngoingEvals==0. Tells finishOngoingEval() to broadcast on waitingForFinish during shutdown drain.
   std::condition_variable waitingForFinish; //Condvar for waiting for at least one ongoing eval to finish.
 
   //-------------------------------------------------------------------------------------------------
@@ -265,6 +299,7 @@ class NNEvaluator {
   std::atomic<int> currentDefaultSymmetry;
   //Modifiable batch size smaller than maxBatchSize
   std::atomic<int> currentBatchSize;
+  std::atomic<bool> isSuperseded;
 
   // Object pool for NNOutput to reduce heap allocation overhead in serve().
   // Each serve() batch allocates ~192 NNOutput objects; pooling avoids malloc/free syscalls.
@@ -292,7 +327,7 @@ class NNEvaluator {
       freeList.push_back(p);
     }
   };
-  NNOutputPool nnOutputPool;
+  std::shared_ptr<NNOutputPool> nnOutputPool;
 
   //Queued up requests
   ThreadSafeQueue<NNResultBuf*> queryQueue;

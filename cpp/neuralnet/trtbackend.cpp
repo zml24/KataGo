@@ -22,6 +22,8 @@
 using namespace std;
 using namespace nvinfer1;
 
+static std::mutex g_trtComputeHandleCreateMutex;
+
 // Define this to print out some of the intermediate values of the neural net
 //#define DEBUG_INTERMEDIATE_VALUES
 
@@ -1399,11 +1401,14 @@ struct ComputeHandle {
   ComputeContext* ctx;
 
   bool usingFP16;
+  bool allowStandbyCache;
   int maxBatchSize;
   int modelVersion;
   int lastBatchSize;  // cache for setInputShape optimization
   int gpuIdx;         // CUDA device index (for per-GPU standby engine isolation)
   uint8_t descHash[32] = {};  // architecture hash (for standby engine tagging)
+  bool useCudaGraph;  // KATAGO_TRT_CUDA_GRAPH=1 enables CUDA Graph capture/replay
+  std::map<int, cudaGraphExec_t> cudaGraphCache;  // per-batch-size cached graph executables
   vector<pair<string, string>> debugOutputs;
 
   TRTLogger trtLogger;
@@ -1420,13 +1425,21 @@ struct ComputeHandle {
     const LoadedModel* loadedModel,
     int maxBatchSz,
     bool requireExactNNLen,
-    int gpuIdxForThisThread) {
+    int gpuIdxForThisThread,
+    int serverThreadIdx) {
     ctx = context;
 
     maxBatchSize = maxBatchSz;
     modelVersion = loadedModel->modelDesc.modelVersion;
     lastBatchSize = 0;
     gpuIdx = gpuIdxForThisThread;
+    // Standby engine reuse across model handoff is currently unstable on H200/TRT:
+    // after old evaluator drain completes, reusing the preserved live engine can
+    // segfault inside createComputeHandle(). Keep the faster refit-plan cache,
+    // but disable live-engine standby reuse to prioritize correctness.
+    allowStandbyCache = false;
+    const char* cudaGraphEnv = std::getenv("KATAGO_TRT_CUDA_GRAPH");
+    useCudaGraph = (cudaGraphEnv != nullptr && string(cudaGraphEnv) == "1");
 
     // Certain minor versions of TensorRT uses a global logger, which is bad.
     // Since TensorRT maintains ABI compatibility between minor versions, a dynamic library mismatch
@@ -1488,7 +1501,7 @@ struct ComputeHandle {
         // Priority 1: Standby engine — reuse per-GPU live engine from cache,
         // skipping the ~12s deserializeCudaEngine step entirely.
         // Engine is device-specific, so we only reuse from the same GPU index.
-        {
+        if(allowStandbyCache) {
           auto it = cache.standbyEngines.find(gpuIdx);
           if(it != cache.standbyEngines.end() && it->second.engine) {
             if(memcmp(it->second.tuneHash, tuneHash, 32) == 0) {
@@ -1530,7 +1543,7 @@ struct ComputeHandle {
             // Pre-deserialize standby engine for this GPU's next switch.
             // Use cache.cacheLogger (persistent) instead of handle's trtLogger to avoid UAF
             // when this handle is later destroyed but the standby engine survives in cache.
-            if(cache.standbyEngines.find(gpuIdx) == cache.standbyEngines.end() && !cache.plan.empty()) {
+            if(allowStandbyCache && cache.standbyEngines.find(gpuIdx) == cache.standbyEngines.end() && !cache.plan.empty()) {
               cache.cacheLogger.setLogger(logger);
               auto standbyRt = unique_ptr<IRuntime>(createInferRuntime(cache.cacheLogger));
               if(standbyRt) {
@@ -1581,6 +1594,10 @@ struct ComputeHandle {
 
     if(refitEnabled)
       config->setFlag(BuilderFlag::kREFIT);
+
+    const char* directIOEnv = std::getenv("KATAGO_TRT_DIRECT_IO");
+    if(directIOEnv != nullptr && string(directIOEnv) == "1")
+      config->setFlag(BuilderFlag::kDIRECT_IO);
 
     // Build the network graph (fast, O(layers), no kernel compilation).
     auto network = unique_ptr<INetworkDefinition>(
@@ -1867,7 +1884,7 @@ struct ComputeHandle {
       // Without this, standby never hits because KataGo creates the new
       // ComputeHandle BEFORE freeing the old one.
       // Use cache.cacheLogger (persistent) to avoid UAF when handle is destroyed.
-      if(!cache.plan.empty()) {
+      if(allowStandbyCache && !cache.plan.empty()) {
         cache.cacheLogger.setLogger(logger);
         auto standbyRt = unique_ptr<IRuntime>(createInferRuntime(cache.cacheLogger));
         if(standbyRt) {
@@ -1911,6 +1928,10 @@ struct ComputeHandle {
   }
 
   ~ComputeHandle() {
+    for(auto& entry : cudaGraphCache) {
+      cudaGraphExecDestroy(entry.second);
+    }
+    cudaGraphCache.clear();
     for(auto ptr: buffers) {
       CUDA_ERR("~ComputeHandle", cudaFree(ptr.second));
     }
@@ -2009,6 +2030,8 @@ ComputeHandle* NeuralNet::createComputeHandle(
   int gpuIdxForThisThread,
   int serverThreadIdx
 ) {
+  std::lock_guard<std::mutex> createLock(g_trtComputeHandleCreateMutex);
+
   if(inputsUseNHWC) {
     throw StringError("TensorRT backend: inputsUseNHWC = false required, other configurations not supported");
   }
@@ -2030,13 +2053,14 @@ ComputeHandle* NeuralNet::createComputeHandle(
       "TensorRT backend thread " + Global::intToString(serverThreadIdx) + ": Initializing (may take a long time)");
   }
 
-  auto handle = new ComputeHandle(logger, &prop, context, loadedModel, maxBatchSize, requireExactNNLen, gpuIdxForThisThread);
+  auto handle = new ComputeHandle(logger, &prop, context, loadedModel, maxBatchSize, requireExactNNLen, gpuIdxForThisThread, serverThreadIdx);
 
   if(logger != NULL) {
     logger->write(
       "TensorRT backend thread " + Global::intToString(serverThreadIdx) + ": Model version " +
       Global::intToString(loadedModel->modelDesc.modelVersion) +
-      " useFP16 = " + Global::boolToString(handle->usingFP16));
+      " useFP16 = " + Global::boolToString(handle->usingFP16) +
+      " useCudaGraph = " + Global::boolToString(handle->useCudaGraph));
     logger->write(
       "TensorRT backend thread " + Global::intToString(serverThreadIdx) +
       ": Model name: " + loadedModel->modelDesc.name);
@@ -2052,10 +2076,13 @@ void NeuralNet::freeComputeHandle(ComputeHandle* gpuHandle) {
   // TRTLogger which is about to be destroyed; TRT engines are self-contained after
   // deserialization and do not need the runtime to remain alive.
   const char* refitEnv = std::getenv("KATAGO_TRT_REFIT");
-  if(refitEnv != nullptr && string(refitEnv) == "1" && gpuHandle->engine) {
+  if(refitEnv != nullptr && string(refitEnv) == "1" && gpuHandle->allowStandbyCache && gpuHandle->engine) {
     auto& cache = RefitEngineCache::get();
     lock_guard<mutex> lock(cache.mu);
-    // Release exec context and buffers, but keep engine alive
+    // Release CUDA graphs, exec context and buffers, but keep engine alive
+    for(auto& entry : gpuHandle->cudaGraphCache)
+      cudaGraphExecDestroy(entry.second);
+    gpuHandle->cudaGraphCache.clear();
     gpuHandle->exec.reset();
     for(auto& ptr : gpuHandle->buffers)
       cudaFree(ptr.second);
@@ -2328,6 +2355,14 @@ void NeuralNet::getOutput(
     if(numMetaFeatures > 0) {
       auto metaInputDims = gpuHandle->getBufferDynamicShape("InputMeta", batchSize);
       gpuHandle->exec->setInputShape("InputMeta", metaInputDims);
+    }
+    // Invalidate any cached graph for the old batch size shape
+    if(gpuHandle->useCudaGraph) {
+      auto it = gpuHandle->cudaGraphCache.find(gpuHandle->lastBatchSize);
+      if(it != gpuHandle->cudaGraphCache.end()) {
+        cudaGraphExecDestroy(it->second);
+        gpuHandle->cudaGraphCache.erase(it);
+      }
     }
     gpuHandle->lastBatchSize = batchSize;
   }

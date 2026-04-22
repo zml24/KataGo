@@ -56,10 +56,32 @@ class SelfplayManager {
   void release(const std::string& modelName);
   void release(NNEvaluator* nnEval);
 
+  //Write lease: hold this while enqueuing data AFTER releasing the eval.
+  //This prevents full cleanup from erasing the model while data is still being enqueued.
+  //Pointer-keyed overloads are stable across in-place model reloads that change modelName.
+  void acquireWriteLease(const std::string& modelName);
+  void releaseWriteLease(const std::string& modelName);
+  void acquireWriteLease(NNEvaluator* nnEval);
+  void releaseWriteLease(NNEvaluator* nnEval);
+
+  //Attempt to reload the latest model's NNEvaluator in place with a new model file,
+  //without creating a new NNEvaluator/ModelData. Returns true on success.
+  //The existing ModelData's modelName is updated to newModelName; its TrainingDataWriter
+  //and sgfOut stay bound to the existing ModelData (data continues to flow into the
+  //same output stream).
+  bool tryReloadLatestInPlace(
+    const std::string& newModelFileName,
+    const std::string& newModelName,
+    const std::string& expectedSha256
+  );
+
   //Clean up any currently-unused models if their last usage was older than this many seconds ago.
   void cleanupUnusedModelsOlderThan(double seconds);
   //Clear the evaluation caches of any models that are currently unused.
   void clearUnusedModelCaches();
+  void noteModelEvalResourcesFreed(NNEvaluator* nnEval);
+  int getModelAcquireCount(NNEvaluator* nnEval) const;
+  void noteModelBackendResourcesFreed(NNEvaluator* nnEval);
 
   //====================================================================================
   //These should only be called by a thread that has currently acquired the model.
@@ -78,6 +100,9 @@ class SelfplayManager {
     const std::function<void(TrainingDataWriter* tdataWriter, std::ofstream* sgfOut)>& f
   );
 
+  //Dump per-model acquire/writeRef/freed counters for debugging cleanup progression.
+  void debugDumpModelStats();
+
   //====================================================================================
 
   //For internal use
@@ -90,6 +115,10 @@ class SelfplayManager {
 
     ThreadSafeQueue<FinishedGameData*> finishedGameQueue;
     int acquireCount;
+    int writeRefCount;
+    bool evalResourcesFreed;
+    bool backendCleanupQueued;
+    bool backendResourcesFreed;
 
     TrainingDataWriter* tdataWriter;
     std::ofstream* sgfOut;
@@ -120,7 +149,8 @@ class SelfplayManager {
 
   NNEvaluator* acquireModelAlreadyLocked(SelfplayManager::ModelData* foundData);
   void releaseAlreadyLocked(SelfplayManager::ModelData* foundData);
-  void maybeAutoCleanupAlreadyLocked();
+  void maybeAutoCleanupAlreadyLocked(std::vector<NNEvaluator*>& backendCleanupEvals);
+  void finishPendingBackendCleanup(const std::vector<NNEvaluator*>& backendCleanupEvals);
   void runDataWriteLoopImpl(ModelData* modelData);
 
  public:

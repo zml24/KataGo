@@ -1,7 +1,5 @@
 #include "../program/selfplaymanager.h"
 
-#include "../core/test.h"
-
 using namespace std;
 
 SelfplayManager::ModelData::ModelData(
@@ -17,6 +15,10 @@ SelfplayManager::ModelData::ModelData(
   hasDataWriteLoop(hasDataLoop),
   finishedGameQueue(maxDQueueSize),
   acquireCount(0),
+  writeRefCount(0),
+  evalResourcesFreed(false),
+  backendCleanupQueued(false),
+  backendResourcesFreed(false),
   tdataWriter(tdWriter),
   sgfOut(sOut)
 {
@@ -54,7 +56,7 @@ SelfplayManager::~SelfplayManager() {
   std::unique_lock<std::mutex> lock(managerMutex);
   for(size_t i = 0; i<modelDatas.size(); i++) {
     //If a client tries to delete this while something is still acquired, there's something wrong.
-    testAssert(modelDatas[i]->acquireCount == 0);
+    assert(modelDatas[i]->acquireCount == 0);
     //Trigger data writing loop to quit once it reaches end of its queue
     modelDatas[i]->finishedGameQueue.setReadOnly();
     totalNumRowsProcessed += modelDatas[i]->nnEval->numRowsProcessed();
@@ -82,12 +84,39 @@ static void dataWriteLoop(SelfplayManager* manager, SelfplayManager::ModelData* 
   manager->runDataWriteLoop(modelData);
 }
 
-void SelfplayManager::maybeAutoCleanupAlreadyLocked() {
+void SelfplayManager::maybeAutoCleanupAlreadyLocked(std::vector<NNEvaluator*>& backendCleanupEvals) {
   if(autoCleanupAllButLatestIfUnused && modelDatas.size() > 0) {
     for(size_t i = 0; i<modelDatas.size()-1; i++) {
       ModelData* foundData = modelDatas[i];
-      if(foundData->acquireCount <= 0) {
-        testAssert(foundData->acquireCount == 0);
+
+      //Phase 1: Once no in-flight game still holds the evaluator, switch it to dummy
+      //eval mode. This preserves full NN functionality for game threads that are still
+      //mid-search with the old model (needed for mid-game model switching).
+      //In serialized reload mode, acquireCount is already 0 by the time we get here
+      //(drained in loadLatestNeuralNetIntoManager), so this condition is a no-op.
+      if(foundData->acquireCount <= 0 && !foundData->evalResourcesFreed) {
+        assert(foundData->acquireCount == 0);
+        if(logger != NULL)
+          logger->write("Retiring old model eval resources: " + foundData->modelName);
+        foundData->nnEval->releaseHeavyResources();
+        foundData->evalResourcesFreed = true;
+      }
+
+      //Phase 2: Once no in-flight game still holds the evaluator, free TRT/server-thread/backend
+      //resources. This is queued here but executed outside managerMutex so that a slow TRT teardown
+      //does not block acquireLatest() for every selfplay thread.
+      if(foundData->acquireCount <= 0 && !foundData->backendResourcesFreed && !foundData->backendCleanupQueued) {
+        assert(foundData->acquireCount == 0);
+        if(logger != NULL)
+          logger->write("Releasing retired model backend resources: " + foundData->modelName);
+        foundData->backendCleanupQueued = true;
+        backendCleanupEvals.push_back(foundData->nnEval);
+      }
+
+      //Phase 3: Full cleanup - only when backend teardown is complete and no thread holds eval or write lease.
+      if(foundData->acquireCount <= 0 && foundData->writeRefCount <= 0 && foundData->backendResourcesFreed) {
+        assert(foundData->acquireCount == 0);
+        assert(foundData->writeRefCount == 0);
         //Trigger data writing loop to quit once it reaches end of its queue
         foundData->finishedGameQueue.setReadOnly();
         totalNumRowsProcessed += foundData->nnEval->numRowsProcessed();
@@ -101,35 +130,114 @@ void SelfplayManager::maybeAutoCleanupAlreadyLocked() {
   }
 }
 
+void SelfplayManager::finishPendingBackendCleanup(const std::vector<NNEvaluator*>& initialBackendCleanupEvals) {
+  std::vector<NNEvaluator*> backendCleanupEvals = initialBackendCleanupEvals;
+  while(!backendCleanupEvals.empty()) {
+    for(NNEvaluator* nnEval: backendCleanupEvals) {
+      nnEval->releaseRetiredBackendResources();
+    }
+
+    std::vector<NNEvaluator*> nextBackendCleanupEvals;
+    {
+      std::lock_guard<std::mutex> lock(managerMutex);
+      for(NNEvaluator* nnEval: backendCleanupEvals) {
+        for(size_t i = 0; i<modelDatas.size(); i++) {
+          ModelData* foundData = modelDatas[i];
+          if(foundData->nnEval == nnEval) {
+            foundData->backendCleanupQueued = false;
+            foundData->backendResourcesFreed = true;
+            break;
+          }
+        }
+      }
+      maybeAutoCleanupAlreadyLocked(nextBackendCleanupEvals);
+    }
+    backendCleanupEvals.swap(nextBackendCleanupEvals);
+  }
+}
+
 
 void SelfplayManager::cleanupUnusedModelsOlderThan(double seconds) {
-  std::lock_guard<std::mutex> lock(managerMutex);
-  double now = timer.getSeconds();
-  for(size_t i = 0; i<modelDatas.size(); i++) {
-    ModelData* foundData = modelDatas[i];
-    if(foundData->acquireCount <= 0 && now - foundData->lastReleaseTime > seconds) {
-      testAssert(foundData->acquireCount == 0);
-      logger->write("Unloading network that hasn't been used in a while: " + foundData->modelName);
-      //Trigger data writing loop to quit once it reaches end of its queue
-      foundData->finishedGameQueue.setReadOnly();
-      totalNumRowsProcessed += foundData->nnEval->numRowsProcessed();
-      //Data write loop is responsible for deleting ModelData, if it exists
-      if(!foundData->hasDataWriteLoop)
-        delete foundData;
-      modelDatas.erase(modelDatas.begin()+i);
-      i--;
+  std::vector<NNEvaluator*> backendCleanupEvals;
+  {
+    std::lock_guard<std::mutex> lock(managerMutex);
+    double now = timer.getSeconds();
+    for(size_t i = 0; i<modelDatas.size(); i++) {
+      ModelData* foundData = modelDatas[i];
+      if(foundData->acquireCount <= 0 && foundData->writeRefCount <= 0 && now - foundData->lastReleaseTime > seconds) {
+        assert(foundData->acquireCount == 0);
+        assert(foundData->writeRefCount == 0);
+        if(!foundData->evalResourcesFreed) {
+          foundData->nnEval->releaseHeavyResources();
+          foundData->evalResourcesFreed = true;
+        }
+        if(!foundData->backendResourcesFreed && !foundData->backendCleanupQueued) {
+          if(logger != NULL)
+            logger->write("Releasing inactive model backend resources: " + foundData->modelName);
+          foundData->backendCleanupQueued = true;
+          backendCleanupEvals.push_back(foundData->nnEval);
+        }
+        if(foundData->backendResourcesFreed) {
+          logger->write("Unloading network that hasn't been used in a while: " + foundData->modelName);
+          //Trigger data writing loop to quit once it reaches end of its queue
+          foundData->finishedGameQueue.setReadOnly();
+          totalNumRowsProcessed += foundData->nnEval->numRowsProcessed();
+          //Data write loop is responsible for deleting ModelData, if it exists
+          if(!foundData->hasDataWriteLoop)
+            delete foundData;
+          modelDatas.erase(modelDatas.begin()+i);
+          i--;
+        }
+      }
     }
   }
+  finishPendingBackendCleanup(backendCleanupEvals);
 }
 
 void SelfplayManager::clearUnusedModelCaches() {
   std::lock_guard<std::mutex> lock(managerMutex);
   for(size_t i = 0; i<modelDatas.size(); i++) {
     ModelData* foundData = modelDatas[i];
-    if(foundData->acquireCount <= 0) {
+    if(foundData->acquireCount <= 0 && !foundData->evalResourcesFreed) {
       foundData->nnEval->clearCache();
     }
   }
+}
+
+void SelfplayManager::noteModelEvalResourcesFreed(NNEvaluator* nnEval) {
+  std::lock_guard<std::mutex> lock(managerMutex);
+  for(size_t i = 0; i<modelDatas.size(); i++) {
+    if(modelDatas[i]->nnEval == nnEval) {
+      modelDatas[i]->evalResourcesFreed = true;
+      return;
+    }
+  }
+}
+
+int SelfplayManager::getModelAcquireCount(NNEvaluator* nnEval) const {
+  std::lock_guard<std::mutex> lock(managerMutex);
+  for(size_t i = 0; i<modelDatas.size(); i++) {
+    if(modelDatas[i]->nnEval == nnEval)
+      return modelDatas[i]->acquireCount;
+  }
+  return 0;
+}
+
+void SelfplayManager::noteModelBackendResourcesFreed(NNEvaluator* nnEval) {
+  std::vector<NNEvaluator*> backendCleanupEvals;
+  {
+    std::lock_guard<std::mutex> lock(managerMutex);
+    for(size_t i = 0; i<modelDatas.size(); i++) {
+      if(modelDatas[i]->nnEval == nnEval) {
+        modelDatas[i]->evalResourcesFreed = true;
+        modelDatas[i]->backendCleanupQueued = false;
+        modelDatas[i]->backendResourcesFreed = true;
+        maybeAutoCleanupAlreadyLocked(backendCleanupEvals);
+        break;
+      }
+    }
+  }
+  finishPendingBackendCleanup(backendCleanupEvals);
 }
 
 
@@ -139,22 +247,26 @@ void SelfplayManager::loadModelAndStartDataWriting(
   ofstream* sgfOut
 ) {
   string modelName = nnEval->getModelName();
-  std::lock_guard<std::mutex> lock(managerMutex);
-  for(size_t i = 0; i<modelDatas.size(); i++) {
-    if(modelDatas[i]->modelName == modelName) {
-      throw StringError("SelfplayManager::loadModelAndStartDataWriting: Duplicate model name: " + modelName);
+  std::vector<NNEvaluator*> backendCleanupEvals;
+  {
+    std::lock_guard<std::mutex> lock(managerMutex);
+    for(size_t i = 0; i<modelDatas.size(); i++) {
+      if(modelDatas[i]->modelName == modelName && !modelDatas[i]->evalResourcesFreed) {
+        throw StringError("SelfplayManager::loadModelAndStartDataWriting: Duplicate model name: " + modelName);
+      }
     }
+
+    double initialTime = timer.getSeconds();
+    bool hasDataWriteLoop = true;
+    ModelData* newModel = new ModelData(modelName,nnEval,maxDataQueueSize,tdataWriter,sgfOut,initialTime,hasDataWriteLoop);
+    modelDatas.push_back(newModel);
+    numDataWriteLoopsActive++;
+    std::thread newThread(dataWriteLoop,this,newModel);
+    newThread.detach();
+
+    maybeAutoCleanupAlreadyLocked(backendCleanupEvals);
   }
-
-  double initialTime = timer.getSeconds();
-  bool hasDataWriteLoop = true;
-  ModelData* newModel = new ModelData(modelName,nnEval,maxDataQueueSize,tdataWriter,sgfOut,initialTime,hasDataWriteLoop);
-  modelDatas.push_back(newModel);
-  numDataWriteLoopsActive++;
-  std::thread newThread(dataWriteLoop,this,newModel);
-  newThread.detach();
-
-  maybeAutoCleanupAlreadyLocked();
+  finishPendingBackendCleanup(backendCleanupEvals);
 }
 
 void SelfplayManager::loadModelNoDataWritingLoop(
@@ -163,18 +275,22 @@ void SelfplayManager::loadModelNoDataWritingLoop(
   ofstream* sgfOut
 ) {
   string modelName = nnEval->getModelName();
-  std::lock_guard<std::mutex> lock(managerMutex);
-  for(size_t i = 0; i<modelDatas.size(); i++) {
-    if(modelDatas[i]->modelName == modelName) {
-      throw StringError("SelfplayManager::loadModelAndStartDataWriting: Duplicate model name: " + modelName);
+  std::vector<NNEvaluator*> backendCleanupEvals;
+  {
+    std::lock_guard<std::mutex> lock(managerMutex);
+    for(size_t i = 0; i<modelDatas.size(); i++) {
+      if(modelDatas[i]->modelName == modelName && !modelDatas[i]->evalResourcesFreed) {
+        throw StringError("SelfplayManager::loadModelAndStartDataWriting: Duplicate model name: " + modelName);
+      }
     }
-  }
 
-  double initialTime = timer.getSeconds();
-  bool hasDataWriteLoop = false;
-  ModelData* newModel = new ModelData(modelName,nnEval,maxDataQueueSize,tdataWriter,sgfOut,initialTime,hasDataWriteLoop);
-  modelDatas.push_back(newModel);
-  maybeAutoCleanupAlreadyLocked();
+    double initialTime = timer.getSeconds();
+    bool hasDataWriteLoop = false;
+    ModelData* newModel = new ModelData(modelName,nnEval,maxDataQueueSize,tdataWriter,sgfOut,initialTime,hasDataWriteLoop);
+    modelDatas.push_back(newModel);
+    maybeAutoCleanupAlreadyLocked(backendCleanupEvals);
+  }
+  finishPendingBackendCleanup(backendCleanupEvals);
 }
 
 size_t SelfplayManager::numModels() const {
@@ -201,7 +317,7 @@ string SelfplayManager::getLatestModelName() const {
 bool SelfplayManager::hasModel(const std::string& modelName) const {
   std::lock_guard<std::mutex> lock(managerMutex);
   for(size_t i = 0; i<modelDatas.size(); i++) {
-    if(modelDatas[i]->modelName == modelName)
+    if(modelDatas[i]->modelName == modelName && !modelDatas[i]->evalResourcesFreed)
       return true;
   }
   return false;
@@ -209,6 +325,8 @@ bool SelfplayManager::hasModel(const std::string& modelName) const {
 
 
 NNEvaluator* SelfplayManager::acquireModelAlreadyLocked(ModelData* foundData) {
+  if(foundData->evalResourcesFreed)
+    return NULL;
   foundData->acquireCount += 1;
   return foundData->nnEval;
 }
@@ -220,9 +338,9 @@ void SelfplayManager::releaseAlreadyLocked(ModelData* foundData) {
 NNEvaluator* SelfplayManager::acquireModel(const string& modelName) {
   std::lock_guard<std::mutex> lock(managerMutex);
   ModelData* foundData = NULL;
-  for(size_t i = 0; i<modelDatas.size(); i++) {
-    if(modelDatas[i]->modelName == modelName) {
-      foundData = modelDatas[i];
+  for(size_t i = modelDatas.size(); i > 0; i--) {
+    if(modelDatas[i-1]->modelName == modelName) {
+      foundData = modelDatas[i-1];
       break;
     }
   }
@@ -240,33 +358,116 @@ NNEvaluator* SelfplayManager::acquireLatest() {
 }
 
 void SelfplayManager::release(const string& modelName) {
-  std::lock_guard<std::mutex> lock(managerMutex);
-  ModelData* foundData = NULL;
-  for(size_t i = 0; i<modelDatas.size(); i++) {
-    if(modelDatas[i]->modelName == modelName) {
-      foundData = modelDatas[i];
-      break;
+  std::vector<NNEvaluator*> backendCleanupEvals;
+  {
+    std::lock_guard<std::mutex> lock(managerMutex);
+    ModelData* foundData = NULL;
+    for(size_t i = 0; i<modelDatas.size(); i++) {
+      if(modelDatas[i]->modelName == modelName) {
+        foundData = modelDatas[i];
+        break;
+      }
+    }
+    if(foundData != NULL) {
+      releaseAlreadyLocked(foundData);
+      maybeAutoCleanupAlreadyLocked(backendCleanupEvals);
     }
   }
-  if(foundData != NULL) {
-    releaseAlreadyLocked(foundData);
-    maybeAutoCleanupAlreadyLocked();
-  }
+  finishPendingBackendCleanup(backendCleanupEvals);
 }
 
 void SelfplayManager::release(NNEvaluator* nnEval) {
-  std::lock_guard<std::mutex> lock(managerMutex);
-  ModelData* foundData = NULL;
-  for(size_t i = 0; i<modelDatas.size(); i++) {
-    if(modelDatas[i]->nnEval == nnEval) {
-      foundData = modelDatas[i];
-      break;
+  std::vector<NNEvaluator*> backendCleanupEvals;
+  {
+    std::lock_guard<std::mutex> lock(managerMutex);
+    ModelData* foundData = NULL;
+    for(size_t i = 0; i<modelDatas.size(); i++) {
+      if(modelDatas[i]->nnEval == nnEval) {
+        foundData = modelDatas[i];
+        break;
+      }
+    }
+    if(foundData != NULL) {
+      releaseAlreadyLocked(foundData);
+      maybeAutoCleanupAlreadyLocked(backendCleanupEvals);
     }
   }
-  if(foundData != NULL) {
-    releaseAlreadyLocked(foundData);
-    maybeAutoCleanupAlreadyLocked();
+  finishPendingBackendCleanup(backendCleanupEvals);
+}
+
+void SelfplayManager::acquireWriteLease(const string& modelName) {
+  std::lock_guard<std::mutex> lock(managerMutex);
+  for(size_t i = 0; i<modelDatas.size(); i++) {
+    if(modelDatas[i]->modelName == modelName) {
+      modelDatas[i]->writeRefCount += 1;
+      return;
+    }
   }
+}
+
+void SelfplayManager::releaseWriteLease(const string& modelName) {
+  std::vector<NNEvaluator*> backendCleanupEvals;
+  {
+    std::lock_guard<std::mutex> lock(managerMutex);
+    for(size_t i = 0; i<modelDatas.size(); i++) {
+      if(modelDatas[i]->modelName == modelName) {
+        modelDatas[i]->writeRefCount -= 1;
+        maybeAutoCleanupAlreadyLocked(backendCleanupEvals);
+        break;
+      }
+    }
+  }
+  finishPendingBackendCleanup(backendCleanupEvals);
+}
+
+void SelfplayManager::acquireWriteLease(NNEvaluator* nnEval) {
+  std::lock_guard<std::mutex> lock(managerMutex);
+  for(size_t i = 0; i<modelDatas.size(); i++) {
+    if(modelDatas[i]->nnEval == nnEval) {
+      modelDatas[i]->writeRefCount += 1;
+      return;
+    }
+  }
+}
+
+void SelfplayManager::releaseWriteLease(NNEvaluator* nnEval) {
+  std::vector<NNEvaluator*> backendCleanupEvals;
+  {
+    std::lock_guard<std::mutex> lock(managerMutex);
+    for(size_t i = 0; i<modelDatas.size(); i++) {
+      if(modelDatas[i]->nnEval == nnEval) {
+        modelDatas[i]->writeRefCount -= 1;
+        maybeAutoCleanupAlreadyLocked(backendCleanupEvals);
+        break;
+      }
+    }
+  }
+  finishPendingBackendCleanup(backendCleanupEvals);
+}
+
+bool SelfplayManager::tryReloadLatestInPlace(
+  const string& newModelFileName,
+  const string& newModelName,
+  const string& expectedSha256
+) {
+  std::lock_guard<std::mutex> lock(managerMutex);
+  if(modelDatas.empty())
+    return false;
+  ModelData* foundData = modelDatas.back();
+  if(foundData == NULL || foundData->nnEval == NULL)
+    return false;
+  for(size_t i = 0; i+1 < modelDatas.size(); i++) {
+    if(modelDatas[i]->modelName == newModelName)
+      return false;
+  }
+  bool ok = foundData->nnEval->reloadLoadedModel(newModelFileName, newModelName, expectedSha256);
+  if(!ok)
+    return false;
+  foundData->modelName = newModelName;
+  foundData->lastReleaseTime = timer.getSeconds();
+  if(logger != NULL)
+    logger->write("SelfplayManager in-place reloaded latest model to " + newModelName);
+  return true;
 }
 
 void SelfplayManager::countOneGameStarted(NNEvaluator* nnEval) {
@@ -308,7 +509,7 @@ void SelfplayManager::enqueueDataToWrite(const string& modelName, FinishedGameDa
   }
   if(foundData == NULL)
     throw StringError("SelfplayManager::enqueueDataToWrite: could not find model. Possible bug - client did not acquire model?");
-  testAssert(foundData->hasDataWriteLoop == true);
+  assert(foundData->hasDataWriteLoop == true);
 
   //In case it takes a while to push the game on, drop the lock. We're guaranteed as a precondition that
   //the caller has acquired the model as well, so it won't be cleaned up underneath us.
@@ -353,12 +554,12 @@ void SelfplayManager::runDataWriteLoopImpl(ModelData* modelData) {
     if(!suc)
       break;
 
-    testAssert(gameData != NULL);
+    assert(gameData != NULL);
 
     modelData->tdataWriter->writeGame(*gameData);
 
     if(modelData->sgfOut != NULL) {
-      testAssert(gameData->startHist.moveHistory.size() <= gameData->endHist.moveHistory.size());
+      assert(gameData->startHist.moveHistory.size() <= gameData->endHist.moveHistory.size());
       WriteSgf::writeSgf(*modelData->sgfOut,gameData->bName,gameData->wName,gameData->endHist,gameData,false,true);
       (*modelData->sgfOut) << endl;
     }
@@ -372,7 +573,7 @@ void SelfplayManager::runDataWriteLoopImpl(ModelData* modelData) {
   if(logger != NULL)
     logger->write("Data write loop finishing for neural net: " + modelData->modelName);
 
-  testAssert(modelData->acquireCount == 0);
+  assert(modelData->acquireCount == 0);
 
   string name = modelData->modelName;
 
@@ -384,7 +585,7 @@ void SelfplayManager::runDataWriteLoopImpl(ModelData* modelData) {
     std::lock_guard<std::mutex> lock(managerMutex);
     for(size_t i = 0; i<modelDatas.size(); i++) {
       (void)i;
-      testAssert(modelDatas[i] != modelData);
+      assert(modelDatas[i] != modelData);
     }
   }
 
@@ -406,12 +607,26 @@ void SelfplayManager::runDataWriteLoopImpl(ModelData* modelData) {
   //Check back in and notify that we're done once done cleaning up.
   std::unique_lock<std::mutex> lock(managerMutex);
   numDataWriteLoopsActive--;
-  testAssert(numDataWriteLoopsActive >= 0);
+  assert(numDataWriteLoopsActive >= 0);
   if(numDataWriteLoopsActive == 0) {
-    testAssert(modelDatas.size() == 0);
+    assert(modelDatas.size() == 0);
     dataWriteLoopsAreDone.notify_all();
   }
   lock.unlock();
+}
+
+void SelfplayManager::debugDumpModelStats() {
+  std::lock_guard<std::mutex> lock(managerMutex);
+  if(logger == NULL) return;
+  for(size_t i = 0; i<modelDatas.size(); i++) {
+    ModelData* d = modelDatas[i];
+    logger->write("DEBUG_MODEL[" + Global::uint64ToString(i) + "] " + d->modelName +
+                  " acq=" + Global::intToString(d->acquireCount) +
+                  " wref=" + Global::intToString(d->writeRefCount) +
+                  " freed=" + Global::intToString(d->evalResourcesFreed ? 1 : 0) +
+                  " backend=" + Global::intToString(d->backendResourcesFreed ? 1 : 0) +
+                  " qsz=" + Global::uint64ToString(d->finishedGameQueue.size()));
+  }
 }
 
 void SelfplayManager::withDataWriters(
@@ -428,7 +643,7 @@ void SelfplayManager::withDataWriters(
   }
   if(foundData == NULL)
     throw StringError("SelfplayManager::withDataWriters: could not find model. Possible bug - client did not acquire model?");
-  testAssert(foundData->hasDataWriteLoop == false);
+  assert(foundData->hasDataWriteLoop == false);
 
   f(foundData->tdataWriter, foundData->sgfOut);
 }

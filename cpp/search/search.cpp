@@ -545,6 +545,8 @@ void Search::runWholeSearch(
           shouldStop = true;
         if(shouldStopEarly != NULL && (*shouldStopEarly)())
           shouldStop = true;
+        if(nnEvaluator->isReleasedOrSuperseded())
+          shouldStop = true;
 
         //But an explicit stop signal can stop us from doing any search
         if(shouldStop || shouldStopNow.load(std::memory_order_relaxed)) {

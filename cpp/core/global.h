@@ -298,6 +298,12 @@ namespace Global {
     F func;
   };
 
+  //C++17 class template argument deduction guide so callers can write
+  //'Global::CustomScopeGuard guard([&]{ ... });' without spelling out the
+  //anonymous lambda type.
+  template <typename F>
+  CustomScopeGuard(F&&) -> CustomScopeGuard<typename std::decay<F>::type>;
+
 }
 
 

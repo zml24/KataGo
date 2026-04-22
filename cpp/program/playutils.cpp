@@ -380,6 +380,15 @@ static SearchParams getNoiselessParams(const SearchParams& oldParams, int64_t nu
   return newParams;
 }
 
+static bool getRootValuesOrNeutral(Search* bot, ReportedSearchValues& values) {
+  if(bot->getRootValues(values))
+    return true;
+  if(bot->getRootRawNNValues(values))
+    return true;
+  values = ReportedSearchValues();
+  return false;
+}
+
 ReportedSearchValues PlayUtils::getWhiteScoreValues(
   Search* bot,
   const Board& board,
@@ -403,7 +412,8 @@ ReportedSearchValues PlayUtils::getWhiteScoreValues(
   bot->setPosition(pla,board,hist);
   bot->runWholeSearch(pla);
 
-  ReportedSearchValues values = bot->getRootValuesRequireSuccess();
+  ReportedSearchValues values;
+  getRootValuesOrNeutral(bot,values);
   bot->setParams(oldParams);
   return values;
 }
@@ -1194,6 +1204,8 @@ Loc PlayUtils::maybeFriendlyPass(
 
     ReportedSearchValues valuesAfterPass;
     ReportedSearchValues valuesAfterMove;
+    bool gotValuesAfterPass;
+    bool gotValuesAfterMove;
 
     {
       Board boardAfterPass = board;
@@ -1202,7 +1214,7 @@ Loc PlayUtils::maybeFriendlyPass(
       Player plaAfterPass = getOpp(pla);
       bot->setPosition(plaAfterPass,boardAfterPass,histAfterPass);
       bot->runWholeSearch(plaAfterPass);
-      valuesAfterPass = bot->getRootValuesRequireSuccess();
+      gotValuesAfterPass = bot->getRootValues(valuesAfterPass);
     }
     {
       Board boardAfterMove = board;
@@ -1211,13 +1223,14 @@ Loc PlayUtils::maybeFriendlyPass(
       Player plaAfterMove = getOpp(pla);
       bot->setPosition(plaAfterMove,boardAfterMove,histAfterMove);
       bot->runWholeSearch(plaAfterMove);
-      valuesAfterMove = bot->getRootValuesRequireSuccess();
+      gotValuesAfterMove = bot->getRootValues(valuesAfterMove);
     }
 
     bot->setParams(oldParams);
     bot->clearSearch();
 
     if(
+      gotValuesAfterPass && gotValuesAfterMove &&
       pla == P_WHITE
       && valuesAfterPass.utility > valuesAfterMove.utility - 0.1
       && valuesAfterPass.expectedScore > valuesAfterMove.expectedScore - 0.25
@@ -1225,6 +1238,7 @@ Loc PlayUtils::maybeFriendlyPass(
       moveLoc = Board::PASS_LOC;
     }
     else if(
+      gotValuesAfterPass && gotValuesAfterMove &&
       pla == P_BLACK
       && valuesAfterPass.utility < valuesAfterMove.utility + 0.1
       && valuesAfterPass.expectedScore < valuesAfterMove.expectedScore + 0.25

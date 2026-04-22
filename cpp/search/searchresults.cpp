@@ -578,7 +578,7 @@ Loc Search::getChosenMoveLoc() {
   vector<double> playSelectionValues;
   bool suc = getPlaySelectionValues(locs,playSelectionValues,0.0);
   if(!suc)
-    return Board::NULL_LOC;
+    return PlayUtils::chooseRandomLegalMove(rootBoard, rootHistory, rootPla, nonSearchRand, Board::NULL_LOC);
 
   testAssert(locs.size() == playSelectionValues.size());
 

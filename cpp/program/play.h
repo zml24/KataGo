@@ -294,6 +294,9 @@ namespace Play {
     std::vector<PolicyTargetMove>& buf,
     const Search* toMoveBot,
     const SearchNode* node,
+    const Board& board,
+    const BoardHistory& hist,
+    Player pla,
     std::vector<Loc>& locsBuf,
     std::vector<double>& playSelectionValuesBuf
   );

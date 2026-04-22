@@ -2066,7 +2066,7 @@ int MainCmds::writetrainingdata(const vector<string>& args) {
 
           moves.push_back(moveLoc);
           policyTargets.emplace_back();
-          Play::extractPolicyTarget(policyTargets[policyTargets.size()-1],search,search->rootNode,locsBuf,playSelectionValuesBuf);
+          Play::extractPolicyTarget(policyTargets[policyTargets.size()-1],search,search->rootNode,board,hist,nextPla,locsBuf,playSelectionValuesBuf);
 
           // KataGo cleanup moves get weighted a tiny bit, so we can preserve the instinct to cleanup
           // in the right way for strict rules as according to KataGo's cleanup instincts.

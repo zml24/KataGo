@@ -35,7 +35,8 @@ namespace Setup {
     int defaultMaxBatchSize,
     bool defaultRequireExactNNLen,
     bool disableFP16,
-    setup_for_t setupFor
+    setup_for_t setupFor,
+    bool spawnServerThreadsImmediately = true
   );
 
   std::vector<NNEvaluator*> initializeNNEvaluators(
@@ -51,7 +52,8 @@ namespace Setup {
     int defaultMaxBatchSize,
     bool defaultRequireExactNNLen,
     bool disableFP16,
-    setup_for_t setupFor
+    setup_for_t setupFor,
+    bool spawnServerThreadsImmediately = true
   );
 
   constexpr int MAX_BOT_PARAMS_FROM_CFG = 4096;

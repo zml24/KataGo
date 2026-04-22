@@ -12,7 +12,6 @@
 #include "../program/play.h"
 #include "../program/selfplaymanager.h"
 #include "../command/commandline.h"
-#include "../core/test.h"
 #include "../main.h"
 
 #include <chrono>
@@ -107,6 +106,27 @@ int MainCmds::selfplay(const vector<string>& args) {
 
   const bool switchNetsMidGame = cfg.getBool("switchNetsMidGame");
   const SearchParams baseParams = Setup::loadSingleParams(cfg,Setup::SETUP_FOR_OTHER);
+  WaitableFlag shouldPause;
+  std::atomic<bool> shouldAbortGamesForReload(false);
+#if defined(USE_TENSORRT_BACKEND)
+  const char* refitEnv = std::getenv("KATAGO_TRT_REFIT");
+  const bool trtRefitEnabled = (refitEnv != nullptr && string(refitEnv) == "1");
+  // With TRT refit, model loading is fast (~183ms) and two evaluators can
+  // safely coexist — no need to abort in-flight games.
+  // Without refit, full TRT engine rebuild (~7 min) requires serialized reload.
+  const bool useSerializedModelReload = !trtRefitEnabled;
+#else
+  const bool useSerializedModelReload = false;
+#endif
+  const bool allowMidgameNetSwitch = switchNetsMidGame && !useSerializedModelReload;
+  if(useSerializedModelReload) {
+    logger.write("TensorRT selfplay will serialize model reloads and may abort in-flight games during model updates");
+    if(switchNetsMidGame)
+      logger.write("TensorRT-safe reload disables midgame model switching");
+  }
+  else if(allowMidgameNetSwitch) {
+    logger.write("TRT refit enabled: mid-game model switching active, no game abort on model update");
+  }
 
   //Initialize object for randomizing game settings and running games
   const bool isDistributed = false;
@@ -137,7 +157,8 @@ int MainCmds::selfplay(const vector<string>& args) {
   //Returns true if a new net was loaded.
   auto loadLatestNeuralNetIntoManager =
     [inputsVersion,&manager,maxRowsPerTrainFile,firstFileRandMinProp,dataBoardLen,
-     &modelsDir,&outputDir,&logger,&cfg,numGameThreads,
+     &modelsDir,&outputDir,&logger,&cfg,numGameThreads,&shouldPause,&shouldAbortGamesForReload,
+     switchNetsMidGame,useSerializedModelReload,allowMidgameNetSwitch,
      minBoardXSizeUsed,maxBoardXSizeUsed,minBoardYSizeUsed,maxBoardYSizeUsed](const string* lastNetName) -> bool {
 
     string modelName;
@@ -163,67 +184,192 @@ int MainCmds::selfplay(const vector<string>& args) {
     const string expectedSha256 = "";
 
     Rand rand;
-     NNEvaluator* nnEval = Setup::initializeNNEvaluator(
-      modelName,modelFile,expectedSha256,cfg,logger,rand,expectedConcurrentEvals,
-      maxBoardXSizeUsed,maxBoardYSizeUsed,defaultMaxBatchSize,defaultRequireExactNNLen,disableFP16,
-      Setup::SETUP_FOR_OTHER
-    );
-    logger.write("Loaded latest neural net " + modelName + " from: " + modelFile);
-
-    string modelOutputDir = outputDir + "/" + modelName;
-    string sgfOutputDir = modelOutputDir + "/sgfs";
-    string tdataOutputDir = modelOutputDir + "/tdata";
-
-    //Try repeatedly to make directories, in case the filesystem is unhappy with us as we try to make the same dirs as another process.
-    //Wait a random amount of time in between each failure.
-    int maxTries = 5;
-    for(int i = 0; i<maxTries; i++) {
-      bool success = false;
-      try {
-        MakeDir::make(modelOutputDir);
-        MakeDir::make(sgfOutputDir);
-        MakeDir::make(tdataOutputDir);
-        success = true;
-      }
-      catch(const StringError& e) {
-        logger.write(string("WARNING, error making directories, trying again shortly: ") + e.what());
-        success = false;
-      }
-
-      if(success)
-        break;
-      else {
-        if(i == maxTries-1) {
-          logger.write("ERROR: Could not make selfplay model directories, is something wrong with the filesystem?");
-          //Just give up and wait for the next model.
-          return false;
-        }
-        double sleepTime = 10.0 + rand.nextDouble() * 30.0;
-        std::this_thread::sleep_for(std::chrono::duration<double>(sleepTime));
-        continue;
-      }
-    }
-
-    {
-      ofstream out;
-      FileUtils::open(out,modelOutputDir + "/" + "selfplay-" + Global::uint64ToHexString(rand.nextUInt64()) + ".cfg");
-      out << cfg.getContents();
-      out.close();
-    }
-
-    //Note that this inputsVersion passed here is NOT necessarily the same as the one used in the neural net self play, it
-    //simply controls the input feature version for the written data
-    TrainingDataWriter* tdataWriter = new TrainingDataWriter(
-      tdataOutputDir, inputsVersion, maxRowsPerTrainFile, firstFileRandMinProp, dataBoardLen, dataBoardLen, Global::uint64ToHexString(rand.nextUInt64()));
+    NNEvaluator* nnEval = NULL;
+    TrainingDataWriter* tdataWriter = NULL;
     ofstream* sgfOut = NULL;
-    if(sgfOutputDir.length() > 0) {
-      sgfOut = new ofstream();
-      FileUtils::open(*sgfOut, sgfOutputDir + "/" + Global::uint64ToHexString(rand.nextUInt64()) + ".sgfs");
-    }
+    bool pausedForSafeHandoff = false;
+    bool serializedReloadInProgress = false;
 
-    logger.write("Model loading loop thread loaded new neural net " + nnEval->getModelName());
-    manager->loadModelAndStartDataWriting(nnEval, tdataWriter, sgfOut);
-    return true;
+    // ========== IN-PLACE REFIT FAST PATH ==========
+    // If TRT refit is enabled and we already have a live evaluator, skip creating a
+    // second NNEvaluator/ModelData entirely. Reload the weights in place on the
+    // existing evaluator, keep its tdataWriter/sgfOut bound to the existing ModelData.
+    // This eliminates the double-evaluator state that causes GPU context and NNCache
+    // to stack up across model switches — the root cause of the observed 322 MiB/switch
+    // GPU leak and linear CPU RSS growth in the pure/overlap baselines.
+    if(allowMidgameNetSwitch && lastNetName != NULL && manager->numModels() > 0) {
+      bool reloaded = false;
+      try {
+        reloaded = manager->tryReloadLatestInPlace(modelFile, modelName, expectedSha256);
+      } catch(const std::exception& e) {
+        logger.write(string("In-place reload threw: ") + e.what() + "; falling back to full evaluator creation");
+        reloaded = false;
+      } catch(...) {
+        logger.write("In-place reload threw unknown exception; falling back to full evaluator creation");
+        reloaded = false;
+      }
+      if(reloaded) {
+        logger.write("In-place reloaded latest evaluator to " + modelName);
+        return true;
+      }
+      logger.write("In-place reload failed for " + modelName + "; falling back to full evaluator creation");
+    }
+    // ========== END FAST PATH ==========
+
+    try {
+      nnEval = Setup::initializeNNEvaluator(
+        modelName,modelFile,expectedSha256,cfg,logger,rand,expectedConcurrentEvals,
+        maxBoardXSizeUsed,maxBoardYSizeUsed,defaultMaxBatchSize,defaultRequireExactNNLen,disableFP16,
+        Setup::SETUP_FOR_OTHER,
+        false
+      );
+
+      if(useSerializedModelReload && lastNetName != NULL && manager->numModels() > 0) {
+        serializedReloadInProgress = true;
+        logger.write("Draining in-flight selfplay for TRT-safe model handoff to " + modelName);
+        shouldAbortGamesForReload.store(true, std::memory_order_release);
+
+        NNEvaluator* oldLatest = manager->acquireLatest();
+        if(oldLatest != NULL) {
+          logger.write("Draining previous latest model before enabling new TRT backend: " + oldLatest->getModelName());
+          oldLatest->releaseHeavyResources();
+          manager->noteModelEvalResourcesFreed(oldLatest);
+
+          //Keep our own acquire lease alive throughout the drain. If we
+          //release first and wait for acquireCount==0, maybeAutoCleanup can
+          //queue backend teardown + Phase-3 erase, and the data-write loop
+          //may delete the ModelData (and its NNEvaluator) while we still hold
+          //oldLatest — a use-after-free on the later releaseRetiredBackendResources
+          //call. Drain down to acquireCount==1 (our own lease) instead, then
+          //free backend, then do a single final release that triggers
+          //Phase-3 cleanup cleanly.
+          int lastLoggedAcquireCount = -1;
+          while(!shouldStop.load()) {
+            int acquireCount = manager->getModelAcquireCount(oldLatest);
+            if(acquireCount <= 1)
+              break;
+            if(acquireCount != lastLoggedAcquireCount) {
+              logger.write(
+                "Waiting for " + Global::intToString(acquireCount - 1) +
+                " in-flight selfplay games to release retired model " + oldLatest->getModelName()
+              );
+              lastLoggedAcquireCount = acquireCount;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+          }
+          if(!shouldStop.load()) {
+            oldLatest->releaseRetiredBackendResources();
+            manager->noteModelBackendResourcesFreed(oldLatest);
+          }
+          //Final release. After this, oldLatest may be freed by the data-write
+          //loop at any time; do not touch it again.
+          manager->release(oldLatest);
+          oldLatest = NULL;
+        }
+      }
+      else if(switchNetsMidGame && !allowMidgameNetSwitch && lastNetName != NULL && manager->numModels() > 0) {
+        pausedForSafeHandoff = true;
+        logger.write("Pausing selfplay for TRT-safe model handoff to " + modelName);
+        shouldPause.set(true);
+
+        NNEvaluator* oldLatest = manager->acquireLatest();
+        if(oldLatest != NULL) {
+          logger.write("Draining previous latest model before enabling new TRT backend: " + oldLatest->getModelName());
+          oldLatest->releaseHeavyResources();
+          oldLatest->releaseRetiredBackendResources();
+          manager->release(oldLatest);
+        }
+      }
+      // When allowMidgameNetSwitch is true (TRT refit mode), skip both serialized
+      // and paused handoff. Game threads will switch to the new model naturally at
+      // move boundaries via checkForNewNNEval. The old model stays fully functional
+      // until acquireCount reaches 0, then maybeAutoCleanup handles resource release.
+
+      nnEval->spawnServerThreads();
+      logger.write("Loaded latest neural net " + modelName + " from: " + modelFile);
+
+      string modelOutputDir = outputDir + "/" + modelName;
+      string sgfOutputDir = modelOutputDir + "/sgfs";
+      string tdataOutputDir = modelOutputDir + "/tdata";
+
+      //Try repeatedly to make directories, in case the filesystem is unhappy with us as we try to make the same dirs as another process.
+      //Wait a random amount of time in between each failure.
+      int maxTries = 5;
+      for(int i = 0; i<maxTries; i++) {
+        bool success = false;
+        try {
+          MakeDir::make(modelOutputDir);
+          MakeDir::make(sgfOutputDir);
+          MakeDir::make(tdataOutputDir);
+          success = true;
+        }
+        catch(const StringError& e) {
+          logger.write(string("WARNING, error making directories, trying again shortly: ") + e.what());
+          success = false;
+        }
+
+        if(success)
+          break;
+        else {
+          if(i == maxTries-1) {
+            logger.write("ERROR: Could not make selfplay model directories, is something wrong with the filesystem?");
+            //Just give up and wait for the next model.
+            if(serializedReloadInProgress || pausedForSafeHandoff) {
+              shouldAbortGamesForReload.store(false, std::memory_order_release);
+              if(pausedForSafeHandoff)
+                shouldPause.set(false);
+              logger.write("Resuming selfplay after failed TRT-safe handoff");
+            }
+            delete nnEval;
+            return false;
+          }
+          double sleepTime = 10.0 + rand.nextDouble() * 30.0;
+          std::this_thread::sleep_for(std::chrono::duration<double>(sleepTime));
+          continue;
+        }
+      }
+
+      {
+        ofstream out;
+        FileUtils::open(out,modelOutputDir + "/" + "selfplay-" + Global::uint64ToHexString(rand.nextUInt64()) + ".cfg");
+        out << cfg.getContents();
+        out.close();
+      }
+
+      //Note that this inputsVersion passed here is NOT necessarily the same as the one used in the neural net self play, it
+      //simply controls the input feature version for the written data
+      tdataWriter = new TrainingDataWriter(
+        tdataOutputDir, inputsVersion, maxRowsPerTrainFile, firstFileRandMinProp, dataBoardLen, dataBoardLen, Global::uint64ToHexString(rand.nextUInt64()));
+      if(sgfOutputDir.length() > 0) {
+        sgfOut = new ofstream();
+        FileUtils::open(*sgfOut, sgfOutputDir + "/" + Global::uint64ToHexString(rand.nextUInt64()) + ".sgfs");
+      }
+
+      logger.write("Model loading loop thread loaded new neural net " + nnEval->getModelName());
+      manager->loadModelAndStartDataWriting(nnEval, tdataWriter, sgfOut);
+      nnEval = NULL;
+      tdataWriter = NULL;
+      sgfOut = NULL;
+      if(serializedReloadInProgress || pausedForSafeHandoff) {
+        shouldAbortGamesForReload.store(false, std::memory_order_release);
+        if(pausedForSafeHandoff)
+          shouldPause.set(false);
+        logger.write("Resuming selfplay after TRT-safe model handoff to " + modelName);
+      }
+      return true;
+    }
+    catch(...) {
+      shouldAbortGamesForReload.store(false, std::memory_order_release);
+      if(pausedForSafeHandoff && shouldPause.get())
+        shouldPause.set(false);
+      if(nnEval != NULL)
+        delete nnEval;
+      if(tdataWriter != NULL)
+        delete tdataWriter;
+      if(sgfOut != NULL)
+        delete sgfOut;
+      throw;
+    }
   };
 
   //Initialize the initial neural net
@@ -243,25 +389,39 @@ int MainCmds::selfplay(const vector<string>& args) {
     &gameRunner,
     &manager,
     &logger,
-    switchNetsMidGame,
+    &shouldPause,
+    &shouldAbortGamesForReload,
+    allowMidgameNetSwitch,
     &numGamesStarted,
     &forkData,
     maxGamesTotal,
     &baseParams,
     &gameSeedBase
   ](int threadIdx) {
-    auto shouldStopFunc = []() noexcept {
-      return shouldStop.load();
-    };
-    WaitableFlag* shouldPause = nullptr;
+    WaitableFlag* shouldPausePtr = &shouldPause;
 
     string prevModelName;
     Rand thisLoopSeedRand;
     while(true) {
       if(shouldStop.load())
         break;
+      if(shouldPausePtr->get())
+        shouldPausePtr->waitUntilFalse();
+      if(shouldStop.load())
+        break;
+
       NNEvaluator* nnEval = manager->acquireLatest();
-      testAssert(nnEval != NULL);
+      if(nnEval == NULL) {
+        if(shouldPausePtr->get() || shouldAbortGamesForReload.load(std::memory_order_acquire)) {
+          std::this_thread::sleep_for(std::chrono::milliseconds(10));
+          continue;
+        }
+        throw StringError("Selfplay game loop could not acquire latest model");
+      }
+      if(shouldPausePtr->get() || shouldAbortGamesForReload.load(std::memory_order_acquire)) {
+        manager->release(nnEval);
+        continue;
+      }
 
       if(prevModelName != nnEval->getModelName()) {
         prevModelName = nnEval->getModelName();
@@ -271,7 +431,7 @@ int MainCmds::selfplay(const vector<string>& args) {
       //Callback that runGame will call periodically to ask us if we have a new neural net
       std::function<NNEvaluator*()> checkForNewNNEval = [&manager,&nnEval,&prevModelName,&logger,&threadIdx]() -> NNEvaluator* {
         NNEvaluator* newNNEval = manager->acquireLatest();
-        testAssert(newNNEval != NULL);
+        assert(newNNEval != NULL);
         if(newNNEval == nnEval) {
           manager->release(newNNEval);
           return NULL;
@@ -285,9 +445,19 @@ int MainCmds::selfplay(const vector<string>& args) {
       };
 
       FinishedGameData* gameData = NULL;
-
       int64_t gameIdx = numGamesStarted.fetch_add(1,std::memory_order_acq_rel);
       if(gameIdx < maxGamesTotal) {
+        bool abortedForReloadThisGame = false;
+        auto shouldStopFunc = [&shouldAbortGamesForReload,&abortedForReloadThisGame]() noexcept {
+          if(shouldStop.load())
+            return true;
+          if(shouldAbortGamesForReload.load(std::memory_order_acquire)) {
+            abortedForReloadThisGame = true;
+            return true;
+          }
+          return false;
+        };
+
         manager->countOneGameStarted(nnEval);
         MatchPairer::BotSpec botSpecB;
         botSpecB.botIdx = 0;
@@ -300,21 +470,37 @@ int MainCmds::selfplay(const vector<string>& args) {
         gameData = gameRunner->runGame(
           seed, botSpecB, botSpecW, forkData, NULL, logger,
           shouldStopFunc,
-          shouldPause,
-          (switchNetsMidGame ? checkForNewNNEval : nullptr),
+          shouldPausePtr,
+          (allowMidgameNetSwitch ? checkForNewNNEval : nullptr),
           nullptr,
           nullptr
         );
+
+        if(gameData == NULL && abortedForReloadThisGame && !shouldStop.load()) {
+          manager->release(nnEval);
+          continue;
+        }
       }
 
       //NULL gamedata will happen when the game is interrupted by shouldStop, which means we should also stop.
       //Or when we run out of total games.
       bool shouldContinue = gameData != NULL;
-      //Note that if we've gotten a newNNEval, we're actually pushing the game as data for the new one, rather than the old one!
+      // Use pointer-keyed lease/enqueue: an in-place reload may rename the ModelData's
+      // modelName between game start and enqueue, but the NNEvaluator* is stable.
       if(gameData != NULL)
-        manager->enqueueDataToWrite(nnEval,gameData);
-
+        manager->acquireWriteLease(nnEval);
+      NNEvaluator* nnEvalForWrite = nnEval;
       manager->release(nnEval);
+      if(gameData != NULL) {
+        try {
+          manager->enqueueDataToWrite(nnEvalForWrite,gameData);
+        }
+        catch(...) {
+          manager->releaseWriteLease(nnEvalForWrite);
+          throw;
+        }
+        manager->releaseWriteLease(nnEvalForWrite);
+      }
 
       if(!shouldContinue)
         break;
@@ -360,6 +546,22 @@ int MainCmds::selfplay(const vector<string>& args) {
   }
   std::thread modelLoadLoopThread(modelLoadLoopProtected);
 
+  //DEBUG: optional monitor thread, gated by env flag. Dumps per-model
+  //acquireCount / writeRefCount / freed-flags every 10s. Off by default;
+  //set KATAGO_DEBUG_MODEL_STATS=1 to enable during cleanup-path debugging.
+  const char* debugStatsEnv = std::getenv("KATAGO_DEBUG_MODEL_STATS");
+  const bool debugStatsEnabled = (debugStatsEnv != nullptr && string(debugStatsEnv) == "1");
+  std::thread debugMonitorThread;
+  if(debugStatsEnabled) {
+    debugMonitorThread = std::thread([&manager]() {
+      while(!shouldStop.load()) {
+        std::this_thread::sleep_for(std::chrono::seconds(10));
+        if(shouldStop.load()) break;
+        manager->debugDumpModelStats();
+      }
+    });
+  }
+
   //Wait for all game threads to stop
   for(int i = 0; i<threads.size(); i++)
     threads[i].join();
@@ -376,6 +578,8 @@ int MainCmds::selfplay(const vector<string>& args) {
     modelLoadSleepVar.notify_all();
   }
   modelLoadLoopThread.join();
+  if(debugMonitorThread.joinable())
+    debugMonitorThread.join();
 
   //At this point, nothing else except possibly data write loops are running, within the selfplay manager.
   delete manager;

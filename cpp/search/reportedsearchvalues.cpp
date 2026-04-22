@@ -4,6 +4,18 @@
 #include "../search/search.h"
 
 ReportedSearchValues::ReportedSearchValues()
+  : winValue(0.5),
+    lossValue(0.5),
+    noResultValue(0.0),
+    staticScoreValue(0.0),
+    dynamicScoreValue(0.0),
+    expectedScore(0.0),
+    expectedScoreStdev(0.0),
+    lead(0.0),
+    winLossValue(0.0),
+    utility(0.0),
+    weight(0.0),
+    visits(0)
 {}
 ReportedSearchValues::~ReportedSearchValues()
 {}

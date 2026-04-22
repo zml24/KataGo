@@ -1,7 +1,8 @@
 #include "../neuralnet/nneval.h"
 #include "../neuralnet/modelversion.h"
-#include "../core/test.h"
 #include "../neuralnet/serve_profiler.h"
+
+#include <chrono>
 
 using namespace std;
 
@@ -104,10 +105,13 @@ NNEvaluator::NNEvaluator(
    numOngoingEvals(0),
    numWaitingEvals(0),
    numEvalsToAwaken(0),
+   drainPending(false),
    waitingForFinish(),
    currentDoRandomize(doRandomize),
    currentDefaultSymmetry(defaultSymmetry),
    currentBatchSize(maxBatchSz),
+   isSuperseded(false),
+   nnOutputPool(std::make_shared<NNOutputPool>()),
    queryQueue()
 {
   if(nnXLen > NNPos::MAX_BOARD_LEN)
@@ -160,27 +164,132 @@ NNEvaluator::NNEvaluator(
   queryQueue.setReadOnly();
 }
 
-NNEvaluator::~NNEvaluator() {
-  killServerThreads();
+static void fillDummyResult(
+  const Board& board,
+  const BoardHistory& history,
+  Player nextPlayer,
+  int nnXLen,
+  int nnYLen,
+  int policySize,
+  double policyOptimism,
+  bool includeOwnerMap,
+  NNResultBuf& buf
+) {
+  std::lock_guard<std::mutex> resultLock(buf.resultMutex);
+  buf.result = std::make_shared<NNOutput>();
+  buf.result->nnXLen = nnXLen;
+  buf.result->nnYLen = nnYLen;
+  buf.result->whiteWinProb = 0.5f;
+  buf.result->whiteLossProb = 0.5f;
+  buf.result->whiteNoResultProb = 0.0f;
+  buf.result->whiteScoreMean = 0.0f;
+  buf.result->whiteScoreMeanSq = 0.0f;
+  buf.result->whiteLead = 0.0f;
+  buf.result->varTimeLeft = (float)(0.5 * board.x_size * board.y_size);
+  buf.result->shorttermWinlossError = 0.0f;
+  buf.result->shorttermScoreError = 0.0f;
+  buf.result->policyOptimismUsed = (float)policyOptimism;
 
-  if(computeContext != NULL)
-    NeuralNet::freeComputeContext(computeContext);
-  computeContext = NULL;
+  if(includeOwnerMap) {
+    float* whiteOwnerMap = new float[nnXLen * nnYLen];
+    std::fill(whiteOwnerMap, whiteOwnerMap + nnXLen * nnYLen, 0.0f);
+    buf.result->whiteOwnerMap = whiteOwnerMap;
+  }
+  else {
+    buf.result->whiteOwnerMap = NULL;
+  }
 
-  if(loadedModel != NULL)
-    NeuralNet::freeLoadedModel(loadedModel);
-  loadedModel = NULL;
+  std::fill(buf.result->policyProbs, buf.result->policyProbs + NNPos::MAX_NN_POLICY_SIZE, 0.0f);
+  int legalCount = 0;
+  for(int pos = 0; pos < policySize; pos++) {
+    Loc loc = NNPos::posToLoc(pos, board.x_size, board.y_size, nnXLen, nnYLen);
+    if(history.isLegal(board, loc, nextPlayer))
+      legalCount += 1;
+  }
 
-  delete nnCacheTable;
+  if(legalCount > 0) {
+    float uniformProb = 1.0f / legalCount;
+    for(int pos = 0; pos < policySize; pos++) {
+      Loc loc = NNPos::posToLoc(pos, board.x_size, board.y_size, nnXLen, nnYLen);
+      buf.result->policyProbs[pos] = history.isLegal(board, loc, nextPlayer) ? uniformProb : 0.0f;
+    }
+  }
+  else {
+    int passPos = NNPos::locToPos(Board::PASS_LOC, board.x_size, nnXLen, nnYLen);
+    buf.result->policyProbs[passPos] = 1.0f;
+  }
+
+  buf.hasResult = true;
 }
 
+void NNEvaluator::finishOngoingEval() {
+  std::lock_guard<std::mutex> lock(bufferMutex);
+  numOngoingEvals -= 1;
+  //Only broadcast when somebody is actually parked on waitingForFinish.
+  //Without this gate, every evaluate() completion wakes all 400 game threads
+  //(thundering herd) and costs ~2.4x throughput in RL selfplay.
+  //
+  //The only live consumer now is killServerThreads()'s post-join drain,
+  //which sets drainPending=true while spinning on numOngoingEvals==0.
+  //waitForNextNNEvalIfAny() used to register itself here via
+  //++numWaitingEvals, but is now a plain sleep_for (no condvar), so
+  //numWaitingEvals stays at 0. The numWaitingEvals check is kept as a
+  //defensive guard in case a future change reintroduces condvar-based
+  //throttling.
+  if(numWaitingEvals > 0 || drainPending)
+    waitingForFinish.notify_all();
+}
+
+void NNEvaluator::releaseHeavyResources() {
+  isSuperseded.store(true, std::memory_order_release);
+}
+
+void NNEvaluator::releaseRetiredBackendResources() {
+  killServerThreads();
+  if(nnCacheTable != NULL) {
+    delete nnCacheTable;
+    nnCacheTable = NULL;
+  }
+  releaseRetiredModelResources();
+}
+
+void NNEvaluator::releaseRetiredModelResources() {
+  if(computeContext != NULL) {
+    NeuralNet::freeComputeContext(computeContext);
+    computeContext = NULL;
+  }
+  if(loadedModel != NULL) {
+    NeuralNet::freeLoadedModel(loadedModel);
+    loadedModel = NULL;
+  }
+}
+
+bool NNEvaluator::isReleasedOrSuperseded() const {
+  return isSuperseded.load(std::memory_order_acquire);
+}
+
+NNEvaluator::~NNEvaluator() {
+  killServerThreads();
+  releaseRetiredModelResources();
+
+  if(nnCacheTable != NULL)
+    delete nnCacheTable;
+  nnCacheTable = NULL;
+}
+
+//These three names are mutated by reloadLoadedModel() under bufferMutex, so
+//concurrent readers (e.g. selfplay log lines) must take the same lock to avoid
+//a std::string data race during in-place model swaps.
 string NNEvaluator::getModelName() const {
+  std::lock_guard<std::mutex> lock(bufferMutex);
   return modelName;
 }
 string NNEvaluator::getModelFileName() const {
+  std::lock_guard<std::mutex> lock(bufferMutex);
   return modelFileName;
 }
 string NNEvaluator::getInternalModelName() const {
+  std::lock_guard<std::mutex> lock(bufferMutex);
   return internalModelName;
 }
 
@@ -248,6 +357,9 @@ void NNEvaluator::setCurrentBatchSize(int batchSize) {
   currentBatchSize.store(batchSize,std::memory_order_release);
 }
 bool NNEvaluator::requiresSGFMetadata() const {
+  //numInputMetaChannels is overwritten by reloadLoadedModel under bufferMutex,
+  //so observe it under the same lock to avoid a data race.
+  std::lock_guard<std::mutex> lk(bufferMutex);
   return numInputMetaChannels > 0;
 }
 
@@ -284,9 +396,17 @@ int NNEvaluator::getNNYLen() const {
   return nnYLen;
 }
 int NNEvaluator::getModelVersion() const {
+  //Replaced by reloadLoadedModel under bufferMutex.
+  std::lock_guard<std::mutex> lk(bufferMutex);
   return modelVersion;
 }
 double NNEvaluator::getTrunkSpatialConvDepth() const {
+  //loadedModel is swapped (old freed, new installed) by reloadLoadedModel
+  //under bufferMutex; read + use it under the same lock so the underlying
+  //LoadedModel cannot be freed while we are inspecting its descriptor.
+  std::lock_guard<std::mutex> lk(bufferMutex);
+  if(loadedModel == NULL)
+    return 0.0;
   return NeuralNet::getModelDesc(loadedModel).getTrunkSpatialConvDepth();
 }
 
@@ -298,6 +418,10 @@ enabled_t NNEvaluator::getUsingNHWCMode() const {
 }
 
 bool NNEvaluator::supportsShorttermError() const {
+  //modelVersion is replaced by reloadLoadedModel under bufferMutex.
+  //search.cpp's MCTS terminal-leaf hot path calls this, so the lock must
+  //stay narrow; the read is a single int load.
+  std::lock_guard<std::mutex> lk(bufferMutex);
   return modelVersion >= 9;
 }
 
@@ -314,7 +438,10 @@ void NNEvaluator::setDefaultSymmetry(int s) {
   currentDefaultSymmetry.store(s, std::memory_order_release);
 }
 
-Rules NNEvaluator::getSupportedRules(const Rules& desiredRules, bool& supported) const {
+Rules NNEvaluator::getSupportedRules(const Rules& desiredRules, bool& supported) {
+  //Same reasoning as getTrunkSpatialConvDepth: loadedModel is swapped +
+  //old-freed by reloadLoadedModel under bufferMutex.
+  std::lock_guard<std::mutex> lk(bufferMutex);
   if(loadedModel == NULL) {
     supported = true;
     return desiredRules;
@@ -417,12 +544,125 @@ void NNEvaluator::killServerThreads() {
   serverThreads.clear();
   serverThreadsIsUsingFP16.clear();
 
-  //Can unset now that threads are dead
+  //Drain any evaluate() calls that got past the isSuperseded gate before we
+  //set the query queue readonly. Their forcePush() failed and the fallback
+  //path (see evaluate()) decrements numOngoingEvals and notifies here. Without
+  //this wait, the asserts below race with the fallback and fire in Debug builds.
+  //drainPending tells finishOngoingEval()'s gated notify_all to broadcast on
+  //waitingForFinish even when no waitForNextNNEvalIfAny() waiter is
+  //registered; otherwise the gate would skip the wakeup and we'd hang here.
+  lock.lock();
+  drainPending = true;
+  while(numOngoingEvals > 0)
+    waitingForFinish.wait(lock);
+  drainPending = false;
+  lock.unlock();
+
+  //Can unset now that threads are dead and no evaluate() is mid-push
   isKilled = false;
 
-  testAssert(numOngoingEvals == 0);
-  testAssert(numWaitingEvals == 0);
-  testAssert(numEvalsToAwaken == 0);
+  assert(numOngoingEvals == 0);
+  assert(numWaitingEvals == 0);
+  assert(numEvalsToAwaken == 0);
+}
+
+bool NNEvaluator::reloadLoadedModel(
+  const string& newModelFileName,
+  const string& newModelName,
+  const string& expectedSha256
+) {
+  if(debugSkipNeuralNet)
+    return false;
+
+  // 1) Try loading the new model file BEFORE touching anything live. If the model
+  //    file is corrupt (NaN/inf weights, parse error, etc.), loadModelFile throws
+  //    and we return false with the existing evaluator completely untouched. Callers
+  //    fall back to creating a new NNEvaluator, or just stay on the current one.
+  //    This costs a few hundred MB of transient memory (two LoadedModels alive briefly)
+  //    but avoids the cascade where a bad new-model crashes the whole selfplay process.
+  LoadedModel* newLoadedModel = nullptr;
+  try {
+    newLoadedModel = NeuralNet::loadModelFile(newModelFileName, expectedSha256);
+  } catch(const std::exception& e) {
+    if(logger != NULL)
+      logger->write(string("In-place reload rejected new model ") + newModelName + ": " + e.what());
+    return false;
+  }
+  if(newLoadedModel == nullptr) {
+    if(logger != NULL)
+      logger->write("In-place reload rejected new model " + newModelName + ": loadModelFile returned null");
+    return false;
+  }
+
+  // 2) Flip isSuperseded BEFORE killServerThreads so any evaluate() calls arriving
+  //    during the reload fall through to fillDummyResult and never push into the
+  //    queue or hit assert(!isKilled). This is the only way to safely kill/respawn
+  //    server threads while game threads are potentially still calling evaluate().
+  isSuperseded.store(true, std::memory_order_release);
+
+  // Historically this woke condvar waiters parked in waitForNextNNEvalIfAny()
+  // so they could re-check and exit once killServerThreads() below set
+  // isKilled. Now that waitForNextNNEvalIfAny() is a plain sleep_for,
+  // numWaitingEvals stays at 0 and the block is a no-op at runtime. Kept
+  // as a defensive edge in case a future change reintroduces condvar-based
+  // throttling.
+  {
+    lock_guard<std::mutex> lk(bufferMutex);
+    if(numWaitingEvals > 0)
+      waitingForFinish.notify_all();
+  }
+
+  // 3) Drain the server threads (they will process any already-pushed requests and
+  //    exit; killServerThreads asserts numOngoingEvals==0 on return, which is
+  //    guaranteed because new evaluate() calls now short-circuit into dummy results).
+  killServerThreads();
+
+  // 4+5) Swap loadedModel AND replace all snapshotted fields under a single
+  //      bufferMutex critical section. This serializes with:
+  //        * evaluate()'s snapshot block (same lock), so a single evaluate()
+  //          always sees a consistent {loadedModel, modelVersion,
+  //          inputsVersion, numInputMetaChannels, postProcessParams,
+  //          modelName, modelFileName} tuple belonging to one model.
+  //        * all public getters that observe loadedModel / modelVersion /
+  //          numInputMetaChannels (getModelVersion, getTrunkSpatialConvDepth,
+  //          getSupportedRules, requiresSGFMetadata, supportsShorttermError),
+  //          which also take bufferMutex, so the old LoadedModel cannot be
+  //          freed out from under a getter inspecting its descriptor.
+  //
+  //      killServerThreads() returned with numOngoingEvals==0, so no
+  //      evaluate() is mid-snapshot; holding the lock through
+  //      freeLoadedModel keeps getters blocked but cannot deadlock against
+  //      server threads (none are alive here).
+  {
+    lock_guard<std::mutex> lk(bufferMutex);
+    if(loadedModel != NULL) {
+      NeuralNet::freeLoadedModel(loadedModel);
+      loadedModel = NULL;
+    }
+    loadedModel = newLoadedModel;
+    const ModelDesc& desc = NeuralNet::getModelDesc(loadedModel);
+    internalModelName = desc.name;
+    modelVersion = desc.modelVersion;
+    inputsVersion = NNModelVersion::getInputsVersion(modelVersion);
+    numInputMetaChannels = desc.numInputMetaChannels;
+    postProcessParams = desc.postProcessParams;
+    modelName = newModelName;
+    modelFileName = newModelFileName;
+  }
+
+  // 6) Old cached NN outputs belong to old weights; drop them.
+  if(nnCacheTable != NULL)
+    nnCacheTable->clear();
+
+  // 7) Respawn server threads; each one will create a fresh ComputeHandle off the
+  //    new loadedModel (TRT refit cache will make this ~1s instead of minutes).
+  spawnServerThreads();
+
+  // 8) Resume normal inference.
+  isSuperseded.store(false, std::memory_order_release);
+  if(logger != NULL)
+    logger->write("NNEvaluator in-place reloaded to " + modelName);
+  return true;
 }
 
 void NNEvaluator::serve(
@@ -452,7 +692,7 @@ void NNEvaluator::serve(
 
   {
     lock_guard<std::mutex> lock(bufferMutex);
-    testAssert(serverThreadIdx < serverThreadsIsUsingFP16.size());
+    assert(serverThreadIdx < serverThreadsIsUsingFP16.size());
     serverThreadsIsUsingFP16[serverThreadIdx] = gpuHandle == NULL ? 0 : NeuralNet::isUsingFP16(gpuHandle) ? 1 : 0;
     numServerThreadsStartingUp--;
     if(numServerThreadsStartingUp <= 0)
@@ -484,7 +724,7 @@ void NNEvaluator::serve(
     if(!gotAnything) {
       // Flush last batch's deferred notify before exiting
       if(prevOverlapNumRows > 0) {
-        NNOutputPool* pool = &nnOutputPool;
+        std::shared_ptr<NNOutputPool> pool = nnOutputPool;
         for(int row = 0; row < prevOverlapNumRows; row++) {
           NNResultBuf* rb = prevOverlapResultBufs[row];
           auto rp = std::shared_ptr<NNOutput>(prevOverlapOutputBuf[row], [pool](NNOutput* p) { pool->release(p); });
@@ -498,14 +738,14 @@ void NNEvaluator::serve(
 
     if(_profEnabled) _tAfterPop = ServeProfileStats::Clock::now();
     int numRows = (int)resultBufs.size();
-    testAssert(numRows > 0);
+    assert(numRows > 0);
 
     bool doRandomize = currentDoRandomize.load(std::memory_order_acquire);
     int defaultSymmetry = currentDefaultSymmetry.load(std::memory_order_acquire);
 
     if(debugSkipNeuralNet) {
       for(int row = 0; row < numRows; row++) {
-        testAssert(resultBufs[row] != NULL);
+        assert(resultBufs[row] != NULL);
         NNResultBuf* resultBuf = resultBufs[row];
         resultBufs[row] = NULL;
 
@@ -513,7 +753,7 @@ void NNEvaluator::serve(
         int boardYSize = resultBuf->boardYSizeForServer;
 
         unique_lock<std::mutex> resultLock(resultBuf->resultMutex);
-        testAssert(resultBuf->hasResult == false);
+        assert(resultBuf->hasResult == false);
         resultBuf->result = std::make_shared<NNOutput>();
 
         float* policyProbs = resultBuf->result->policyProbs;
@@ -570,13 +810,28 @@ void NNEvaluator::serve(
         resultBuf->clientWaitingForResult.notify_all();
         resultLock.unlock();
       }
+      m_numRowsProcessed.fetch_add(numRows, std::memory_order_relaxed);
+      m_numBatchesProcessed.fetch_add(1, std::memory_order_relaxed);
+      numRowsHandledThisThread += numRows;
+      numBatchesHandledThisThread += 1;
+
+      //numOngoingEvals is decremented by the client in finishOngoingEval()
+      //after postprocess + cache write, so reload's drain blocks on the
+      //full evaluate() lifetime — not just batch completion. The notify
+      //below is a historical wakeup edge for waitForNextNNEvalIfAny()
+      //condvar waiters; it is a no-op now that the API is sleep-based
+      //(numWaitingEvals stays at 0), but is kept as defence in depth.
+      lock.lock();
+      if(numWaitingEvals > 0)
+        waitingForFinish.notify_all();
+      lock.unlock();
       continue; // debug path: skip profiling
     }
     else {
       outputBuf.clear();
       for(int row = 0; row<numRows; row++) {
-        NNOutput* emptyOutput = nnOutputPool.acquire();
-        testAssert(resultBufs[row] != NULL);
+        NNOutput* emptyOutput = nnOutputPool->acquire();
+        assert(resultBufs[row] != NULL);
         emptyOutput->nnXLen = nnXLen;
         emptyOutput->nnYLen = nnYLen;
         if(resultBufs[row]->includeOwnerMap)
@@ -592,14 +847,14 @@ void NNEvaluator::serve(
           if(doRandomize)
             resultBufs[row]->symmetry = rand.nextUInt(SymmetryHelpers::NUM_SYMMETRIES);
           else {
-            testAssert(defaultSymmetry >= 0 && defaultSymmetry <= SymmetryHelpers::NUM_SYMMETRIES-1);
+            assert(defaultSymmetry >= 0 && defaultSymmetry <= SymmetryHelpers::NUM_SYMMETRIES-1);
             resultBufs[row]->symmetry = defaultSymmetry;
           }
         }
       }
 
       // Set up overlap callback: notify previous batch during GPU computation
-      NNOutputPool* pool = &nnOutputPool;
+      std::shared_ptr<NNOutputPool> pool = nnOutputPool;
       if(prevOverlapNumRows > 0) {
         auto pBufs = std::move(prevOverlapResultBufs);
         auto pOuts = std::move(prevOverlapOutputBuf);
@@ -622,7 +877,7 @@ void NNEvaluator::serve(
       if(_profEnabled) _tBeforeGO = ServeProfileStats::Clock::now();
       NeuralNet::getOutput(gpuHandle, buf.inputBuffers, numRows, resultBufs.data(), outputBuf);
       if(_profEnabled) _tAfterGO = ServeProfileStats::Clock::now();
-      testAssert(outputBuf.size() == numRows);
+      assert(outputBuf.size() == numRows);
 
       // If backend didn't execute overlap callback (CUDA, or profiling mode), do it now
       if(g_gpuOverlapCallback) {
@@ -648,15 +903,17 @@ void NNEvaluator::serve(
     }
 
     if(_profEnabled) _tAfterNotify = ServeProfileStats::Clock::now();
-    //Lock and update stats before looping again
+    //Lock and update stats before looping again. numOngoingEvals is decremented
+    //by the client in finishOngoingEval() after postprocess + cache write —
+    //leaving it on the server here would let reload clear the cache between
+    //our notify and the client's nnCacheTable->set, polluting the new model's
+    //cache with old-weight outputs. The notify below is a historical wakeup
+    //for waitForNextNNEvalIfAny() condvar waiters; it is a no-op now that
+    //the API is sleep-based (numWaitingEvals stays at 0), but is kept as
+    //defence in depth in case a future change brings that API back.
     lock.lock();
-    numOngoingEvals -= numRows;
-
-    if(numWaitingEvals > 0) {
-      numEvalsToAwaken += numWaitingEvals;
-      numWaitingEvals = 0;
+    if(numWaitingEvals > 0)
       waitingForFinish.notify_all();
-    }
     lock.unlock();
     if(_profEnabled) {
       auto _tEnd = ServeProfileStats::Clock::now();
@@ -683,14 +940,26 @@ void NNEvaluator::serve(
 }
 
 void NNEvaluator::waitForNextNNEvalIfAny() {
-  unique_lock<std::mutex> lock(bufferMutex);
-  if(numOngoingEvals <= 0)
-    return;
-
-  numWaitingEvals++;
-  while(numEvalsToAwaken <= 0 && !isKilled)
-    waitingForFinish.wait(lock);
-  numEvalsToAwaken--;
+  //Throttle-only API. The single caller (search.cpp's MCTS terminal-leaf
+  //branch) uses this to keep a leaf-only playout from running much faster
+  //than a real NN eval and skewing MCTS visit statistics. It does NOT need
+  //to observe any specific numOngoingEvals transition — "wait roughly one
+  //eval's worth of wall time" is the contract.
+  //
+  //The previous condvar implementation (++numWaitingEvals then park on
+  //waitingForFinish until numOngoingEvals strictly decreased) was correct
+  //but caused a 400-thread thundering herd on every evaluate() completion
+  //in RL selfplay: finishOngoingEval()'s notify_all would wake every parked
+  //game thread, each of which re-acquired bufferMutex only to re-sleep
+  //because its initialOngoing snapshot still wasn't beaten. Net effect:
+  //~2.4x throughput regression.
+  //
+  //A plain sleep matches the throttle contract, generates no contention on
+  //bufferMutex, and keeps numWaitingEvals at 0 so finishOngoingEval()'s
+  //gated notify_all becomes a no-op on the hot path. The drain path in
+  //killServerThreads() still uses waitingForFinish via drainPending, so
+  //shutdown semantics are unchanged.
+  std::this_thread::sleep_for(std::chrono::milliseconds(1));
 }
 
 
@@ -799,7 +1068,6 @@ void NNEvaluator::evaluate(
   bool skipCache,
   bool includeOwnerMap
 ) {
-  testAssert(!isKilled);
   buf.hasResult = false;
 
   if(board.x_size > nnXLen || board.y_size > nnYLen)
@@ -813,17 +1081,101 @@ void NNEvaluator::evaluate(
                         " and requireExactNNLen, but was asked to evaluate board with different x or y size");
   }
 
+  if(isSuperseded.load(std::memory_order_acquire)) {
+    //Stamp the same nnHash a real-path NNOutput would carry, so that
+    //averageMultipleSymmetries() (NNOutput's vector ctor) can mix dummy and
+    //real results from the same query without tripping its same-hash assert.
+    //numInputMetaChannels is fixed across reloads of the same model series,
+    //so we can read it under a brief lock and the value matches what the
+    //real path would snapshot below.
+    int dummyNumMetaChannels;
+    {
+      std::lock_guard<std::mutex> lock(bufferMutex);
+      dummyNumMetaChannels = numInputMetaChannels;
+    }
+    MiscNNInputParams dummyParams = nnInputParamsArg;
+    if(dummyNumMetaChannels > 0)
+      dummyParams.policyOptimism = 0.0;
+    Hash128 dummyHash = NNInputs::getHash(board, history, nextPlayer, dummyParams);
+    if(dummyNumMetaChannels > 0 && sgfMeta != NULL && sgfMeta->initialized)
+      dummyHash ^= sgfMeta->getHash(nextPlayer);
+    fillDummyResult(
+      board, history, nextPlayer,
+      nnXLen, nnYLen, policySize,
+      nnInputParamsArg.policyOptimism,
+      includeOwnerMap, buf
+    );
+    buf.result->nnHash = dummyHash;
+    return;
+  }
+
+  //Do not assert(!isKilled) here: killServerThreads() toggles isKilled inside
+  //the reload path in parallel with evaluate(). The forcePush-failure fallback
+  //below is the authoritative handling for that race.
+
+  //Snapshot every field that reloadLoadedModel() can replace, and claim a
+  //numOngoingEvals slot, all atomically under bufferMutex. reloadLoadedModel()
+  //drains numOngoingEvals == 0 and replaces these fields under the same mutex,
+  //so once this block succeeds we are guaranteed a consistent view of a single
+  //model for the entire rest of evaluate() (input fill + server query +
+  //postprocess), even if reload replaces the fields while our request is
+  //in flight on the server side.
+  int snapshotModelVersion;
+  int snapshotInputsVersion;
+  int snapshotNumInputMetaChannels;
+  ModelPostProcessParams snapshotPostProcessParams;
+  string snapshotModelName;
+  string snapshotModelFileName;
+  {
+    unique_lock<std::mutex> lock(bufferMutex);
+    if(isSuperseded.load(std::memory_order_acquire)) {
+      int dummyNumMetaChannels = numInputMetaChannels;
+      lock.unlock();
+      MiscNNInputParams dummyParams = nnInputParamsArg;
+      if(dummyNumMetaChannels > 0)
+        dummyParams.policyOptimism = 0.0;
+      Hash128 dummyHash = NNInputs::getHash(board, history, nextPlayer, dummyParams);
+      if(dummyNumMetaChannels > 0 && sgfMeta != NULL && sgfMeta->initialized)
+        dummyHash ^= sgfMeta->getHash(nextPlayer);
+      fillDummyResult(
+        board, history, nextPlayer,
+        nnXLen, nnYLen, policySize,
+        nnInputParamsArg.policyOptimism,
+        includeOwnerMap, buf
+      );
+      buf.result->nnHash = dummyHash;
+      return;
+    }
+    snapshotModelVersion = modelVersion;
+    snapshotInputsVersion = inputsVersion;
+    snapshotNumInputMetaChannels = numInputMetaChannels;
+    snapshotPostProcessParams = postProcessParams;
+    snapshotModelName = modelName;
+    snapshotModelFileName = modelFileName;
+    numOngoingEvals += 1;
+  }
+  //RAII guard balances the numOngoingEvals++ above on every exit path
+  //(cache hit early return, forcePush-fail fallback, normal completion
+  //after postprocess + cache write, or any exception thrown during
+  //postprocess). reloadLoadedModel()'s drain loop waits on
+  //numOngoingEvals == 0 before it mutates snapshotted fields or clears
+  //the cache, so keeping the slot alive across the full evaluate()
+  //lifetime prevents two hazards in one stroke: postprocess reading the
+  //replaced params, and nnCacheTable->set() inserting an old-weight
+  //NNOutput into the cleared-for-new-model cache.
+  Global::CustomScopeGuard evalSlotGuard([this]() { finishOngoingEval(); });
+
   // Avoid using policy optimism for humanSL
   MiscNNInputParams nnInputParams = nnInputParamsArg;
-  if(numInputMetaChannels > 0)
+  if(snapshotNumInputMetaChannels > 0)
     nnInputParams.policyOptimism = 0.0;
 
   Hash128 nnHash = NNInputs::getHash(board, history, nextPlayer, nnInputParams);
-  if(numInputMetaChannels > 0) {
+  if(snapshotNumInputMetaChannels > 0) {
     if(sgfMeta == NULL)
-      Global::fatalError("SGFMetadata is required for " + modelName + " but was not provided");
+      Global::fatalError("SGFMetadata is required for " + snapshotModelName + " but was not provided");
     if(!sgfMeta->initialized)
-      Global::fatalError("SGFMetadata is required for " + modelName + " but was not initialized. Did you specify humanSLProfile=... in katago's config or via overrides?");
+      Global::fatalError("SGFMetadata is required for " + snapshotModelName + " but was not initialized. Did you specify humanSLProfile=... in katago's config or via overrides?");
     nnHash ^= sgfMeta->getHash(nextPlayer);
   }
 
@@ -833,6 +1185,7 @@ void NNEvaluator::evaluate(
     if(!(includeOwnerMap && buf.result->whiteOwnerMap == NULL))
     {
       buf.hasResult = true;
+      //evalSlotGuard releases the numOngoingEvals slot on return.
       return;
     }
     else {
@@ -847,35 +1200,35 @@ void NNEvaluator::evaluate(
   buf.boardYSizeForServer = board.y_size;
 
   if(!debugSkipNeuralNet) {
-    const int rowSpatialLen = NNModelVersion::getNumSpatialFeatures(modelVersion) * nnXLen * nnYLen;
+    const int rowSpatialLen = NNModelVersion::getNumSpatialFeatures(snapshotModelVersion) * nnXLen * nnYLen;
     if(buf.rowSpatialBuf.size() < rowSpatialLen)
       buf.rowSpatialBuf.resize(rowSpatialLen);
-    const int rowGlobalLen = NNModelVersion::getNumGlobalFeatures(modelVersion);
+    const int rowGlobalLen = NNModelVersion::getNumGlobalFeatures(snapshotModelVersion);
     if(buf.rowGlobalBuf.size() < rowGlobalLen)
       buf.rowGlobalBuf.resize(rowGlobalLen);
-    const int rowMetaLen = numInputMetaChannels;
+    const int rowMetaLen = snapshotNumInputMetaChannels;
     if(buf.rowMetaBuf.size() < rowMetaLen)
       buf.rowMetaBuf.resize(rowMetaLen);
 
     static_assert(NNModelVersion::latestInputsVersionImplemented == 7, "");
-    if(inputsVersion == 3)
+    if(snapshotInputsVersion == 3)
       NNInputs::fillRowV3(board, history, nextPlayer, nnInputParams, nnXLen, nnYLen, inputsUseNHWC, buf.rowSpatialBuf.data(), buf.rowGlobalBuf.data());
-    else if(inputsVersion == 4)
+    else if(snapshotInputsVersion == 4)
       NNInputs::fillRowV4(board, history, nextPlayer, nnInputParams, nnXLen, nnYLen, inputsUseNHWC, buf.rowSpatialBuf.data(), buf.rowGlobalBuf.data());
-    else if(inputsVersion == 5)
+    else if(snapshotInputsVersion == 5)
       NNInputs::fillRowV5(board, history, nextPlayer, nnInputParams, nnXLen, nnYLen, inputsUseNHWC, buf.rowSpatialBuf.data(), buf.rowGlobalBuf.data());
-    else if(inputsVersion == 6)
+    else if(snapshotInputsVersion == 6)
       NNInputs::fillRowV6(board, history, nextPlayer, nnInputParams, nnXLen, nnYLen, inputsUseNHWC, buf.rowSpatialBuf.data(), buf.rowGlobalBuf.data());
-    else if(inputsVersion == 7)
+    else if(snapshotInputsVersion == 7)
       NNInputs::fillRowV7(board, history, nextPlayer, nnInputParams, nnXLen, nnYLen, inputsUseNHWC, buf.rowSpatialBuf.data(), buf.rowGlobalBuf.data());
     else
       ASSERT_UNREACHABLE;
 
     if(rowMetaLen > 0) {
       if(sgfMeta == NULL)
-        Global::fatalError("SGFMetadata is required for " + modelName + " but was not provided");
+        Global::fatalError("SGFMetadata is required for " + snapshotModelName + " but was not provided");
       if(!sgfMeta->initialized)
-        Global::fatalError("SGFMetadata is required for " + modelName + " but was not initialized. Did you specify humanSLProfile=... in katago's config or via overrides?");
+        Global::fatalError("SGFMetadata is required for " + snapshotModelName + " but was not initialized. Did you specify humanSLProfile=... in katago's config or via overrides?");
       SGFMetadata::fillMetadataRow(
         sgfMeta,
         buf.rowMetaBuf.data(),
@@ -892,12 +1245,25 @@ void NNEvaluator::evaluate(
   buf.symmetry = nnInputParams.symmetry;
   buf.policyOptimism = nnInputParams.policyOptimism;
 
-  unique_lock<std::mutex> lock(bufferMutex);
-  numOngoingEvals += 1;
-  lock.unlock();
-
   bool suc = queryQueue.forcePush(&buf);
-  testAssert(suc);
+  if(!suc) {
+    //The query queue was set readonly by reloadLoadedModel() (or destructor)
+    //between our isSuperseded check and this push. Fall back to a dummy
+    //result — without this the thread would block forever on
+    //buf.clientWaitingForResult since no server will process a buf that
+    //was never pushed. Stamp the same nnHash we already computed for the
+    //real path so a sibling symmetry can still average against this dummy
+    //without tripping NNOutput's same-hash assert. evalSlotGuard releases
+    //the numOngoingEvals slot on return, waking the reload drain loop.
+    fillDummyResult(
+      board, history, nextPlayer,
+      nnXLen, nnYLen, policySize,
+      nnInputParams.policyOptimism,
+      includeOwnerMap, buf
+    );
+    buf.result->nnHash = nnHash;
+    return;
+  }
 
   unique_lock<std::mutex> resultLock(buf.resultMutex);
   while(!buf.hasResult)
@@ -923,12 +1289,12 @@ void NNEvaluator::evaluate(
     buf.result->policyOptimismUsed = (float)resultWithoutOwnerMap->policyOptimismUsed;
     buf.result->nnXLen = resultWithoutOwnerMap->nnXLen;
     buf.result->nnYLen = resultWithoutOwnerMap->nnYLen;
-    testAssert(buf.result->whiteOwnerMap != NULL);
+    assert(buf.result->whiteOwnerMap != NULL);
   }
   else {
     float* policy = buf.result->policyProbs;
 
-    float policyOutputScaling = postProcessParams.outputScaleMultiplier / nnInputParams.nnPolicyTemperature;
+    float policyOutputScaling = snapshotPostProcessParams.outputScaleMultiplier / nnInputParams.nnPolicyTemperature;
 
     int xSize = board.x_size;
     int ySize = board.y_size;
@@ -936,7 +1302,7 @@ void NNEvaluator::evaluate(
     float maxPolicy = -1e25f;
     bool isLegal[NNPos::MAX_NN_POLICY_SIZE];
     int legalCount = 0;
-    testAssert(nextPlayer == history.presumedNextMovePla);
+    assert(nextPlayer == history.presumedNextMovePla);
     for(int i = 0; i<policySize; i++) {
       Loc loc = NNPos::posToLoc(i,xSize,ySize,nnXLen,nnYLen);
       isLegal[i] = history.isLegal(board,loc,nextPlayer);
@@ -967,7 +1333,7 @@ void NNEvaluator::evaluate(
         maxPolicy = policyValue;
     }
 
-    testAssert(legalCount > 0);
+    assert(legalCount > 0);
 
     float policySum = 0.0f;
 
@@ -980,7 +1346,7 @@ void NNEvaluator::evaluate(
         policySum += policy[i];
       }
       int passPos = NNPos::locToPos(Board::PASS_LOC, xSize, nnXLen, nnYLen);
-      testAssert(passPos == policySize-1);
+      assert(passPos == policySize-1);
       int i = passPos;
       policy[i] = std::max(1e-20f, std::min(exp(policy[i] - maxPolicy), policySum * maxPassPolicySumFactor));
       policySum += policy[i];
@@ -1002,7 +1368,7 @@ void NNEvaluator::evaluate(
     if(policySum <= 0.0) {
       if(!buf.errorLogLockout && logger != NULL) {
         buf.errorLogLockout = true;
-        logger->write("Warning: all legal moves rounded to 0 probability for " + string(modelFileName));
+        logger->write("Warning: all legal moves rounded to 0 probability for " + snapshotModelFileName);
       }
       float uniform = 1.0f / legalCount;
       for(int i = 0; i<policySize; i++) {
@@ -1023,18 +1389,18 @@ void NNEvaluator::evaluate(
 
     //Fix up the value as well. Note that the neural net gives us back the value from the perspective
     //of the player so we need to negate that to make it the white value.
-    if(modelVersion == 3) {
+    if(snapshotModelVersion == 3) {
       const double twoOverPi = 0.63661977236758134308;
 
       double winProb;
       double lossProb;
       double noResultProb;
       //Version 3 neural nets just pack the pre-arctanned scoreValue into the whiteScoreMean field
-      double scoreValue = atan(buf.result->whiteScoreMean * postProcessParams.outputScaleMultiplier) * twoOverPi;
+      double scoreValue = atan(buf.result->whiteScoreMean * snapshotPostProcessParams.outputScaleMultiplier) * twoOverPi;
       {
-        double winLogits = buf.result->whiteWinProb * postProcessParams.outputScaleMultiplier;
-        double lossLogits = buf.result->whiteLossProb * postProcessParams.outputScaleMultiplier;
-        double noResultLogits = buf.result->whiteNoResultProb * postProcessParams.outputScaleMultiplier;
+        double winLogits = buf.result->whiteWinProb * snapshotPostProcessParams.outputScaleMultiplier;
+        double lossLogits = buf.result->whiteLossProb * snapshotPostProcessParams.outputScaleMultiplier;
+        double noResultLogits = buf.result->whiteNoResultProb * snapshotPostProcessParams.outputScaleMultiplier;
 
         //Softmax
         double maxLogits = std::max(std::max(winLogits,lossLogits),noResultLogits);
@@ -1078,7 +1444,7 @@ void NNEvaluator::evaluate(
       }
 
     }
-    else if(modelVersion >= 4) {
+    else if(snapshotModelVersion >= 4) {
       double winProb;
       double lossProb;
       double noResultProb;
@@ -1089,15 +1455,15 @@ void NNEvaluator::evaluate(
       double shorttermWinlossError;
       double shorttermScoreError;
       {
-        double winLogits = buf.result->whiteWinProb * postProcessParams.outputScaleMultiplier;
-        double lossLogits = buf.result->whiteLossProb * postProcessParams.outputScaleMultiplier;
-        double noResultLogits = buf.result->whiteNoResultProb * postProcessParams.outputScaleMultiplier;
-        double scoreMeanPreScaled = buf.result->whiteScoreMean * postProcessParams.outputScaleMultiplier;
-        double scoreStdevPreSoftplus = buf.result->whiteScoreMeanSq * postProcessParams.outputScaleMultiplier;
-        double leadPreScaled = buf.result->whiteLead * postProcessParams.outputScaleMultiplier;
-        double varTimeLeftPreSoftplus = buf.result->varTimeLeft * postProcessParams.outputScaleMultiplier;
-        double shorttermWinlossErrorPreSoftplus = buf.result->shorttermWinlossError * postProcessParams.outputScaleMultiplier;
-        double shorttermScoreErrorPreSoftplus = buf.result->shorttermScoreError * postProcessParams.outputScaleMultiplier;
+        double winLogits = buf.result->whiteWinProb * snapshotPostProcessParams.outputScaleMultiplier;
+        double lossLogits = buf.result->whiteLossProb * snapshotPostProcessParams.outputScaleMultiplier;
+        double noResultLogits = buf.result->whiteNoResultProb * snapshotPostProcessParams.outputScaleMultiplier;
+        double scoreMeanPreScaled = buf.result->whiteScoreMean * snapshotPostProcessParams.outputScaleMultiplier;
+        double scoreStdevPreSoftplus = buf.result->whiteScoreMeanSq * snapshotPostProcessParams.outputScaleMultiplier;
+        double leadPreScaled = buf.result->whiteLead * snapshotPostProcessParams.outputScaleMultiplier;
+        double varTimeLeftPreSoftplus = buf.result->varTimeLeft * snapshotPostProcessParams.outputScaleMultiplier;
+        double shorttermWinlossErrorPreSoftplus = buf.result->shorttermWinlossError * snapshotPostProcessParams.outputScaleMultiplier;
+        double shorttermScoreErrorPreSoftplus = buf.result->shorttermScoreError * snapshotPostProcessParams.outputScaleMultiplier;
 
         if(history.rules.koRule != Rules::KO_SIMPLE && history.rules.scoringRule != Rules::SCORING_TERRITORY)
           noResultLogits -= 100000.0;
@@ -1116,11 +1482,11 @@ void NNEvaluator::evaluate(
         lossProb /= probSum;
         noResultProb /= probSum;
 
-        scoreMean = scoreMeanPreScaled * postProcessParams.scoreMeanMultiplier;
-        double scoreStdev = softPlus(scoreStdevPreSoftplus) * postProcessParams.scoreStdevMultiplier;
+        scoreMean = scoreMeanPreScaled * snapshotPostProcessParams.scoreMeanMultiplier;
+        double scoreStdev = softPlus(scoreStdevPreSoftplus) * snapshotPostProcessParams.scoreStdevMultiplier;
         scoreMeanSq = scoreMean * scoreMean + scoreStdev * scoreStdev;
-        lead = leadPreScaled * postProcessParams.leadMultiplier;
-        varTimeLeft = softPlus(varTimeLeftPreSoftplus) * postProcessParams.varianceTimeMultiplier;
+        lead = leadPreScaled * snapshotPostProcessParams.leadMultiplier;
+        varTimeLeft = softPlus(varTimeLeftPreSoftplus) * snapshotPostProcessParams.varianceTimeMultiplier;
 
         //scoreMean and scoreMeanSq are still conditional on having a result, we need to make them unconditional now
         //noResult counts as 0 score for scorevalue purposes.
@@ -1128,19 +1494,19 @@ void NNEvaluator::evaluate(
         scoreMeanSq = scoreMeanSq * (1.0-noResultProb);
         lead = lead * (1.0-noResultProb);
 
-        if(modelVersion >= 14) {
+        if(snapshotModelVersion >= 14) {
           {
             double s = softPlus(shorttermWinlossErrorPreSoftplus * 0.5);
-            shorttermWinlossError = sqrt(s * s * postProcessParams.shorttermValueErrorMultiplier);
+            shorttermWinlossError = sqrt(s * s * snapshotPostProcessParams.shorttermValueErrorMultiplier);
           }
           {
             double s = softPlus(shorttermScoreErrorPreSoftplus * 0.5);
-            shorttermScoreError = sqrt(s * s * postProcessParams.shorttermScoreErrorMultiplier);
+            shorttermScoreError = sqrt(s * s * snapshotPostProcessParams.shorttermScoreErrorMultiplier);
           }
         }
-        else if(modelVersion >= 10) {
-          shorttermWinlossError = sqrt(softPlus(shorttermWinlossErrorPreSoftplus) * postProcessParams.shorttermValueErrorMultiplier);
-          shorttermScoreError = sqrt(softPlus(shorttermScoreErrorPreSoftplus) * postProcessParams.shorttermScoreErrorMultiplier);
+        else if(snapshotModelVersion >= 10) {
+          shorttermWinlossError = sqrt(softPlus(shorttermWinlossErrorPreSoftplus) * snapshotPostProcessParams.shorttermValueErrorMultiplier);
+          shorttermScoreError = sqrt(softPlus(shorttermScoreErrorPreSoftplus) * snapshotPostProcessParams.shorttermScoreErrorMultiplier);
         }
         else {
           shorttermWinlossError = softPlus(shorttermWinlossErrorPreSoftplus);
@@ -1183,7 +1549,7 @@ void NNEvaluator::evaluate(
         buf.result->whiteLead = -(float)lead;
       }
 
-      if(modelVersion >= 9) {
+      if(snapshotModelVersion >= 9) {
         buf.result->varTimeLeft = (float)varTimeLeft;
         buf.result->shorttermWinlossError = (float)shorttermWinlossError;
         buf.result->shorttermScoreError = (float)shorttermScoreError;
@@ -1201,7 +1567,7 @@ void NNEvaluator::evaluate(
 
   //Postprocess ownermap
   if(buf.result->whiteOwnerMap != NULL) {
-    if(modelVersion >= 3) {
+    if(snapshotModelVersion >= 3) {
       for(int pos = 0; pos<nnXLen*nnYLen; pos++) {
         int y = pos / nnXLen;
         int x = pos % nnXLen;
@@ -1211,9 +1577,9 @@ void NNEvaluator::evaluate(
           //Similarly as mentioned above, the result we get back from the net is actually not from white's perspective,
           //but from the player to move, so we need to flip it to make it white at the same time as we tanh it.
           if(nextPlayer == P_WHITE)
-            buf.result->whiteOwnerMap[pos] = tanh(buf.result->whiteOwnerMap[pos] * postProcessParams.outputScaleMultiplier);
+            buf.result->whiteOwnerMap[pos] = tanh(buf.result->whiteOwnerMap[pos] * snapshotPostProcessParams.outputScaleMultiplier);
           else
-            buf.result->whiteOwnerMap[pos] = -tanh(buf.result->whiteOwnerMap[pos] * postProcessParams.outputScaleMultiplier);
+            buf.result->whiteOwnerMap[pos] = -tanh(buf.result->whiteOwnerMap[pos] * snapshotPostProcessParams.outputScaleMultiplier);
         }
       }
     }
